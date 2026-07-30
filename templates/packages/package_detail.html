@@ -1,0 +1,24 @@
+{% extends 'base.html' %}
+
+{% block title %}Package List | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h4 class="mb-0">{{ package_list.name }}</h4>
+    <small class="text-muted">{{ package_list.get_distro_family_display }}</small>
+  </div>
+  <a class="btn btn-outline-secondary" href="{% url 'packages:package-list' %}">Back</a>
+</div>
+
+<div class="card">
+  <div class="card-header"><h6 class="mb-0">Package Items</h6></div>
+  <div class="card-body">
+    <form method="post" action="{% url 'packages:package-items' package_list.pk %}">
+      {% csrf_token %}
+      {{ bulk_form.as_p }}
+      <button class="btn btn-primary btn-sm" type="submit">Save Items</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

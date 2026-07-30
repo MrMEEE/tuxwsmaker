@@ -1,0 +1,234 @@
+{% extends 'base.html' %}
+
+{% block title %}Build Form | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">Build Definition</h5></div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {% if form.non_field_errors %}
+      <div class="alert alert-danger">{{ form.non_field_errors }}</div>
+      {% endif %}
+
+      <div class="row g-3">
+        <div class="col-md-6">{{ form.name.label_tag }} {{ form.name }}</div>
+        <div class="col-md-6">{{ form.operating_system.label_tag }} {{ form.operating_system }}</div>
+        <div class="col-md-6">{{ form.iso_image.label_tag }} {{ form.iso_image }}</div>
+        <div class="col-md-6">{{ form.partition_layout.label_tag }} {{ form.partition_layout }}</div>
+        <div class="col-md-6">{{ form.machine_config.label_tag }} {{ form.machine_config }}</div>
+        <div class="col-12">
+          <div id="boot-layout-compatibility" class="alert d-none mb-0" role="status"></div>
+        </div>
+        <div class="col-12">
+          {{ form.package_lists.label_tag }}
+          <div class="border rounded p-2" style="max-height: 180px; overflow-y: auto;">
+            {{ form.package_lists }}
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="form-check">{{ form.output_pxe }} {{ form.output_pxe.label_tag }}</div>
+          <div class="form-check">{{ form.output_usb_img }} {{ form.output_usb_img.label_tag }}</div>
+        </div>
+      </div>
+
+      <hr>
+      <h6>Playbooks (Run Order)</h6>
+      <p class="text-muted small mb-2">Select one or more discovered playbooks, then set the exact run order for this build.</p>
+      {{ form.playbook_order_json }}
+
+      <div class="row g-3">
+        <div class="col-md-5">
+          <label class="form-label">Available Playbooks</label>
+          <input id="available-playbooks-filter" class="form-control form-control-sm mb-2" type="text" placeholder="Filter playbooks...">
+          <select id="available-playbooks" class="form-select" size="10">
+            {% for pb in form.available_playbooks %}
+              <option value="{{ pb.id }}" data-label="{{ pb.repository.name }} [{{ pb.branch }}] {{ pb.path }}">{{ pb.repository.name }} [{{ pb.branch }}] {{ pb.path }}</option>
+            {% empty %}
+              <option disabled>No discovered playbooks. Add repos under Playbooks and sync first.</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm btn-outline-primary mt-2" type="button" id="add-playbook-btn">Add to Order</button>
+        </div>
+        <div class="col-md-7">
+          <label class="form-label">Selected Order</label>
+          <select id="selected-playbooks" class="form-select" size="10"></select>
+          <div class="mt-2 d-flex gap-2">
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="move-up-btn">Up</button>
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="move-down-btn">Down</button>
+            <button class="btn btn-sm btn-outline-danger" type="button" id="remove-playbook-btn">Remove</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Save</button>
+        <a class="btn btn-outline-secondary" href="{% url 'builds:build-list' %}">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{{ form.machine_boot_modes|json_script:"machine-boot-modes-map" }}
+{{ form.layout_meta|json_script:"layout-meta-map" }}
+<script>
+  (function () {
+    const available = document.getElementById("available-playbooks");
+    const availableFilter = document.getElementById("available-playbooks-filter");
+    const selected = document.getElementById("selected-playbooks");
+    const orderField = document.getElementById("id_playbook_order_json");
+    const machineConfigField = document.getElementById("id_machine_config");
+    const partitionLayoutField = document.getElementById("id_partition_layout");
+    const compatibilityBanner = document.getElementById("boot-layout-compatibility");
+
+    const machineBootModes = JSON.parse(document.getElementById("machine-boot-modes-map").textContent || "{}");
+    const layoutMeta = JSON.parse(document.getElementById("layout-meta-map").textContent || "{}");
+
+    const addBtn = document.getElementById("add-playbook-btn");
+    const removeBtn = document.getElementById("remove-playbook-btn");
+    const upBtn = document.getElementById("move-up-btn");
+    const downBtn = document.getElementById("move-down-btn");
+
+    function showCompatibility(message, level) {
+      if (!compatibilityBanner) {
+        return;
+      }
+      compatibilityBanner.classList.remove("d-none", "alert-danger", "alert-warning", "alert-info", "alert-success");
+      compatibilityBanner.classList.add(`alert-${level}`);
+      compatibilityBanner.textContent = message;
+    }
+
+    function evaluateCompatibility() {
+      if (!machineConfigField || !partitionLayoutField || !compatibilityBanner) {
+        return;
+      }
+      const machineId = machineConfigField.value;
+      const layoutId = partitionLayoutField.value;
+      if (!machineId || !layoutId) {
+        compatibilityBanner.classList.add("d-none");
+        return;
+      }
+
+      const bootMode = machineBootModes[machineId];
+      const meta = layoutMeta[layoutId];
+      if (!bootMode || !meta) {
+        compatibilityBanner.classList.add("d-none");
+        return;
+      }
+
+      if (bootMode === "uefi" && meta.table_type !== "gpt") {
+        showCompatibility("Invalid combination: UEFI machine config requires a GPT partition table.", "danger");
+        return;
+      }
+      if (bootMode === "uefi" && !meta.has_esp) {
+        showCompatibility("Invalid combination: UEFI machine config requires an EFI system partition mounted at /boot/efi.", "danger");
+        return;
+      }
+      if (bootMode === "bios" && meta.table_type !== "mbr") {
+        showCompatibility("Invalid combination: BIOS machine config requires an MBR partition table.", "danger");
+        return;
+      }
+
+      const modeLabel = bootMode.toUpperCase();
+      const tableLabel = String(meta.table_type || "").toUpperCase();
+      showCompatibility(`Compatible: ${modeLabel} machine config with ${tableLabel} partition layout.`, "success");
+    }
+
+    function containsId(id) {
+      return Array.from(selected.options).some((opt) => opt.value === id);
+    }
+
+    function syncHiddenField() {
+      const payload = Array.from(selected.options).map((opt) => ({
+        id: Number(opt.value),
+        label: opt.text,
+      }));
+      orderField.value = JSON.stringify(payload);
+    }
+
+    function addOption(id, label) {
+      if (containsId(id)) {
+        return;
+      }
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.text = label;
+      selected.appendChild(opt);
+      syncHiddenField();
+    }
+
+    function filterAvailable() {
+      const q = (availableFilter.value || "").trim().toLowerCase();
+      Array.from(available.options).forEach((opt) => {
+        const hay = (opt.dataset.label || opt.text || "").toLowerCase();
+        opt.hidden = q !== "" && !hay.includes(q);
+      });
+    }
+
+    function removeSelected() {
+      if (selected.selectedIndex < 0) {
+        return;
+      }
+      selected.remove(selected.selectedIndex);
+      syncHiddenField();
+    }
+
+    function moveSelected(direction) {
+      const idx = selected.selectedIndex;
+      if (idx < 0) {
+        return;
+      }
+      const target = idx + direction;
+      if (target < 0 || target >= selected.options.length) {
+        return;
+      }
+      const option = selected.options[idx];
+      const clone = option.cloneNode(true);
+      selected.remove(idx);
+      selected.add(clone, selected.options[target]);
+      selected.selectedIndex = target;
+      syncHiddenField();
+    }
+
+    addBtn.addEventListener("click", function () {
+      const opt = available.options[available.selectedIndex];
+      if (!opt || !opt.value) {
+        return;
+      }
+      addOption(opt.value, opt.dataset.label || opt.text);
+    });
+
+    removeBtn.addEventListener("click", removeSelected);
+    upBtn.addEventListener("click", function () { moveSelected(-1); });
+    downBtn.addEventListener("click", function () { moveSelected(1); });
+    availableFilter.addEventListener("input", filterAvailable);
+    if (machineConfigField) {
+      machineConfigField.addEventListener("change", evaluateCompatibility);
+    }
+    if (partitionLayoutField) {
+      partitionLayoutField.addEventListener("change", evaluateCompatibility);
+    }
+
+    if (orderField.value) {
+      try {
+        const initial = JSON.parse(orderField.value);
+        if (Array.isArray(initial)) {
+          initial.forEach((item) => {
+            if (item && item.id) {
+              addOption(String(item.id), item.label || String(item.id));
+            }
+          });
+        }
+      } catch (_) {
+        orderField.value = "";
+      }
+    }
+    syncHiddenField();
+    filterAvailable();
+    evaluateCompatibility();
+  })();
+</script>
+{% endblock %}

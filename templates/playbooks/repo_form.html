@@ -1,0 +1,240 @@
+{% extends 'base.html' %}
+
+{% block title %}Playbook Repository | TuxWSMaker{% endblock %}
+
+{% block extra_css %}
+<style>
+  .repo-tree details {
+    margin-left: 0.25rem;
+  }
+  .repo-tree summary {
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+  }
+  .repo-tree summary::-webkit-details-marker {
+    display: none;
+  }
+  .repo-tree summary::before {
+    content: ">";
+    display: inline-block;
+    margin-right: 0.35rem;
+    color: #6b7280;
+    transition: transform 0.12s ease;
+  }
+  .repo-tree details[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  .repo-tree-file {
+    margin-left: 1.15rem;
+    color: #4b5563;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="row g-3">
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header"><h5 class="mb-0">Playbook Repository</h5></div>
+      <div class="card-body">
+        {% include 'playbooks/repo_form_fragment.html' %}
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0">Repository Preview</h6>
+        <button class="btn btn-sm btn-outline-primary" type="button" id="inspect-now-btn">Inspect</button>
+      </div>
+      <div class="card-body">
+        <div class="mb-2">
+          <label class="form-label">Detected Branches</label>
+          <select id="detected-branches" class="form-select form-select-sm"></select>
+        </div>
+        <div id="inspect-status" class="small text-muted">Enter a repository URL to inspect branches and files.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Repository File Tree</h6></div>
+      <div class="card-body" style="max-height: 70vh; overflow: auto;">
+        <div id="repo-tree" class="small repo-tree"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  (function () {
+    const repoInput = document.getElementById("id_repo_url");
+    const defaultBranchInput = document.getElementById("id_default_branch");
+    const sshKeyFieldWrap = document.getElementById("ssh-key-field-wrap");
+    const apiKeyFieldWrap = document.getElementById("api-key-field-wrap");
+    const inspectBtn = document.getElementById("inspect-now-btn");
+    const branchesSelect = document.getElementById("detected-branches");
+    const statusEl = document.getElementById("inspect-status");
+    const treeEl = document.getElementById("repo-tree");
+    const sshKeySelect = document.getElementById("id_ssh_key");
+    const apiKeyInput = document.getElementById("id_api_key");
+
+    let inspectTimer = null;
+    let defaultBranchTouched = false;
+
+    function setStatus(text, kind) {
+      statusEl.className = "small " + (kind === "error" ? "text-danger" : "text-muted");
+      statusEl.textContent = text;
+    }
+
+    function updateAuthVisibility() {
+      const repoUrl = (repoInput.value || "").trim();
+      const isHttp = repoUrl.startsWith("http://") || repoUrl.startsWith("https://");
+      const isSshStyle = repoUrl.indexOf("@") !== -1 && !isHttp;
+      if (sshKeyFieldWrap) {
+        sshKeyFieldWrap.style.display = isHttp ? "none" : "";
+      }
+      if (apiKeyFieldWrap) {
+        apiKeyFieldWrap.style.display = isSshStyle ? "none" : "";
+      }
+      if (isHttp && sshKeySelect) {
+        sshKeySelect.value = "";
+      }
+      if (isSshStyle && apiKeyInput) {
+        apiKeyInput.value = "";
+      }
+    }
+
+    function renderTreeNode(node, depth) {
+      if (!node) {
+        return "";
+      }
+      if (node.type === "file") {
+        return "<div class=\"repo-tree-file\">" + node.name + "</div>";
+      }
+      const children = (node.children || []).map((child) => renderTreeNode(child, depth + 1)).join("");
+      const openAttr = depth === 0 ? " open" : "";
+      return "<details" + openAttr + "><summary><strong>" + node.name + "</strong></summary><div>" + children + "</div></details>";
+    }
+
+    function renderTree(tree) {
+      if (!tree) {
+        treeEl.innerHTML = "<div class=\"text-muted\">No tree available.</div>";
+        return;
+      }
+      treeEl.innerHTML = renderTreeNode(tree, 0);
+    }
+
+    function updateBranchOptions(branches, selected) {
+      branchesSelect.innerHTML = "";
+      if (!branches || branches.length === 0) {
+        const opt = document.createElement("option");
+        opt.text = "No branches found";
+        opt.value = "";
+        branchesSelect.add(opt);
+        return;
+      }
+      branches.forEach((branch) => {
+        const opt = document.createElement("option");
+        opt.value = branch;
+        opt.text = branch;
+        if (branch === selected) {
+          opt.selected = true;
+        }
+        branchesSelect.add(opt);
+      });
+
+      if (!defaultBranchTouched) {
+        if (!defaultBranchInput.value || !branches.includes(defaultBranchInput.value)) {
+          defaultBranchInput.value = selected || branches[0] || "";
+        }
+      }
+    }
+
+    async function inspectRepo(forceBranch) {
+      const repoUrl = (repoInput.value || "").trim();
+      if (!repoUrl) {
+        setStatus("Enter a repository URL to inspect branches and files.", "muted");
+        branchesSelect.innerHTML = "";
+        treeEl.innerHTML = "";
+        return;
+      }
+
+      const branch = forceBranch || (branchesSelect.value || defaultBranchInput.value || "").trim();
+      setStatus("Inspecting repository...", "muted");
+
+      const data = new FormData();
+      data.set("repo_url", repoUrl);
+      if (branch) {
+        data.set("branch", branch);
+      }
+      if (sshKeySelect && sshKeySelect.value) {
+        data.set("ssh_key", sshKeySelect.value);
+      }
+      if (apiKeyInput && apiKeyInput.value) {
+        data.set("api_key", apiKeyInput.value);
+      }
+
+      try {
+        const response = await fetch("{% url 'playbooks:repo-inspect' %}", {
+          method: "POST",
+          headers: {
+            "X-CSRFToken": document.querySelector('input[name="csrfmiddlewaretoken"]').value,
+          },
+          body: data,
+          credentials: "same-origin",
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || "Inspection failed");
+        }
+        updateBranchOptions(data.branches || [], data.selected_branch || "");
+        if (data.selected_branch && !defaultBranchTouched) {
+          defaultBranchInput.value = data.selected_branch;
+        }
+        renderTree(data.tree);
+        setStatus("Repository inspected successfully.", "muted");
+      } catch (err) {
+        setStatus("Inspection failed: " + (err && err.message ? err.message : String(err)), "error");
+      }
+    }
+
+    function queueInspect() {
+      if (inspectTimer) {
+        window.clearTimeout(inspectTimer);
+      }
+      inspectTimer = window.setTimeout(function () {
+        inspectRepo();
+      }, 600);
+    }
+
+    repoInput.addEventListener("input", queueInspect);
+    repoInput.addEventListener("input", updateAuthVisibility);
+    defaultBranchInput.addEventListener("change", function () {
+      defaultBranchTouched = true;
+    });
+    inspectBtn.addEventListener("click", function () { inspectRepo(); });
+    if (sshKeySelect) {
+      sshKeySelect.addEventListener("change", function () { queueInspect(); });
+    }
+    if (apiKeyInput) {
+      apiKeyInput.addEventListener("input", function () { queueInspect(); });
+    }
+    branchesSelect.addEventListener("change", function () {
+      if (branchesSelect.value) {
+        defaultBranchInput.value = branchesSelect.value;
+        defaultBranchTouched = true;
+      }
+      inspectRepo(branchesSelect.value);
+    });
+
+    updateAuthVisibility();
+    if ((repoInput.value || "").trim()) {
+      inspectRepo(defaultBranchInput.value || "");
+    }
+  })();
+</script>
+{% endblock %}

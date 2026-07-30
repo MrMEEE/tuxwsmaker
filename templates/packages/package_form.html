@@ -1,0 +1,19 @@
+{% extends 'base.html' %}
+
+{% block title %}Package List Form | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">Package List</h5></div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {{ form.as_p }}
+      <div class="d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Save</button>
+        <a class="btn btn-outline-secondary" href="{% url 'packages:package-list' %}">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,12 @@
+<form method="post" action="{{ request.path }}">
+  {% csrf_token %}
+  {{ form.as_p }}
+  <div class="d-flex gap-2 justify-content-end">
+    <button class="btn btn-primary" type="submit">Save</button>
+    {% if modal_mode %}
+      <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal">Cancel</button>
+    {% else %}
+      <a class="btn btn-outline-secondary" href="{% url 'packages:package-list' %}">Cancel</a>
+    {% endif %}
+  </div>
+</form>

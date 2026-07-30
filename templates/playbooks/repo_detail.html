@@ -1,0 +1,205 @@
+{% extends 'base.html' %}
+
+{% block title %}Playbook Repository | TuxWSMaker{% endblock %}
+
+{% block extra_css %}
+<style>
+  .repo-tree details {
+    margin-left: 0.25rem;
+  }
+  .repo-tree summary {
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+  }
+  .repo-tree summary::-webkit-details-marker {
+    display: none;
+  }
+  .repo-tree summary::before {
+    content: ">";
+    display: inline-block;
+    margin-right: 0.35rem;
+    color: #6b7280;
+    transition: transform 0.12s ease;
+  }
+  .repo-tree details[open] > summary::before {
+    transform: rotate(90deg);
+  }
+  .repo-tree-file {
+    margin-left: 1.15rem;
+    color: #4b5563;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h4 class="mb-0">{{ repo.name }}</h4>
+    <small class="text-muted">{{ repo.repo_url }}</small>
+  </div>
+  <a class="btn btn-outline-secondary" href="{% url 'playbooks:repo-list' %}">Back</a>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Repository Sync</h6></div>
+      <div class="card-body">
+        <form method="post" action="{% url 'playbooks:repo-sync-branches' repo.pk %}" class="mb-3">
+          {% csrf_token %}
+          <button class="btn btn-sm btn-primary" type="submit">Check Branches</button>
+        </form>
+
+        <form method="post" action="{% url 'playbooks:repo-sync-playbooks' repo.pk %}">
+          {% csrf_token %}
+          <label class="form-label">Branch</label>
+          <select name="branch" class="form-select form-select-sm mb-2">
+            {% for branch in repo.branches.all %}
+              <option value="{{ branch.name }}" {% if branch.name == repo.default_branch %}selected{% endif %}>{{ branch.name }}</option>
+            {% empty %}
+              <option value="{{ repo.default_branch }}">{{ repo.default_branch }}</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm btn-outline-primary" type="submit">Scan Playbooks</button>
+        </form>
+
+        <hr>
+        <div class="small text-muted">
+          <div>Default branch: {{ repo.default_branch }}</div>
+          <div>Last branch sync: {{ repo.last_branch_sync_at|default:'-' }}</div>
+          <div>Last playbook sync: {{ repo.last_playbook_sync_at|default:'-' }}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Discovered Playbooks</h6></div>
+      <div class="card-body">
+        <div class="table-responsive">
+          <table class="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th>Branch</th>
+                <th>Path</th>
+                <th>Active</th>
+              </tr>
+            </thead>
+            <tbody>
+            {% for item in repo.playbooks.all %}
+              <tr>
+                <td>{{ item.branch }}</td>
+                <td class="small">{{ item.path }}</td>
+                <td>{% if item.is_active %}yes{% else %}no{% endif %}</td>
+              </tr>
+            {% empty %}
+              <tr><td colspan="3">No playbooks discovered yet. Save/update repo or run "Scan Playbooks" for the selected branch.</td></tr>
+            {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0">Repository Tree</h6>
+        <button class="btn btn-sm btn-outline-primary" type="button" id="refresh-tree-btn">Refresh Tree</button>
+      </div>
+      <div class="card-body">
+        <div class="row g-2 mb-2">
+          <div class="col-md-6">
+            <label class="form-label small mb-1">Inspect Branch</label>
+            <select id="inspect-branch" class="form-select form-select-sm">
+              {% for branch in repo.branches.all %}
+                <option value="{{ branch.name }}" {% if branch.name == repo.default_branch %}selected{% endif %}>{{ branch.name }}</option>
+              {% empty %}
+                <option value="{{ repo.default_branch }}">{{ repo.default_branch }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div id="tree-status" class="small text-muted mb-2"></div>
+        <div id="repo-tree" class="small repo-tree" style="max-height: 50vh; overflow: auto;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+{{ initial_tree|json_script:"initial-tree-data" }}
+<script>
+  (function () {
+    const treeEl = document.getElementById("repo-tree");
+    const statusEl = document.getElementById("tree-status");
+    const branchSelect = document.getElementById("inspect-branch");
+    const refreshBtn = document.getElementById("refresh-tree-btn");
+    const repoUrl = "{{ repo.repo_url|escapejs }}";
+
+    function setStatus(text, kind) {
+      statusEl.className = "small mb-2 " + (kind === "error" ? "text-danger" : "text-muted");
+      statusEl.textContent = text;
+    }
+
+    function renderTreeNode(node, depth) {
+      if (!node) {
+        return "";
+      }
+      if (node.type === "file") {
+        return "<div class=\"repo-tree-file\">" + node.name + "</div>";
+      }
+      const children = (node.children || []).map((child) => renderTreeNode(child, depth + 1)).join("");
+      const openAttr = depth === 0 ? " open" : "";
+      return "<details" + openAttr + "><summary><strong>" + node.name + "</strong></summary><div>" + children + "</div></details>";
+    }
+
+    function renderTree(tree) {
+      if (!tree) {
+        treeEl.innerHTML = "<div class=\"text-muted\">No tree available.</div>";
+        return;
+      }
+      treeEl.innerHTML = renderTreeNode(tree, 0);
+    }
+
+    async function refreshTree() {
+      const branch = (branchSelect.value || "").trim();
+      setStatus("Refreshing repository tree...", "muted");
+      const params = new URLSearchParams({
+        repo_url: repoUrl,
+        branch: branch,
+      });
+
+      try {
+        const response = await fetch("{% url 'playbooks:repo-inspect' %}?" + params.toString(), { credentials: "same-origin" });
+        const data = await response.json();
+        if (!response.ok || !data.ok) {
+          throw new Error(data.error || "Tree refresh failed");
+        }
+        renderTree(data.tree);
+        setStatus("Repository tree loaded.", "muted");
+      } catch (err) {
+        setStatus("Tree refresh failed: " + (err && err.message ? err.message : String(err)), "error");
+      }
+    }
+
+    const initialNode = document.getElementById("initial-tree-data");
+    if (initialNode && initialNode.textContent) {
+      try {
+        const initial = JSON.parse(initialNode.textContent);
+        if (initial && initial.tree) {
+          renderTree(initial.tree);
+          setStatus("Repository tree loaded.", "muted");
+        }
+      } catch (_) {
+        setStatus("Unable to parse initial tree payload.", "error");
+      }
+    }
+
+    refreshBtn.addEventListener("click", refreshTree);
+    branchSelect.addEventListener("change", refreshTree);
+  })();
+</script>
+{% endblock %}

@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+
+{% block title %}OS Catalog | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="mb-0">Operating Systems</h5>
+    <a class="btn btn-sm btn-primary ms-auto" href="{% url 'catalog:os-create' %}" data-modal="1" data-modal-title="New OS">New OS</a>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Family</th>
+            <th>ISOs</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+      {% for item in items %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td>{{ item.get_family_display }}</td>
+            <td>{{ item.isos.count }}</td>
+            <td class="text-end">
+              <a class="btn btn-sm btn-outline-primary" href="{% url 'catalog:os-detail' item.pk %}">Manage</a>
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'catalog:os-edit' item.pk %}" data-modal="1" data-modal-title="Edit OS">Edit</a>
+              <form method="post" action="{% url 'catalog:os-delete' item.pk %}" class="d-inline" data-confirm-message="Delete OS and all related ISOs?" data-confirm-title="Delete Operating System" data-confirm-accept="Delete">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+              </form>
+            </td>
+          </tr>
+      {% empty %}
+          <tr>
+            <td colspan="4">No OS entries yet.</td>
+          </tr>
+      {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

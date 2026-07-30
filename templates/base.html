@@ -1,0 +1,585 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}TuxWSMaker{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='%232c3e50' d='M8.186 1.113a.5.5 0 0 0-.372 0L1.846 3.5l2.404.961L10.404 2zm3.564 1.426L5.596 5 8 5.961 14.154 3.5zm3.25 1.7-6.5 2.6v7.922l6.5-2.6V4.24zM7.5 14.762V6.838L1 4.239v7.923zM7.443.184a1.5 1.5 0 0 1 1.114 0l7.129 2.852A.5.5 0 0 1 16 3.5v8.662a1 1 0 0 1-.629.928l-7.185 2.874a.5.5 0 0 1-.372 0L.63 13.09a1 1 0 0 1-.63-.928V3.5a.5.5 0 0 1 .314-.464z'/%3E%3C/svg%3E">
+
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+
+    <style>
+        :root {
+            --sidebar-width: 250px;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        .sidebar {
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            width: var(--sidebar-width);
+            background: #2c3e50;
+            color: white;
+            padding: 1rem;
+            overflow-y: auto;
+        }
+
+        .sidebar .nav-link {
+            color: rgba(255, 255, 255, 0.8);
+            margin-bottom: 0.5rem;
+            border-radius: 0.25rem;
+        }
+
+        .sidebar .nav-link:hover,
+        .sidebar .nav-link.active {
+            color: white;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .main-content {
+            margin-left: var(--sidebar-width);
+            padding: 2rem;
+        }
+
+        .navbar-custom {
+            background: #34495e;
+            margin-left: var(--sidebar-width);
+        }
+
+        .status-badge {
+            font-size: 0.875rem;
+            padding: 0.25rem 0.5rem;
+        }
+    </style>
+
+    {% block extra_css %}{% endblock %}
+</head>
+<body>
+    {% if user.is_authenticated %}
+    <div class="sidebar">
+        <h4 class="mb-4">
+            <i class="bi bi-hdd-rack"></i> TuxWSMaker
+        </h4>
+
+        <nav class="nav flex-column">
+            <a class="nav-link" href="/">
+                <i class="bi bi-speedometer2"></i> Dashboard
+            </a>
+            <hr class="my-2" style="border-color: rgba(255,255,255,0.15);">
+            <a class="nav-link" href="/os/">
+                <i class="bi bi-diagram-3"></i> OS
+            </a>
+            <a class="nav-link" href="/partitions/">
+                <i class="bi bi-layout-split"></i> Partition Layouts
+            </a>
+            <a class="nav-link" href="/builds/configs/">
+                <i class="bi bi-cpu"></i> Build Config
+            </a>
+            <a class="nav-link" href="/packages/">
+                <i class="bi bi-box-seam"></i> Package Lists
+            </a>
+            <a class="nav-link" href="/playbooks/">
+                <i class="bi bi-journal-code"></i> Playbooks
+            </a>
+            <a class="nav-link" href="/builds/">
+                <i class="bi bi-hammer"></i> Builds
+            </a>
+            <a class="nav-link" href="/builds/ssh-keys/">
+                <i class="bi bi-key"></i> SSH Keys
+            </a>
+            <a class="nav-link" href="/configuration/">
+                <i class="bi bi-gear"></i> Configuration
+            </a>
+
+            <hr class="my-3" style="border-color: rgba(255,255,255,0.2);">
+
+            <a class="nav-link" href="/admin/">
+                <i class="bi bi-shield-lock"></i> Admin
+            </a>
+            <a class="nav-link" href="/api/">
+                <i class="bi bi-code-slash"></i> API
+            </a>
+        </nav>
+    </div>
+
+    <nav class="navbar navbar-dark navbar-custom">
+        <div class="container-fluid">
+            <span class="navbar-text">
+                Welcome, <strong>{{ user.username }}</strong>
+            </span>
+            <div class="d-flex align-items-center gap-2">
+                <span id="ws-status" class="badge text-bg-secondary status-badge">WS: connecting</span>
+                <a href="/" class="btn btn-outline-light btn-sm">
+                    <i class="bi bi-house"></i> Home
+                </a>
+                <form method="post" action="{% url 'users:logout' %}" class="d-flex">
+                    {% csrf_token %}
+                    <button class="btn btn-outline-light btn-sm" type="submit">
+                        <i class="bi bi-box-arrow-right"></i> Logout
+                    </button>
+                </form>
+            </div>
+        </div>
+    </nav>
+    {% endif %}
+
+    <div class="{% if user.is_authenticated %}main-content{% else %}container mt-5{% endif %}">
+      {% if messages %}
+      <div class="messages">
+        {% for message in messages %}
+        <div class="alert alert-{{ message.tags|default:'info' }} alert-dismissible fade show" role="alert">
+          {{ message }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {% block content %}{% endblock %}
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+            (function () {
+                if (window.location.protocol !== "http:") {
+                    return;
+                }
+                if (window.location.hostname !== "localhost") {
+                    return;
+                }
+                const target = "127.0.0.1";
+                const url = window.location;
+                const port = url.port ? ":" + url.port : "";
+                const next = url.protocol + "//" + target + port + url.pathname + url.search + url.hash;
+                window.location.replace(next);
+            })();
+        </script>
+        <script>
+            (function () {
+                function getCookie(name) {
+                    const cookie = document.cookie
+                        .split(";")
+                        .map((v) => v.trim())
+                        .find((v) => v.startsWith(name + "="));
+                    return cookie ? decodeURIComponent(cookie.split("=").slice(1).join("=")) : "";
+                }
+
+                function ensureCsrfToken(form) {
+                    if (!form || String(form.method || "").toLowerCase() !== "post") {
+                        return;
+                    }
+
+                    const token = getCookie("csrftoken");
+                    if (!token) {
+                        return;
+                    }
+
+                    let input = form.querySelector('input[name="csrfmiddlewaretoken"]');
+                    if (!input) {
+                        input = document.createElement("input");
+                        input.type = "hidden";
+                        input.name = "csrfmiddlewaretoken";
+                        form.prepend(input);
+                    }
+                    if (!input.value) {
+                        input.value = token;
+                    }
+                }
+
+                document.addEventListener(
+                    "submit",
+                    function (event) {
+                        ensureCsrfToken(event.target);
+                    },
+                    true
+                );
+
+                document.querySelectorAll('form[method="post"]').forEach(ensureCsrfToken);
+            })();
+
+            (function () {
+                if (!{{ user.is_authenticated|yesno:"true,false" }}) {
+                    return;
+                }
+
+                const statusBadge = document.getElementById("ws-status");
+                const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+                const wsUrl = protocol + "://" + window.location.host + "/ws/updates/";
+                const path = window.location.pathname;
+                const formPattern = /\/(new|create|edit|update)\b/;
+                let socket = null;
+                let reconnectTimer = null;
+                let dirtyForm = false;
+
+                document.addEventListener("input", function (event) {
+                    if (event.target && event.target.closest("form")) {
+                        dirtyForm = true;
+                    }
+                });
+
+                document.addEventListener("change", function (event) {
+                    if (event.target && event.target.closest("form")) {
+                        dirtyForm = true;
+                    }
+                });
+
+                document.addEventListener(
+                    "submit",
+                    function (event) {
+                        if (event.target && event.target.closest("form")) {
+                            dirtyForm = true;
+                        }
+                    },
+                    true
+                );
+
+                function setStatus(text, cls) {
+                    if (!statusBadge) {
+                        return;
+                    }
+                    statusBadge.className = "badge status-badge " + cls;
+                    statusBadge.textContent = text;
+                }
+
+                function eventMatchesCurrentPage(eventData) {
+                    const scope = eventData.scope || "";
+                    if (path.startsWith("/builds/")) {
+                        return scope === "builds" || scope === "build-config";
+                    }
+                    if (path.startsWith("/os/")) {
+                        return scope === "catalog";
+                    }
+                    if (path.startsWith("/partitions/")) {
+                        return scope === "layouts";
+                    }
+                    if (path.startsWith("/packages/")) {
+                        return scope === "packages";
+                    }
+                    if (path.startsWith("/playbooks/")) {
+                        return scope === "playbooks";
+                    }
+                    if (path.startsWith("/configuration/")) {
+                        return scope === "serverconfig";
+                    }
+                    if (path === "/") {
+                        return true;
+                    }
+                    return false;
+                }
+
+                function handleEvent(eventData) {
+                    const liveEvent = new CustomEvent("tuxws:update", { detail: eventData, cancelable: true });
+                    const allowDefaultReload = window.dispatchEvent(liveEvent);
+                    if (!allowDefaultReload) {
+                        return;
+                    }
+
+                    if (window.__tuxUploadActive) {
+                        setStatus("WS: live (upload active)", "text-bg-info");
+                        return;
+                    }
+
+                    if (/^\/os\/\d+\/$/.test(path)) {
+                        setStatus("WS: update pending", "text-bg-warning");
+                        return;
+                    }
+
+                    if (!eventMatchesCurrentPage(eventData)) {
+                        return;
+                    }
+
+                    if (!formPattern.test(path) && !dirtyForm) {
+                        window.location.reload();
+                        return;
+                    }
+
+                    setStatus("WS: update pending", "text-bg-warning");
+                }
+
+                function connect() {
+                    setStatus("WS: connecting", "text-bg-secondary");
+                    socket = new WebSocket(wsUrl);
+
+                    socket.onopen = function () {
+                        setStatus("WS: live", "text-bg-success");
+                    };
+
+                    socket.onmessage = function (msg) {
+                        try {
+                            const data = JSON.parse(msg.data);
+                            if (data.type === "event" && data.event) {
+                                handleEvent(data.event);
+                            }
+                        } catch (err) {
+                            console.error("WebSocket parse error", err);
+                        }
+                    };
+
+                    socket.onclose = function () {
+                        setStatus("WS: reconnecting", "text-bg-warning");
+                        reconnectTimer = window.setTimeout(connect, 1500);
+                    };
+
+                    socket.onerror = function () {
+                        setStatus("WS: error", "text-bg-danger");
+                    };
+                }
+
+                connect();
+
+                window.addEventListener("beforeunload", function () {
+                    if (reconnectTimer) {
+                        window.clearTimeout(reconnectTimer);
+                    }
+                    if (socket) {
+                        socket.close();
+                    }
+                });
+            })();
+        </script>
+
+        <div class="modal fade" id="app-modal" tabindex="-1" aria-hidden="true">
+            <div class="modal-dialog modal-xl modal-dialog-scrollable">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="app-modal-title">Dialog</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body" id="app-modal-body">
+                        <div class="text-muted">Loading...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="modal fade" id="confirm-modal" tabindex="-1" aria-hidden="true">
+            <div class="modal-dialog modal-dialog-centered">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h5 class="modal-title" id="confirm-modal-title">Please Confirm</h5>
+                        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body" id="confirm-modal-body"></div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-outline-secondary" data-bs-dismiss="modal" id="confirm-modal-cancel">Cancel</button>
+                        <button type="button" class="btn btn-danger" id="confirm-modal-accept">Confirm</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            (function () {
+                const confirmModalEl = document.getElementById("confirm-modal");
+                const confirmTitleEl = document.getElementById("confirm-modal-title");
+                const confirmBodyEl = document.getElementById("confirm-modal-body");
+                const confirmAcceptEl = document.getElementById("confirm-modal-accept");
+                const confirmCancelEl = document.getElementById("confirm-modal-cancel");
+                if (!confirmModalEl || !confirmTitleEl || !confirmBodyEl || !confirmAcceptEl || !confirmCancelEl) {
+                    return;
+                }
+
+                const confirmModal = bootstrap.Modal.getOrCreateInstance(confirmModalEl);
+
+                window.tuxConfirm = function (message, options) {
+                    const opts = options || {};
+                    confirmTitleEl.textContent = opts.title || "Please Confirm";
+                    confirmBodyEl.textContent = message || "Are you sure?";
+                    confirmAcceptEl.textContent = opts.confirmLabel || "Confirm";
+                    confirmCancelEl.textContent = opts.cancelLabel || "Cancel";
+                    confirmAcceptEl.className = "btn " + (opts.confirmClass || "btn-danger");
+
+                    return new Promise(function (resolve) {
+                        let settled = false;
+
+                        function finish(value) {
+                            if (settled) {
+                                return;
+                            }
+                            settled = true;
+                            confirmAcceptEl.removeEventListener("click", onAccept);
+                            confirmModalEl.removeEventListener("hidden.bs.modal", onHidden);
+                            resolve(value);
+                        }
+
+                        function onAccept() {
+                            finish(true);
+                            confirmModal.hide();
+                        }
+
+                        function onHidden() {
+                            finish(false);
+                        }
+
+                        confirmAcceptEl.addEventListener("click", onAccept);
+                        confirmModalEl.addEventListener("hidden.bs.modal", onHidden);
+                        confirmModal.show();
+                    });
+                };
+
+                document.addEventListener(
+                    "submit",
+                    function (event) {
+                        const form = event.target;
+                        if (!form || !form.matches("form")) {
+                            return;
+                        }
+
+                        const message = form.getAttribute("data-confirm-message");
+                        if (!message) {
+                            return;
+                        }
+
+                        if (form.dataset.confirmedSubmit === "1") {
+                            form.dataset.confirmedSubmit = "0";
+                            return;
+                        }
+
+                        event.preventDefault();
+                        window
+                            .tuxConfirm(message, {
+                                title: form.getAttribute("data-confirm-title") || "Please Confirm",
+                                confirmLabel: form.getAttribute("data-confirm-accept") || "Confirm",
+                                cancelLabel: form.getAttribute("data-confirm-cancel") || "Cancel",
+                                confirmClass: form.getAttribute("data-confirm-class") || "btn-danger",
+                            })
+                            .then(function (ok) {
+                                if (!ok) {
+                                    return;
+                                }
+                                form.dataset.confirmedSubmit = "1";
+                                form.submit();
+                            });
+                    },
+                    true
+                );
+            })();
+        </script>
+
+        <script>
+            (function () {
+                if (!{{ user.is_authenticated|yesno:"true,false" }}) {
+                    return;
+                }
+
+                const modalEl = document.getElementById("app-modal");
+                const modalTitleEl = document.getElementById("app-modal-title");
+                const modalBodyEl = document.getElementById("app-modal-body");
+                if (!modalEl || !modalBodyEl) {
+                    return;
+                }
+
+                const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+
+                function csrfToken() {
+                    const input = document.querySelector('input[name="csrfmiddlewaretoken"]');
+                    return input ? input.value : "";
+                }
+
+                function runScripts(root) {
+                    root.querySelectorAll("script").forEach(function (oldScript) {
+                        const newScript = document.createElement("script");
+                        Array.from(oldScript.attributes).forEach(function (attr) {
+                            newScript.setAttribute(attr.name, attr.value);
+                        });
+                        if (!oldScript.src) {
+                            newScript.text = oldScript.textContent || "";
+                        }
+                        oldScript.replaceWith(newScript);
+                    });
+                }
+
+                function setModalContent(html) {
+                    modalBodyEl.innerHTML = html;
+                    runScripts(modalBodyEl);
+                }
+
+                function wireForm(form) {
+                    if (!form) {
+                        return;
+                    }
+                    form.addEventListener("submit", async function (event) {
+                        event.preventDefault();
+                        const submitBtn = form.querySelector('button[type="submit"], input[type="submit"]');
+                        if (submitBtn) {
+                            submitBtn.disabled = true;
+                        }
+                        try {
+                            const response = await fetch(form.action, {
+                                method: "POST",
+                                headers: {
+                                    "X-Requested-With": "XMLHttpRequest",
+                                    "X-Modal-Request": "1",
+                                    "X-CSRFToken": csrfToken(),
+                                },
+                                body: new FormData(form),
+                                credentials: "same-origin",
+                            });
+                            const contentType = response.headers.get("content-type") || "";
+                            if (contentType.includes("application/json")) {
+                                const data = await response.json();
+                                if (!response.ok || !data.ok) {
+                                    throw new Error((data && data.error) || "Save failed");
+                                }
+                                modal.hide();
+                                window.location.reload();
+                                return;
+                            }
+                            const html = await response.text();
+                            setModalContent(html);
+                            const nextForm = modalBodyEl.querySelector("form");
+                            if (nextForm) {
+                                wireForm(nextForm);
+                            }
+                        } catch (err) {
+                            setModalContent('<div class="alert alert-danger mb-0">' + (err && err.message ? err.message : String(err)) + '</div>');
+                        } finally {
+                            if (submitBtn) {
+                                submitBtn.disabled = false;
+                            }
+                        }
+                    });
+                }
+
+                async function openModal(url, title) {
+                    modalTitleEl.textContent = title || "Dialog";
+                    setModalContent('<div class="text-muted">Loading...</div>');
+                    modal.show();
+                    try {
+                        const response = await fetch(url + (url.indexOf("?") === -1 ? "?" : "&") + "modal=1", {
+                            headers: {
+                                "X-Requested-With": "XMLHttpRequest",
+                            },
+                            credentials: "same-origin",
+                        });
+                        const html = await response.text();
+                        setModalContent(html);
+                        const form = modalBodyEl.querySelector("form");
+                        if (form) {
+                            wireForm(form);
+                        }
+                    } catch (err) {
+                        setModalContent('<div class="alert alert-danger mb-0">' + (err && err.message ? err.message : String(err)) + '</div>');
+                    }
+                }
+
+                document.addEventListener("click", function (event) {
+                    const link = event.target.closest('[data-modal="1"]');
+                    if (!link) {
+                        return;
+                    }
+                    event.preventDefault();
+                    openModal(link.getAttribute("href"), link.getAttribute("data-modal-title") || link.textContent.trim() || "Dialog");
+                });
+            })();
+        </script>
+
+    {% block extra_js %}{% endblock %}
+</body>
+</html>

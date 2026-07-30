@@ -1,0 +1,27 @@
+<form method="post" action="{{ request.path }}" id="playbook-repo-form" class="modal-repo-form">
+  {% csrf_token %}
+  {% if modal_mode %}
+    <input type="hidden" name="modal" value="1">
+  {% endif %}
+  <div class="row g-3">
+    <div class="col-12">{{ form.name.label_tag }} {{ form.name }}</div>
+    <div class="col-12">{{ form.repo_url.label_tag }} {{ form.repo_url }}</div>
+    <div class="col-md-6" id="ssh-key-field-wrap">{{ form.ssh_key.label_tag }} {{ form.ssh_key }}</div>
+    <div class="col-md-6" id="api-key-field-wrap">{{ form.api_key.label_tag }} {{ form.api_key }}</div>
+    <div class="col-md-6">{{ form.default_branch.label_tag }} {{ form.default_branch }}</div>
+  </div>
+  <div class="text-muted small mt-2 mb-3">
+    SSH repositories use a user-managed private key. HTTPS repositories use an API key/token.
+  </div>
+  <div class="d-flex gap-2 justify-content-end">
+    <button class="btn btn-primary" type="submit">Save</button>
+    {% if modal_mode %}
+      <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Cancel</button>
+    {% else %}
+      <a class="btn btn-outline-secondary" href="{% url 'playbooks:repo-list' %}">Cancel</a>
+    {% endif %}
+  </div>
+  {% if form.errors %}
+    <div class="alert alert-danger mt-3 mb-0">{{ form.errors }}</div>
+  {% endif %}
+</form>

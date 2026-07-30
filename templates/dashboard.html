@@ -1,0 +1,84 @@
+{% extends 'base.html' %}
+
+{% block title %}Dashboard | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="row g-3">
+  <div class="col-md-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">Total Builds</div>
+        <div id="dash-build-total" class="h3 mb-0">-</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">Queued</div>
+        <div id="dash-build-queued" class="h3 mb-0">-</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">Running</div>
+        <div id="dash-build-running" class="h3 mb-0">-</div>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card">
+      <div class="card-body">
+        <div class="text-muted small">Succeeded / Failed</div>
+        <div class="h3 mb-0"><span id="dash-build-succeeded">-</span> / <span id="dash-build-failed">-</span></div>
+      </div>
+    </div>
+  </div>
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body">
+        <h3 class="mb-2">Build Image Rollout Platform</h3>
+        <p class="mb-0">MVP scaffold is active. Use the sidebar to manage OS images, partition layouts, package lists, build definitions, and server settings.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  (function () {
+    function setText(id, value) {
+      const node = document.getElementById(id);
+      if (node) {
+        node.textContent = String(value);
+      }
+    }
+
+    async function refreshSummary() {
+      const response = await fetch("/api/dashboard/summary/", { credentials: "same-origin" });
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      setText("dash-build-total", data.build_total || 0);
+      setText("dash-build-queued", data.build_queued || 0);
+      setText("dash-build-running", data.build_running || 0);
+      setText("dash-build-succeeded", data.build_succeeded || 0);
+      setText("dash-build-failed", data.build_failed || 0);
+    }
+
+    refreshSummary();
+
+    window.addEventListener("tuxws:update", function (event) {
+      const detail = event.detail || {};
+      if (["builds", "build-config", "catalog", "layouts", "packages", "serverconfig"].includes(detail.scope)) {
+        event.preventDefault();
+        refreshSummary();
+      }
+    });
+  })();
+</script>
+{% endblock %}

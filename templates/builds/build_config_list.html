@@ -1,0 +1,48 @@
+{% extends 'base.html' %}
+
+{% block title %}Build Config | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="mb-0">Build Machine Configurations</h5>
+    <a class="btn btn-sm btn-primary ms-auto" href="{% url 'builds:build-config-create' %}" data-modal="1" data-modal-title="New Config">New Config</a>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Resources</th>
+            <th>Network</th>
+            <th>Boot</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+      {% for item in items %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td>{{ item.cpu }} vCPU / {{ item.memory_mib }} MiB</td>
+            <td>wsbuildnet</td>
+            <td>{{ item.get_boot_mode_display }}</td>
+            <td class="text-end">
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'builds:build-config-edit' item.pk %}" data-modal="1" data-modal-title="Edit Config">Edit</a>
+              <form method="post" action="{% url 'builds:build-config-delete' item.pk %}" class="d-inline" data-confirm-message="Delete this machine config?" data-confirm-title="Delete Build Config" data-confirm-accept="Delete">
+                {% csrf_token %}
+                <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>
+      {% empty %}
+          <tr>
+            <td colspan="5" class="text-muted">No build machine configs defined.</td>
+          </tr>
+      {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

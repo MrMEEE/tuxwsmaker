@@ -1,0 +1,47 @@
+{% extends 'base.html' %}
+
+{% block title %}Playbook Repositories | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="mb-0">Playbook Repositories</h5>
+    <a class="btn btn-sm btn-primary ms-auto" href="{% url 'playbooks:repo-create' %}" data-modal="1" data-modal-title="Add Repository">Add Repository</a>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Repo URL</th>
+            <th>Default Branch</th>
+            <th>Playbooks</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for item in items %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td class="small">{{ item.repo_url }}</td>
+            <td>{{ item.default_branch }}</td>
+            <td>{{ item.playbooks.count }}</td>
+            <td class="text-end">
+              <a class="btn btn-sm btn-outline-primary" href="{% url 'playbooks:repo-detail' item.pk %}">Open</a>
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'playbooks:repo-edit' item.pk %}" data-modal="1" data-modal-title="Edit Repository">Edit</a>
+              <form method="post" action="{% url 'playbooks:repo-delete' item.pk %}" class="d-inline" data-confirm-message="Delete repository?" data-confirm-title="Delete Repository" data-confirm-accept="Delete">
+                {% csrf_token %}
+                <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5">No playbook repositories yet.</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

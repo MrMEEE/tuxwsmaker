@@ -1,0 +1,114 @@
+{% extends 'base.html' %}
+
+{% block title %}Builds | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="mb-0">Build Definitions</h5>
+    <a class="btn btn-sm btn-primary ms-auto" href="{% url 'builds:build-create' %}" data-modal="1" data-modal-title="New Build">New Build</a>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>OS</th>
+            <th>Status</th>
+            <th>Outputs</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="build-list-body">
+      {% for item in items %}
+          <tr id="build-row-{{ item.pk }}" data-build-id="{{ item.pk }}">
+            <td>{{ item.name }}</td>
+            <td>{{ item.operating_system }}</td>
+            <td class="build-status">{{ item.get_status_display }}</td>
+            <td>
+              {% if item.output_pxe %}<span class="badge text-bg-info">PXE</span>{% endif %}
+              {% if item.output_usb_img %}<span class="badge text-bg-secondary">USB</span>{% endif %}
+            </td>
+            <td class="text-end">
+              <a class="btn btn-sm btn-outline-primary" href="{% url 'builds:build-detail' item.pk %}">Open</a>
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'builds:build-edit' item.pk %}" data-modal="1" data-modal-title="Edit Build">Edit</a>
+              <form method="post" action="{% url 'builds:build-delete' item.pk %}" class="d-inline" data-confirm-message="Delete this build definition?" data-confirm-title="Delete Build Definition" data-confirm-accept="Delete">
+                {% csrf_token %}
+                <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+              </form>
+            </td>
+          </tr>
+      {% empty %}
+          <tr id="build-list-empty"><td colspan="5">No build definitions yet.</td></tr>
+      {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  (function () {
+    async function refreshBuildList() {
+      const response = await fetch("/api/builds/snapshot/", { credentials: "same-origin" });
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+
+      const body = document.getElementById("build-list-body");
+      if (!body) {
+        return;
+      }
+
+      const rows = body.querySelectorAll("tr[data-build-id]");
+      const rowsById = {};
+      rows.forEach((row) => {
+        rowsById[row.getAttribute("data-build-id")] = row;
+      });
+
+      const presentIds = new Set();
+      (data.items || []).forEach((item) => {
+        const key = String(item.id);
+        presentIds.add(key);
+        const row = rowsById[key];
+        if (row) {
+          const statusCell = row.querySelector(".build-status");
+          if (statusCell) {
+            statusCell.textContent = item.status_display;
+          }
+        }
+      });
+
+      Object.keys(rowsById).forEach((id) => {
+        if (!presentIds.has(id)) {
+          rowsById[id].remove();
+        }
+      });
+
+      const hasRows = body.querySelector("tr[data-build-id]") !== null;
+      let emptyRow = document.getElementById("build-list-empty");
+      if (!hasRows && !emptyRow) {
+        emptyRow = document.createElement("tr");
+        emptyRow.id = "build-list-empty";
+        emptyRow.innerHTML = "<td colspan=\"5\">No build definitions yet.</td>";
+        body.appendChild(emptyRow);
+      }
+      if (hasRows && emptyRow) {
+        emptyRow.remove();
+      }
+    }
+
+    window.addEventListener("tuxws:update", function (event) {
+      const detail = event.detail || {};
+      if (detail.scope === "builds" || detail.scope === "build-config") {
+        event.preventDefault();
+        refreshBuildList();
+      }
+    });
+  })();
+</script>
+{% endblock %}

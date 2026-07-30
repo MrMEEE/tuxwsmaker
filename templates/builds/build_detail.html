@@ -1,0 +1,185 @@
+{% extends 'base.html' %}
+
+{% block title %}Build Detail | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h4 class="mb-0">{{ build.name }}</h4>
+    <small id="build-status-text" class="text-muted">Status: {{ build.get_status_display }}</small>
+  </div>
+  <div class="d-flex gap-2">
+    <a class="btn btn-outline-secondary" href="{% url 'builds:build-edit' build.pk %}" data-modal="1" data-modal-title="Edit Build">Edit</a>
+    {% if show_cancel_build %}
+    <form method="post" action="{% url 'builds:build-cancel' build.pk %}" data-confirm-message="Cancel this running build?" data-confirm-title="Cancel Build" data-confirm-accept="Cancel Build" data-confirm-class="btn-warning">
+      {% csrf_token %}
+      <button class="btn btn-outline-danger" type="submit">Cancel Build</button>
+    </form>
+    {% else %}
+    <form method="post" action="{% url 'builds:build-queue' build.pk %}">
+      {% csrf_token %}
+      <button class="btn btn-primary" type="submit">Queue Build</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Configuration</h6></div>
+      <div class="card-body">
+        <dl class="row mb-0">
+          <dt class="col-sm-5">Operating System</dt><dd class="col-sm-7">{{ build.operating_system }}</dd>
+          <dt class="col-sm-5">ISO</dt><dd class="col-sm-7">{{ build.iso_image }}</dd>
+          <dt class="col-sm-5">Partition Layout</dt><dd class="col-sm-7">{{ build.partition_layout }}</dd>
+          <dt class="col-sm-5">Machine Config</dt><dd class="col-sm-7">{{ build.machine_config }}</dd>
+          <dt class="col-sm-5">Ordered Playbooks</dt>
+          <dd class="col-sm-7">
+            <ol class="mb-0 ps-3">
+              {% for sel in build.ordered_playbook_selections %}
+                <li><span class="small">{{ sel.playbook.repository.name }} [{{ sel.playbook.branch }}] {{ sel.playbook.path }}</span></li>
+              {% empty %}
+                <li class="text-muted">none</li>
+              {% endfor %}
+            </ol>
+            {% if not build.ordered_playbook_selections and build.playbook_path %}
+            <div class="small text-muted mt-1">Legacy fallback: {{ build.playbook_path }} ({{ build.playbook_branch }})</div>
+            {% endif %}
+          </dd>
+          <dt class="col-sm-5">Outputs</dt>
+          <dd class="col-sm-7">
+            {% if build.output_pxe %}<span class="badge text-bg-info">PXE</span>{% endif %}
+            {% if build.output_usb_img %}<span class="badge text-bg-secondary">USB IMG</span>{% endif %}
+          </dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Artifacts</h6></div>
+      <div class="card-body">
+        <ul id="artifact-list" class="list-group">
+          {% for artifact in build.artifacts.all %}
+          <li class="list-group-item">
+            <div class="d-flex justify-content-between">
+              <strong>{{ artifact.get_artifact_type_display }}</strong>
+              <small>{{ artifact.created_at }}</small>
+            </div>
+            <div class="small text-muted">{{ artifact.file_path }}</div>
+            <div class="small"><code>{{ artifact.sha256 }}</code></div>
+            <div class="mt-2">
+              <a class="btn btn-sm btn-outline-primary" href="{% url 'builds:artifact-download' build.pk artifact.pk %}">Download</a>
+            </div>
+          </li>
+          {% empty %}
+          <li id="artifact-list-empty" class="list-group-item">No artifacts yet.</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Build Log</h6></div>
+      <div class="card-body">
+        <ul id="build-log-list" class="list-group">
+          {% for log in build.logs.all %}
+          <li class="list-group-item d-flex justify-content-between gap-3">
+            <div>
+              {% if log.stage %}<span class="badge text-bg-dark me-2">{{ log.stage }}</span>{% endif %}
+              <span>{{ log.message }}</span>
+            </div>
+            <small class="text-muted text-nowrap">{{ log.created_at }}</small>
+          </li>
+          {% empty %}
+          <li id="build-log-empty" class="list-group-item text-muted">No build log yet.</li>
+          {% endfor %}
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  (function () {
+    const buildId = {{ build.id }};
+
+    function artifactItem(artifact) {
+      return ""
+        + "<li class=\"list-group-item\">"
+        + "<div class=\"d-flex justify-content-between\">"
+        + "<strong>" + artifact.artifact_type_display + "</strong>"
+        + "<small>" + (new Date(artifact.created_at)).toLocaleString() + "</small>"
+        + "</div>"
+        + "<div class=\"small text-muted\">" + artifact.file_path + "</div>"
+        + "<div class=\"small\"><code>" + artifact.sha256 + "</code></div>"
+        + "<div class=\"mt-2\">"
+        + "<a class=\"btn btn-sm btn-outline-primary\" href=\"" + artifact.download_url + "\">Download</a>"
+        + "</div>"
+        + "</li>";
+    }
+
+    function logItem(log) {
+      return ""
+        + "<li class=\"list-group-item d-flex justify-content-between gap-3\">"
+        + "<div>"
+        + (log.stage ? "<span class=\"badge text-bg-dark me-2\">" + log.stage + "</span>" : "")
+        + "<span>" + log.message + "</span>"
+        + "</div>"
+        + "<small class=\"text-muted text-nowrap\">" + (new Date(log.created_at)).toLocaleString() + "</small>"
+        + "</li>";
+    }
+
+    async function refreshBuildDetail() {
+      const response = await fetch("/api/builds/" + buildId + "/snapshot/", { credentials: "same-origin" });
+      if (!response.ok) {
+        return;
+      }
+      const data = await response.json();
+      const status = document.getElementById("build-status-text");
+      if (status) {
+        status.textContent = "Status: " + data.status_display;
+      }
+
+      const artifactList = document.getElementById("artifact-list");
+      const logList = document.getElementById("build-log-list");
+      if (!artifactList) {
+        return;
+      }
+      if (!data.artifacts || data.artifacts.length === 0) {
+        artifactList.innerHTML = "<li id=\"artifact-list-empty\" class=\"list-group-item\">No artifacts yet.</li>";
+      } else {
+        artifactList.innerHTML = data.artifacts.map(artifactItem).join("");
+      }
+
+      if (!logList) {
+        return;
+      }
+      if (!data.logs || data.logs.length === 0) {
+        logList.innerHTML = "<li id=\"build-log-empty\" class=\"list-group-item text-muted\">No build log yet.</li>";
+        return;
+      }
+      logList.innerHTML = data.logs.map(logItem).join("");
+    }
+
+    window.addEventListener("tuxws:update", function (event) {
+      const detail = event.detail || {};
+      if (detail.scope !== "builds") {
+        return;
+      }
+
+      const payload = detail.payload || {};
+      if (Number(payload.build_id) === buildId) {
+        event.preventDefault();
+        refreshBuildDetail();
+      }
+    });
+  })();
+</script>
+{% endblock %}

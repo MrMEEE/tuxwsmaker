@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+
+{% block title %}Add User SSH Key | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">Add User SSH Key</h5></div>
+  <div class="card-body">
+    {% include 'builds/ssh_key_form_fragment.html' %}
+  </div>
+</div>
+{% endblock %}

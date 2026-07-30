@@ -1,0 +1,124 @@
+{% extends 'base.html' %}
+
+{% block title %}Manage OS | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h4 class="mb-0">{{ os_item.name }}</h4>
+    <small class="text-muted">{{ os_item.get_family_display }}</small>
+  </div>
+  <a class="btn btn-outline-secondary" href="{% url 'catalog:os-list' %}">Back</a>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">OS Variables</h6></div>
+      <div class="card-body">
+        <form method="post" action="{% url 'catalog:os-variables' os_item.pk %}">
+          {% csrf_token %}
+          {{ os_var_form.as_p }}
+          <button type="submit" class="btn btn-primary btn-sm">Save OS Variables</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Upload ISO(s)</h6></div>
+      <div class="card-body">
+        <form method="post" enctype="multipart/form-data" action="{% url 'catalog:iso-upload' os_item.pk %}">
+          {% csrf_token %}
+          <div class="mb-2">
+            <label class="form-label" for="iso-files">Files</label>
+            <input class="form-control" type="file" id="iso-files" name="files" accept=".iso" multiple required>
+          </div>
+          <div class="mb-2">
+            <label class="form-label" for="iso-versions">Versions (optional)</label>
+            <textarea class="form-control" id="iso-versions" name="versions" rows="4" placeholder="Optional, one version per line"></textarea>
+            <small class="text-muted">If empty, version names are derived from ISO filenames.</small>
+          </div>
+          <div class="mb-2">
+            <label class="form-label" for="iso-os-versions">OS Versions</label>
+            <textarea class="form-control" id="iso-os-versions" name="os_versions" rows="4" placeholder="Optional, one OS version per line"></textarea>
+            <small class="text-muted">Required per ISO, but auto-derived from the version value when left empty.</small>
+          </div>
+          <button type="submit" class="btn btn-primary btn-sm">Upload</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-12">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">ISOs</h6></div>
+      <div class="card-body">
+        <div class="accordion" id="isoAccordion">
+          {% for iso in os_item.isos.all %}
+          <div class="accordion-item">
+            <h2 class="accordion-header" id="isoHeading{{ iso.pk }}">
+              <button class="accordion-button collapsed" type="button" data-bs-toggle="collapse" data-bs-target="#isoCollapse{{ iso.pk }}" aria-expanded="false" aria-controls="isoCollapse{{ iso.pk }}">
+                {{ iso.version }}{% if not iso.is_active %} (inactive){% endif %}
+              </button>
+            </h2>
+            <div id="isoCollapse{{ iso.pk }}" class="accordion-collapse collapse" aria-labelledby="isoHeading{{ iso.pk }}" data-bs-parent="#isoAccordion">
+              <div class="accordion-body">
+                <p class="mb-2"><strong>File:</strong> {{ iso.iso_file.name }}</p>
+                <form method="post" action="{% url 'catalog:iso-edit' os_item.pk iso.pk %}" class="mb-3">
+                  {% csrf_token %}
+                  <div class="row g-2">
+                    <div class="col-md-4">
+                      <label class="form-label">Version</label>
+                      <input class="form-control" type="text" name="version" value="{{ iso.version }}" required>
+                    </div>
+                    <div class="col-md-4">
+                      <label class="form-label">OS Version</label>
+                      <input class="form-control" type="text" name="os_version" value="{{ iso.os_version }}" required>
+                    </div>
+                    <div class="col-md-2">
+                      <label class="form-label">Active</label>
+                      <div class="form-check mt-2">
+                        <input class="form-check-input" type="checkbox" name="is_active" {% if iso.is_active %}checked{% endif %}>
+                      </div>
+                    </div>
+                    <div class="col-md-2 d-flex align-items-end">
+                      <button type="submit" class="btn btn-sm btn-outline-primary w-100">Save Metadata</button>
+                    </div>
+                  </div>
+                </form>
+                <p class="mb-3"><strong>Effective variables:</strong></p>
+                <ul>
+                  {% for key, value in iso.effective_variables.items %}
+                  <li><code>{{ key }}</code> = {{ value }}</li>
+                  {% empty %}
+                  <li>No variables defined.</li>
+                  {% endfor %}
+                </ul>
+
+                <form method="post" action="{% url 'catalog:iso-variables' os_item.pk iso.pk %}" class="mb-3">
+                  {% csrf_token %}
+                  <label class="form-label">ISO override variables (key=value per line)</label>
+                  <textarea class="form-control" name="data" rows="6">{% for v in iso.variables.all %}{{ v.key }}={{ v.value }}{% if not forloop.last %}
+{% endif %}{% endfor %}</textarea>
+                  <button type="submit" class="btn btn-sm btn-outline-primary mt-2">Save ISO Variables</button>
+                </form>
+
+                <form method="post" action="{% url 'catalog:iso-delete' os_item.pk iso.pk %}" data-confirm-message="Delete this ISO?" data-confirm-title="Delete ISO" data-confirm-accept="Delete">
+                  {% csrf_token %}
+                  <button type="submit" class="btn btn-sm btn-outline-danger">Delete ISO</button>
+                </form>
+              </div>
+            </div>
+          </div>
+          {% empty %}
+          <p class="text-muted mb-0">No ISO files uploaded yet.</p>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% endblock %}

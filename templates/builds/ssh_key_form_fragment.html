@@ -1,0 +1,19 @@
+<form method="post" action="{{ request.path }}">
+  {% csrf_token %}
+  <div class="row g-3">
+    <div class="col-md-4">{{ form.name.label_tag }} {{ form.name }}</div>
+    <div class="col-md-8">{{ form.private_key.label_tag }} {{ form.private_key }}</div>
+    <div class="col-12 form-check ms-2">{{ form.generate_keypair }} {{ form.generate_keypair.label_tag }}</div>
+  </div>
+  {% if form.errors %}
+    <div class="alert alert-danger mt-3 mb-0">{{ form.errors }}</div>
+  {% endif %}
+  <div class="d-flex gap-2 justify-content-end mt-3">
+    <button class="btn btn-primary" type="submit">Save Key</button>
+    {% if modal_mode %}
+      <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Cancel</button>
+    {% else %}
+      <a class="btn btn-outline-secondary" href="{% url 'builds:ssh-key-list' %}">Cancel</a>
+    {% endif %}
+  </div>
+</form>

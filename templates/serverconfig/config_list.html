@@ -1,0 +1,12 @@
+{% extends 'base.html' %}
+
+{% block title %}Configuration | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-body">
+    <p>This page has moved to the singleton configuration editor.</p>
+    <a class="btn btn-primary" href="{% url 'serverconfig:server-config' %}">Open Configuration</a>
+  </div>
+</div>
+{% endblock %}

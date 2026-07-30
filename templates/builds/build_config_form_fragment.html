@@ -1,0 +1,22 @@
+<form method="post" action="{{ request.path }}">
+  {% csrf_token %}
+  <div class="row g-3">
+    <div class="col-md-6">{{ form.name.label_tag }} {{ form.name }}</div>
+    <div class="col-md-6">{{ form.boot_mode.label_tag }} {{ form.boot_mode }}</div>
+    <div class="col-md-6">{{ form.cpu.label_tag }} {{ form.cpu }}</div>
+    <div class="col-md-6">{{ form.memory_mib.label_tag }} {{ form.memory_mib }}</div>
+    <div class="col-md-6">{{ form.hypervisor_uri.label_tag }} {{ form.hypervisor_uri }}</div>
+    <div class="col-md-6">{{ form.kickstart_timeout_minutes.label_tag }} {{ form.kickstart_timeout_minutes }}</div>
+  </div>
+  <div class="alert alert-info mt-3 mb-3">
+    Libvirt networking is fixed to wsbuildnet for all build machine configs.
+  </div>
+  <div class="d-flex gap-2 justify-content-end">
+    <button class="btn btn-primary" type="submit">Save</button>
+    {% if modal_mode %}
+      <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Cancel</button>
+    {% else %}
+      <a class="btn btn-outline-secondary" href="{% url 'builds:build-config-list' %}">Cancel</a>
+    {% endif %}
+  </div>
+</form>

@@ -1,0 +1,476 @@
+{% extends 'base.html' %}
+
+{% block title %}Server Configuration Form | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">Server Configuration</h5></div>
+  <div class="card-body">
+    <div id="rhn-dynamic-messages" class="mb-3"></div>
+    <form method="post" class="mb-4" id="server-config-form">
+      {% csrf_token %}
+      <input type="hidden" name="action" value="save">
+      <input type="hidden" name="selected_builder_image_path" id="selected_builder_image_path_hidden" value="{{ config.builder_base_image_path|default:'' }}">
+      <input type="hidden" name="rhn_username" id="builder_rhn_username">
+      <input type="hidden" name="rhn_password" id="builder_rhn_password">
+      <input type="hidden" name="use_redhat_subscription" id="use_redhat_subscription_hidden" value="{% if form.use_redhat_subscription.value %}on{% endif %}">
+      <div class="row g-3">
+        <div class="col-md-4">{{ form.concurrent_builds.label_tag }} {{ form.concurrent_builds }}</div>
+        <div class="col-md-4">{{ form.artifact_retention_days.label_tag }} {{ form.artifact_retention_days }}</div>
+        <div class="col-md-4 mt-4">
+          <div class="form-check">{{ form.enable_artifact_compression }} {{ form.enable_artifact_compression.label_tag }}</div>
+        </div>
+      </div>
+      <div class="d-flex gap-2">
+        <button class="btn btn-primary" type="submit">Save</button>
+        <a class="btn btn-outline-secondary" href="{% url 'serverconfig:server-config' %}">Reload</a>
+      </div>
+    </form>
+
+    <hr>
+    <h6>Builder Image (Red Hat Customer Portal)</h6>
+    <p class="text-muted small">Authenticate to list and download available RHEL qcow2 images from access.redhat.com. Builder ISO access uses host folder mapping from this application's ISO storage.</p>
+
+    <form method="post" class="mb-3">
+      {% csrf_token %}
+      <input type="hidden" name="action" id="rhn_action" value="list_images">
+      <div class="row g-3 align-items-end">
+        <div class="col-md-4">{{ form.rhn_username.label_tag }} {{ form.rhn_username }}</div>
+        <div class="col-md-4">{{ form.rhn_password.label_tag }} {{ form.rhn_password }}</div>
+        <div class="col-md-4">
+          <label class="form-label" for="selected_image_url">Available RHEL images</label>
+          <select class="form-select" name="selected_image_url" id="selected_image_url">
+            <option value="">Select an image...</option>
+            {% for item in available_images %}
+              <option value="{{ item.url }}">RHEL {{ item.major_version }} - {{ item.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="mt-2 d-flex gap-2">
+        <button class="btn btn-outline-primary" type="button" id="list-images-btn">Refresh Available Images</button>
+        <button class="btn btn-success" type="submit" onclick="document.getElementById('rhn_action').value='download_image'">Download Selected Image</button>
+      </div>
+
+      <hr>
+      <h6>ISO Image Import (Red Hat Customer Portal)</h6>
+      <p class="text-muted small">Refreshing available images also populates the ISO catalog, then you can choose which operating system to add it to.</p>
+      <div class="row g-3 align-items-end">
+        <div class="col-md-6">
+          <label class="form-label" for="selected_iso_url">Available ISO images</label>
+          <select class="form-select" name="selected_iso_url" id="selected_iso_url">
+            <option value="">Select an ISO image...</option>
+            {% for item in available_iso_images %}
+              <option value="{{ item.url }}">{{ item.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-6">
+          <label class="form-label" for="selected_iso_os_id">Target operating system</label>
+          <select class="form-select" name="selected_iso_os_id" id="selected_iso_os_id">
+            <option value="">Select operating system...</option>
+            {% for os_item in operating_systems %}
+              <option value="{{ os_item.id }}">{{ os_item.name }} ({{ os_item.family }})</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+      <div class="mt-2 d-flex gap-2">
+        <button class="btn btn-success" type="submit" onclick="document.getElementById('rhn_action').value='download_add_iso'">Download And Add ISO</button>
+      </div>
+    </form>
+
+    <div class="row g-2 mt-1">
+      <div class="col-md-6">
+        <label class="form-label" for="selected_builder_image_path">Builder base image</label>
+        <select class="form-select" name="selected_builder_image_path" id="selected_builder_image_path">
+          <option value="">Select a base image...</option>
+          {% for item in available_builder_images %}
+            <option value="{{ item.path }}" {% if config.builder_base_image_path == item.path %}selected{% endif %}>{{ item.label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-6">
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="checkbox" id="use_redhat_subscription_visible" {% if form.use_redhat_subscription.value %}checked{% endif %}>
+          <label class="form-check-label" for="use_redhat_subscription_visible">Use Red Hat subscription</label>
+        </div>
+        <div class="text-muted small mb-2">Disable this for CentOS, Rocky Linux, and similar distributions where subscription-manager is not needed.</div>
+        <div><strong>Selected image source URL:</strong> {{ config.builder_image_source_url|default:"Not set" }}</div>
+        <div class="text-muted small">Builder VM base images are stored under: media/artifacts/disks</div>
+        <div class="text-muted small">ISO folder is host-mapped into the builder VM from: media/isos (no ISO copy step).</div>
+        <div class="text-muted small">Create Builder Machine uses the Red Hat username/password above to register the VM and install required services.</div>
+        <div class="mt-3 d-flex gap-2">
+          <button class="btn btn-success" type="button" id="create-builder-btn" data-create-label="Create Builder Machine" data-recreate-label="Recreate Builder Machine">Create Builder Machine</button>
+        </div>
+        <div class="mt-2 d-flex gap-2 align-items-center">
+          <form method="post" class="d-inline">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="download_builder_private_key">
+            <button class="btn btn-outline-warning" type="submit" {% if not builder_vm_exists or not builder_private_key_available %}disabled{% endif %}>Download Builder Private Key</button>
+          </form>
+          <span class="text-muted small">Available after the builder VM has been created and a keypair is stored in the database.</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-3">
+      <h6>Builder Creation Log</h6>
+      <div id="builder-progress-log" class="p-2 border rounded bg-light small" style="height: 180px; overflow: auto; white-space: pre-wrap;">No builder activity yet.</div>
+      {{ builder_progress_history|json_script:"builder-progress-history" }}
+    </div>
+
+    <div class="mt-3">
+      <h6>Image Listing Debug</h6>
+      <pre id="rhel-debug" class="p-2 border rounded bg-light small" style="white-space: pre-wrap;">{% if rhel_debug %}{{ rhel_debug }}{% else %}No debug data yet.{% endif %}</pre>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  (function () {
+    const form = document.querySelector("form.mb-3");
+    if (!form) {
+      return;
+    }
+
+    const configForm = document.getElementById("server-config-form");
+    const builderImageSelect = document.getElementById("selected_builder_image_path");
+    const builderImageHidden = document.getElementById("selected_builder_image_path_hidden");
+    const useRedHatSubscriptionHidden = document.getElementById("use_redhat_subscription_hidden");
+    const useRedHatSubscriptionVisible = document.getElementById("use_redhat_subscription_visible");
+    const actionField = document.getElementById("rhn_action");
+    const rhnUserInput = form.querySelector('input[name="rhn_username"]');
+    const rhnPasswordInput = form.querySelector('input[name="rhn_password"]');
+    const builderRhnUserInput = document.getElementById("builder_rhn_username");
+    const builderRhnPasswordInput = document.getElementById("builder_rhn_password");
+    const createBuilderBtn = document.getElementById("create-builder-btn");
+    const listImagesBtn = document.getElementById("list-images-btn");
+    let builderVmExists = {{ builder_vm_exists|yesno:"true,false" }};
+    const builderJobRunning = {{ builder_job_running|yesno:"true,false" }};
+    const msgBox = document.getElementById("rhn-dynamic-messages");
+    const qcow2Select = document.getElementById("selected_image_url");
+    const isoSelect = document.getElementById("selected_iso_url");
+    const debugBox = document.getElementById("rhel-debug");
+    const builderProgressLog = document.getElementById("builder-progress-log");
+    const builderProgressHistoryEl = document.getElementById("builder-progress-history");
+    const listImagesDefaultText = listImagesBtn ? listImagesBtn.textContent : "Refresh Available Images";
+    let builderProgressHistory = [];
+    if (builderProgressHistoryEl) {
+      try {
+        builderProgressHistory = JSON.parse(builderProgressHistoryEl.textContent || "[]");
+      } catch (_) {
+        builderProgressHistory = [];
+      }
+    }
+
+    function setListButtonsBusy(isBusy, activeBtn, loadingText) {
+      [listImagesBtn].forEach(function (btn) {
+        if (!btn) return;
+        btn.disabled = isBusy;
+      });
+      if (isBusy && activeBtn) {
+        activeBtn.textContent = loadingText || "Loading...";
+      }
+    }
+
+    function resetListButtonLabels() {
+      if (listImagesBtn) listImagesBtn.textContent = listImagesDefaultText;
+    }
+
+    function csrfToken() {
+      const input = form.querySelector('input[name="csrfmiddlewaretoken"]');
+      return input ? input.value : "";
+    }
+
+    function showMessage(text, kind) {
+      if (!msgBox) return;
+      msgBox.innerHTML = "";
+      const el = document.createElement("div");
+      el.className = "alert alert-" + (kind || "info") + " mb-0";
+      el.textContent = text;
+      msgBox.appendChild(el);
+    }
+
+    function appendBuilderLog(line) {
+      if (!builderProgressLog) return;
+      const now = new Date();
+      const stamp = now.toTimeString().split(" ")[0];
+      if (builderProgressLog.textContent.trim() === "No builder activity yet.") {
+        builderProgressLog.textContent = "";
+      }
+      builderProgressLog.textContent += "[" + stamp + "] " + line + "\n";
+      builderProgressLog.scrollTop = builderProgressLog.scrollHeight;
+    }
+
+    function appendBuilderLogWithTimestamp(line, isoTs) {
+      if (!builderProgressLog) return;
+      let stamp = "--:--:--";
+      if (isoTs) {
+        const d = new Date(isoTs);
+        if (!Number.isNaN(d.getTime())) {
+          stamp = d.toTimeString().split(" ")[0];
+        }
+      }
+      if (builderProgressLog.textContent.trim() === "No builder activity yet.") {
+        builderProgressLog.textContent = "";
+      }
+      builderProgressLog.textContent += "[" + stamp + "] " + line + "\n";
+      builderProgressLog.scrollTop = builderProgressLog.scrollHeight;
+    }
+
+    function setBuilderBusy(isBusy, loadingText) {
+      if (!createBuilderBtn) return;
+      createBuilderBtn.disabled = isBusy;
+      createBuilderBtn.classList.toggle("btn-success", !isBusy);
+      createBuilderBtn.classList.toggle("btn-secondary", isBusy);
+      if (isBusy) {
+        const label = loadingText || "Working...";
+        createBuilderBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2" role="status" aria-hidden="true"></span>' + label;
+      } else {
+        createBuilderBtn.textContent = builderVmExists
+          ? (createBuilderBtn.dataset.recreateLabel || "Recreate Builder Machine")
+          : (createBuilderBtn.dataset.createLabel || "Create Builder Machine");
+      }
+    }
+
+    function refillSelect(selectEl, items, labelBuilder) {
+      if (!selectEl) return;
+      const current = selectEl.value;
+      selectEl.innerHTML = "";
+      const empty = document.createElement("option");
+      empty.value = "";
+      empty.textContent = selectEl.id === "selected_image_url" ? "Select an image..." : "Select an ISO image...";
+      selectEl.appendChild(empty);
+
+      (items || []).forEach(function (item) {
+        const option = document.createElement("option");
+        option.value = item.url;
+        option.textContent = labelBuilder(item);
+        selectEl.appendChild(option);
+      });
+
+      if (current && Array.from(selectEl.options).some((opt) => opt.value === current)) {
+        selectEl.value = current;
+      }
+    }
+
+    function delay(ms) {
+      return new Promise(function (resolve) {
+        window.setTimeout(resolve, ms);
+      });
+    }
+
+    function syncBuilderImageSelection() {
+      if (builderImageHidden && builderImageSelect) {
+        builderImageHidden.value = builderImageSelect.value || "";
+      }
+    }
+
+    function syncRedHatSubscriptionSelection() {
+      if (!useRedHatSubscriptionHidden || !useRedHatSubscriptionVisible) return;
+      useRedHatSubscriptionHidden.value = useRedHatSubscriptionVisible.checked ? "on" : "";
+    }
+
+    function syncBuilderButtonLabel() {
+      if (!createBuilderBtn) return;
+      if (!createBuilderBtn.disabled) {
+        createBuilderBtn.textContent = builderVmExists
+          ? (createBuilderBtn.dataset.recreateLabel || "Recreate Builder Machine")
+          : (createBuilderBtn.dataset.createLabel || "Create Builder Machine");
+      }
+    }
+
+    syncBuilderImageSelection();
+    syncRedHatSubscriptionSelection();
+    syncBuilderButtonLabel();
+
+    if (Array.isArray(builderProgressHistory) && builderProgressHistory.length > 0) {
+      builderProgressHistory.forEach(function (entry) {
+        const stage = (entry && entry.stage) ? entry.stage : "progress";
+        const message = (entry && entry.message) ? entry.message : "Builder progress update";
+        appendBuilderLogWithTimestamp(stage + ": " + message, entry ? entry.ts : "");
+      });
+
+      const last = builderProgressHistory[builderProgressHistory.length - 1] || {};
+      const lastStage = last.stage || "progress";
+      if (lastStage !== "done" && lastStage !== "error") {
+        setBuilderBusy(true, "Builder task running...");
+      }
+    } else if (builderJobRunning) {
+      appendBuilderLog("progress: Builder task running in background");
+      setBuilderBusy(true, "Builder task running...");
+    }
+
+    if (configForm && builderImageSelect) {
+      builderImageSelect.addEventListener("change", function () {
+        syncBuilderImageSelection();
+        configForm.requestSubmit();
+      });
+    }
+
+    if (useRedHatSubscriptionVisible) {
+      useRedHatSubscriptionVisible.addEventListener("change", function () {
+        syncRedHatSubscriptionSelection();
+      });
+    }
+
+    if (configForm && createBuilderBtn) {
+      createBuilderBtn.addEventListener("click", async function () {
+        const actionName = builderVmExists ? "recreate_builder_vm" : "create_builder_vm";
+        let keepBusy = false;
+        appendBuilderLog((builderVmExists ? "Recreate" : "Create") + " Builder Machine requested...");
+        setBuilderBusy(true, builderVmExists ? "Recreating..." : "Creating...");
+        if (builderRhnUserInput && rhnUserInput) {
+          builderRhnUserInput.value = rhnUserInput.value || "";
+        }
+        if (builderRhnPasswordInput && rhnPasswordInput) {
+          builderRhnPasswordInput.value = rhnPasswordInput.value || "";
+        }
+        syncRedHatSubscriptionSelection();
+        const actionInput = configForm.querySelector('input[name="action"]');
+        if (actionInput) {
+          actionInput.value = actionName;
+        }
+        syncBuilderImageSelection();
+        const data = new FormData(configForm);
+        try {
+          const result = await postJsonWithRetry(data, 10000);
+          const response = result.response;
+          const payload = result.payload;
+
+          if (!response.ok || !payload || !payload.ok) {
+            const text = payload && payload.error ? payload.error : "Failed to create builder VM";
+            appendBuilderLog("error: " + text);
+            showMessage(text, "danger");
+            return;
+          }
+
+          keepBusy = !!payload.queued;
+          appendBuilderLog(payload.message || (keepBusy ? "Builder setup queued" : "Builder VM completed"));
+          showMessage(payload.message || (keepBusy ? "Builder setup queued" : "Builder VM completed"), "success");
+          if (!keepBusy) {
+            builderVmExists = true;
+            syncBuilderButtonLabel();
+          }
+        } catch (err) {
+          const text = "Request failed: " + (err && err.message ? err.message : String(err));
+          appendBuilderLog("error: " + text);
+          showMessage(text, "danger");
+        } finally {
+          if (!keepBusy) {
+            setBuilderBusy(false);
+          }
+        }
+      });
+    }
+
+    window.addEventListener("tuxws:update", function (evt) {
+      const eventData = evt.detail || {};
+      if (eventData.scope !== "serverconfig" || eventData.action !== "builder-progress") {
+        return;
+      }
+      const payload = eventData.payload || {};
+      const stage = payload.stage || "progress";
+      const message = payload.message || "Builder progress update";
+      if (payload.ts) {
+        appendBuilderLogWithTimestamp(stage + ": " + message, payload.ts);
+      } else {
+        appendBuilderLog(stage + ": " + message);
+      }
+      if (stage === "done" || stage === "error") {
+        setBuilderBusy(false);
+        if (stage === "done") {
+          builderVmExists = true;
+          syncBuilderButtonLabel();
+        }
+      }
+      evt.preventDefault();
+    });
+
+    async function postJsonWithRetry(formData, retryDelayMs) {
+      let lastError = null;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        try {
+          const response = await fetch(window.location.href, {
+            method: "POST",
+            headers: {
+              "X-Requested-With": "XMLHttpRequest",
+              "X-CSRFToken": csrfToken(),
+            },
+            body: formData,
+            credentials: "same-origin",
+          });
+
+          let payload = null;
+          try {
+            payload = await response.json();
+          } catch (_) {
+            payload = null;
+          }
+
+          return { response: response, payload: payload };
+        } catch (err) {
+          lastError = err;
+          if (attempt === 0) {
+            await delay(retryDelayMs || 10000);
+          }
+        }
+      }
+
+      throw lastError || new Error("Request failed");
+    }
+
+    async function listAction(actionName, triggerButton) {
+      resetListButtonLabels();
+      setListButtonsBusy(true, triggerButton, "Loading...");
+      actionField.value = actionName;
+      const data = new FormData(form);
+      try {
+        const result = await postJsonWithRetry(data, 10000);
+        const response = result.response;
+        const payload = result.payload;
+
+        if (!response.ok || !payload || !payload.ok) {
+          const text = payload && payload.error ? payload.error : "Failed to list images";
+          showMessage(text, "danger");
+          if (triggerButton) {
+            triggerButton.textContent = "Loading failed";
+          }
+          return;
+        }
+
+        refillSelect(qcow2Select, payload.qcow2_catalog || [], function (item) {
+          return "RHEL " + item.major_version + " - " + item.label;
+        });
+        refillSelect(isoSelect, payload.iso_catalog || [], function (item) {
+          return item.label;
+        });
+
+        if (debugBox) {
+          debugBox.textContent = JSON.stringify(payload.debug || {}, null, 2);
+        }
+        if (triggerButton) {
+          const qcow2Count = (payload.qcow2_catalog || []).length;
+          const isoCount = (payload.iso_catalog || []).length;
+          triggerButton.textContent = "Loading, found " + qcow2Count + " qcow2 and " + isoCount + " ISO images";
+        }
+        showMessage(payload.message || "List updated", "success");
+      } catch (err) {
+        showMessage("Request failed: " + (err && err.message ? err.message : String(err)), "danger");
+        if (triggerButton) {
+          triggerButton.textContent = "Loading failed";
+        }
+      } finally {
+        setListButtonsBusy(false);
+      }
+    }
+
+    if (listImagesBtn) {
+      listImagesBtn.addEventListener("click", function () { listAction("list_images", listImagesBtn); });
+    }
+  })();
+</script>
+{% endblock %}

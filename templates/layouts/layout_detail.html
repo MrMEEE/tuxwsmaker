@@ -1,0 +1,1238 @@
+{% extends 'base.html' %}
+
+{% block title %}Manage Partition Layout | TuxWSMaker{% endblock %}
+
+{% block extra_css %}
+<style>
+  .disk-map-wrap {
+    border: 1px solid #d7dde5;
+    border-radius: 8px;
+    padding: 12px;
+    background: #f8fafc;
+  }
+
+  .disk-map {
+    display: flex;
+    width: 100%;
+    min-height: 52px;
+    border: 1px solid #bfc9d4;
+    border-radius: 6px;
+    overflow: hidden;
+    background: #fff;
+  }
+
+  .disk-segment {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 4px 8px;
+    border-right: 1px solid rgba(0, 0, 0, 0.08);
+    font-size: 0.75rem;
+    line-height: 1.1;
+    white-space: normal;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+    position: relative;
+    text-align: center;
+  }
+
+  .seg-title {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 600;
+  }
+
+  .seg-size {
+    display: block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.9;
+    font-size: 0.7rem;
+  }
+
+  .disk-segment:last-child {
+    border-right: 0;
+  }
+
+  .seg-fixed { background: #dbeafe; color: #0f3b76; }
+  .seg-remainder { background: #dcfce7; color: #14532d; }
+  .seg-free { background: #f3f4f6; color: #374151; }
+  .seg-selected { outline: 3px solid #1d4ed8; outline-offset: -3px; }
+
+  .disk-segment.dragging {
+    opacity: 0.5;
+  }
+
+  .disk-segment.drag-over {
+    box-shadow: inset 0 0 0 2px #1d4ed8;
+  }
+
+  .resize-handle {
+    position: absolute;
+    right: -4px;
+    top: 0;
+    width: 8px;
+    height: 100%;
+    cursor: ew-resize;
+    background: rgba(0, 0, 0, 0.15);
+    z-index: 5;
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 9999px;
+    display: inline-block;
+    margin-right: 6px;
+  }
+
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+
+  .yaml-textarea {
+    display: block;
+    width: 100%;
+    min-height: 72vh;
+    resize: vertical;
+    box-sizing: border-box;
+  }
+
+  #id_yaml_fallback {
+    display: block;
+    width: 100%;
+    min-height: 72vh;
+    box-sizing: border-box;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h4 class="mb-0">{{ layout.name }}</h4>
+    <small class="text-muted">{{ layout.description }}</small>
+  </div>
+  <div class="d-flex gap-2">
+    <span id="save-state-indicator" class="badge text-bg-secondary align-self-center">Saved</span>
+    <button type="button" class="btn btn-primary" id="global-save-btn">Save</button>
+    <div class="btn-group">
+      <button type="button" class="btn btn-outline-primary dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false">Templates</button>
+      <ul class="dropdown-menu dropdown-menu-end">
+        <li><button type="button" class="dropdown-item" id="tpl-anssi-luks-all-disk">ANSSI LUKS All disk</button></li>
+      </ul>
+    </div>
+    <a class="btn btn-outline-secondary" href="{% url 'layouts:layout-list' %}">Back</a>
+  </div>
+</div>
+
+<div class="row g-3">
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <h6 class="mb-0">Partition Editor</h6>
+        <div class="d-flex gap-2">
+          <button type="button" class="btn btn-sm btn-primary" id="new-part-btn">New Partition</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="mb-3 disk-map-wrap">
+          <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between mb-2">
+            <div class="d-flex align-items-center gap-3">
+              <div><span class="legend-dot seg-fixed"></span><small>Fixed</small></div>
+              <div><span class="legend-dot seg-remainder"></span><small>Remainder</small></div>
+              <div><span class="legend-dot seg-free"></span><small>Free Space</small></div>
+            </div>
+            <div class="d-flex align-items-center gap-2">
+              <label for="table-type-select" class="form-label mb-0 small">Table</label>
+              <select id="table-type-select" class="form-select form-select-sm mono" style="max-width: 120px;">
+                {% for value, label in table_type_choices %}
+                <option value="{{ value }}" {% if layout.table_type == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+              <label for="disk-size-mib" class="form-label mb-0 small">Disk MiB</label>
+              <input id="disk-size-mib" class="form-control form-control-sm mono" style="max-width: 140px;" type="number" min="1024" value="102400">
+            </div>
+          </div>
+          <div id="disk-map" class="disk-map"></div>
+          <div class="mt-2 d-flex flex-wrap gap-3 small text-muted">
+            <span>Total fixed: <span id="total-fixed" class="mono">0</span> MiB</span>
+            <span>Remainder entries: <span id="remainder-count" class="mono">0</span></span>
+            <span>Estimated free: <span id="estimated-free" class="mono">0</span> MiB</span>
+            <span>Partition table: <span id="table-type-pill" class="badge text-bg-secondary">{{ layout.get_table_type_display }}</span></span>
+          </div>
+          <div id="disk-warning" class="alert alert-warning mt-2 mb-0 py-2 d-none"></div>
+          <div class="small text-muted mt-2">Tip: Drag partition blocks to reorder. Drag divider on fixed blocks to resize against following free/remainder space.</div>
+        </div>
+
+        <div class="table-responsive">
+          <table id="partition-table" class="table table-sm align-middle">
+            <thead>
+              <tr>
+                <th>Order</th>
+                <th>Name</th>
+                <th>Role</th>
+                <th>Mount</th>
+                <th>Filesystem</th>
+                <th>VG/LV</th>
+                <th>Type</th>
+                <th>Size</th>
+                <th>LUKS / Bootable</th>
+                <th class="text-end">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for entry in layout.entries.all %}
+              <tr
+                data-entry-id="{{ entry.pk }}"
+                data-order="{{ entry.order }}"
+                data-name="{{ entry.name }}"
+                data-role="{{ entry.entry_role }}"
+                data-mount="{{ entry.mount_point }}"
+                data-fs="{{ entry.filesystem }}"
+                data-size-mode="{{ entry.size_mode }}"
+                data-size-mib="{{ entry.size_mib|default:'' }}"
+                data-gpt-type="{{ entry.gpt_type }}"
+                data-volume-group="{{ entry.volume_group }}"
+                data-logical-volume="{{ entry.logical_volume }}"
+                data-luks-enabled="{% if entry.luks_enabled %}1{% else %}0{% endif %}"
+                data-luks-name="{{ entry.luks_name }}"
+                data-boot="{% if entry.is_boot %}1{% else %}0{% endif %}"
+              >
+                  <td class="mono">{{ entry.order }}</td>
+                  <td>{{ entry.name }}</td>
+                  <td>{{ entry.get_entry_role_display }}</td>
+                  <td>{{ entry.mount_point|default:'-' }}</td>
+                  <td>{{ entry.filesystem }}</td>
+                  <td class="mono">{% if entry.entry_role == 'lv' %}{{ entry.volume_group }}/{{ entry.logical_volume }}{% elif entry.entry_role == 'pv' %}{{ entry.volume_group|default:'-' }}{% else %}-{% endif %}</td>
+                  <td class="mono">{{ entry.gpt_type|default:'-' }}</td>
+                  <td>
+                    {% if entry.size_mode == 'fixed' %}
+                      <span class="mono">{{ entry.size_mib }} MiB</span>
+                    {% else %}
+                      <span class="badge text-bg-success">remainder</span>
+                    {% endif %}
+                  </td>
+                  <td>
+                    {% if entry.luks_enabled %}<span class="badge text-bg-warning">LUKS {{ entry.luks_name }}</span>{% else %}<span class="text-muted">-</span>{% endif %}
+                    {% if entry.is_boot %}<span class="badge text-bg-info">bootable</span>{% endif %}
+                  </td>
+                  <td class="text-end">
+                    <button type="button" class="btn btn-sm btn-outline-primary entry-edit-btn">Edit</button>
+                    <button type="button" class="btn btn-sm btn-outline-danger entry-remove-btn">Delete</button>
+                  </td>
+              </tr>
+              {% empty %}
+              <tr><td colspan="10">No entries yet.</td></tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header"><h6 class="mb-0">Expert Entry Form</h6></div>
+      <div class="card-body">
+        <form method="post" action="{% url 'layouts:entry-create' layout.pk %}">
+          {% csrf_token %}
+          {{ entry_form.as_p }}
+          <button class="btn btn-primary btn-sm" type="submit">Add Entry</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">YAML</h6></div>
+      <div class="card-body">
+        <form method="post" action="{% url 'layouts:layout-yaml' layout.pk %}">
+          {% csrf_token %}
+          <div class="mb-0">
+            <label for="id_yaml_fallback" class="form-label">YAML</label>
+            {{ yaml_form.yaml_fallback }}
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<form id="bulk-layout-form" method="post" action="{% url 'layouts:entries-bulk-update' layout.pk %}" class="d-none">
+  {% csrf_token %}
+  <input type="hidden" name="table_type" id="table-type-input" value="{{ layout.table_type }}">
+  <input type="hidden" name="entries_json" id="entries-json">
+</form>
+
+<div class="modal fade" id="entryEditorModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable">
+    <div class="modal-content">
+      <form id="entry-editor-form" method="post" action="{% url 'layouts:entry-create' layout.pk %}">
+        {% csrf_token %}
+        <div class="modal-header">
+          <h5 class="modal-title" id="entryEditorTitle">New Partition</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-md-3">
+              <label class="form-label">Order</label>
+              <select class="form-select" name="order" id="f-order" required></select>
+            </div>
+            <div class="col-md-5">
+              <label class="form-label">Name</label>
+              <input class="form-control" type="text" name="name" id="f-name" required>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Mount Point</label>
+              <input class="form-control" type="text" name="mount_point" id="f-mount" placeholder="/ or /home">
+            </div>
+
+            <div class="col-md-3">
+              <label class="form-label">Role</label>
+              <select class="form-select" name="entry_role" id="f-entry-role"></select>
+            </div>
+
+            <div class="col-md-4">
+              <label class="form-label">Filesystem</label>
+              <select class="form-select" name="filesystem" id="f-filesystem" required></select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Partition Table</label>
+              <select class="form-select" id="f-table-type">
+                {% for value, label in table_type_choices %}
+                <option value="{{ value }}" {% if layout.table_type == value %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Size Mode</label>
+              <select class="form-select" name="size_mode" id="f-size-mode">
+                <option value="fixed">Fixed MiB</option>
+                <option value="remainder">Use remainder</option>
+              </select>
+            </div>
+            <div class="col-md-4">
+              <label class="form-label">Size MiB</label>
+              <input class="form-control" type="number" min="1" name="size_mib" id="f-size-mib" placeholder="2048">
+            </div>
+
+            <div class="col-md-6">
+              <label class="form-label" id="f-type-label">Type Code (optional)</label>
+              <select class="form-select mono" name="gpt_type" id="f-gpt-type"></select>
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">LUKS Name (optional)</label>
+              <input class="form-control" type="text" name="luks_name" id="f-luks-name" placeholder="cryptroot">
+            </div>
+
+            <div class="col-md-6">
+              <label class="form-label">Volume Group (for LV/PV)</label>
+              <input class="form-control" type="text" name="volume_group" id="f-volume-group" placeholder="vg0">
+            </div>
+            <div class="col-md-6">
+              <label class="form-label">Logical Volume (for LV)</label>
+              <input class="form-control" type="text" name="logical_volume" id="f-logical-volume" placeholder="lv_root">
+            </div>
+
+            <div class="col-md-6">
+              <div class="form-check mt-2">
+                <input class="form-check-input" type="checkbox" name="luks_enabled" value="on" id="f-luks-enabled">
+                <label class="form-check-label" for="f-luks-enabled">Enable LUKS</label>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="form-check mt-2">
+                <input class="form-check-input" type="checkbox" name="is_boot" value="on" id="f-is-boot">
+                <label class="form-check-label" for="f-is-boot">Bootable</label>
+              </div>
+            </div>
+          </div>
+          <div id="editor-warning" class="alert alert-warning mt-3 mb-0 d-none"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-primary" type="submit" id="editor-save-btn">Save Partition</button>
+          <button class="btn btn-outline-secondary" type="button" data-bs-dismiss="modal">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+  (function () {
+    const ENTRY_ROLE_CHOICES = JSON.parse('{{ entry_role_choices|escapejs }}');
+    const FILESYSTEM_CHOICES = JSON.parse('{{ filesystem_choices|escapejs }}');
+    const GPT_TYPE_CHOICES = JSON.parse('{{ gpt_type_choices|escapejs }}');
+    const MBR_TYPE_CHOICES = JSON.parse('{{ mbr_type_choices|escapejs }}');
+    const BUILTIN_TEMPLATES = {
+      anssiLuksAllDisk: {
+        table_type: "gpt",
+        entries: [
+          { name: "EFI System Partition", mount_point: "/boot/efi", filesystem: "efi", size_mode: "fixed", size_mib: 1024, gpt_type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", entry_role: "standard", is_boot: true, luks_enabled: false, luks_name: "" },
+          { name: "Boot Partition", mount_point: "/boot", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: false, luks_name: "" },
+          { name: "Root Partition", mount_point: "/", filesystem: "xfs", size_mode: "fixed", size_mib: 40960, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Var Partition", mount_point: "/var", filesystem: "xfs", size_mode: "fixed", size_mib: 4096, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Log Partition", mount_point: "/var/log", filesystem: "xfs", size_mode: "fixed", size_mib: 4096, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Audit Log Partition", mount_point: "/var/log/audit", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Var Temp Partition", mount_point: "/var/tmp", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Temp Partition", mount_point: "/tmp", filesystem: "xfs", size_mode: "fixed", size_mib: 5120, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Swap Partition", mount_point: "swap", filesystem: "swap", size_mode: "fixed", size_mib: 4096, gpt_type: "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F", entry_role: "standard", is_boot: false, luks_enabled: false, luks_name: "" },
+          { name: "Home Partition", mount_point: "/home", filesystem: "xfs", size_mode: "remainder", size_mib: null, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" }
+        ],
+      },
+    };
+
+    const table = document.getElementById("partition-table");
+    const map = document.getElementById("disk-map");
+    const diskSizeInput = document.getElementById("disk-size-mib");
+    const totalFixedEl = document.getElementById("total-fixed");
+    const remainderCountEl = document.getElementById("remainder-count");
+    const freeEl = document.getElementById("estimated-free");
+    const warningEl = document.getElementById("disk-warning");
+    const tableTypeSelect = document.getElementById("table-type-select");
+    const tableTypePill = document.getElementById("table-type-pill");
+
+    const modalEl = document.getElementById("entryEditorModal");
+    const modal = new bootstrap.Modal(modalEl);
+    const titleEl = document.getElementById("entryEditorTitle");
+    const form = document.getElementById("entry-editor-form");
+    const bulkForm = document.getElementById("bulk-layout-form");
+    const entriesJson = document.getElementById("entries-json");
+    const tableTypeInput = document.getElementById("table-type-input");
+    const newBtn = document.getElementById("new-part-btn");
+    const globalSaveBtn = document.getElementById("global-save-btn");
+    const tplAnssiLuksAllDisk = document.getElementById("tpl-anssi-luks-all-disk");
+    const saveStateIndicator = document.getElementById("save-state-indicator");
+    const editorWarning = document.getElementById("editor-warning");
+    const tableBody = table ? table.querySelector("tbody") : null;
+    const yamlTextarea = document.getElementById("id_yaml_fallback");
+    const yamlPreviewUrl = "{% url 'layouts:layout-yaml-preview' layout.pk %}";
+
+    const fOrder = document.getElementById("f-order");
+    const fName = document.getElementById("f-name");
+    const fEntryRole = document.getElementById("f-entry-role");
+    const fMount = document.getElementById("f-mount");
+    const fFilesystem = document.getElementById("f-filesystem");
+    const fTableType = document.getElementById("f-table-type");
+    const fSizeMode = document.getElementById("f-size-mode");
+    const fSizeMib = document.getElementById("f-size-mib");
+    const fTypeLabel = document.getElementById("f-type-label");
+    const fGptType = document.getElementById("f-gpt-type");
+    const fVolumeGroup = document.getElementById("f-volume-group");
+    const fLogicalVolume = document.getElementById("f-logical-volume");
+    const fLuksEnabled = document.getElementById("f-luks-enabled");
+    const fLuksName = document.getElementById("f-luks-name");
+    const fIsBoot = document.getElementById("f-is-boot");
+
+    let entriesState = [];
+    let suppressYamlInput = false;
+    let yamlDebounceTimer = null;
+    let nextTempId = 1;
+    let yamlIsValid = true;
+    let isDirty = false;
+
+    function setSaveState(dirty, statusText) {
+      isDirty = !!dirty;
+      if (!saveStateIndicator) {
+        return;
+      }
+      saveStateIndicator.textContent = statusText || (isDirty ? "Unsaved" : "Saved");
+      saveStateIndicator.classList.remove("text-bg-secondary", "text-bg-warning", "text-bg-info");
+      saveStateIndicator.classList.add(isDirty ? "text-bg-warning" : "text-bg-secondary");
+    }
+
+    function currentTableType() {
+      return (tableTypeSelect && tableTypeSelect.value) || (fTableType && fTableType.value) || (tableTypeInput && tableTypeInput.value) || "gpt";
+    }
+
+    function tableTypeLabel(value) {
+      return value === "mbr" ? "MBR" : "GPT";
+    }
+
+    function updateTableTypeUi() {
+      const val = currentTableType();
+      if (tableTypeSelect) {
+        tableTypeSelect.value = val;
+      }
+      if (fTableType) {
+        fTableType.value = val;
+      }
+      if (tableTypePill) {
+        tableTypePill.textContent = tableTypeLabel(val);
+      }
+      if (tableTypeInput) {
+        tableTypeInput.value = val;
+      }
+      fTypeLabel.textContent = val === "mbr" ? "MBR Type Code (optional)" : "GPT Type GUID (optional)";
+      populateTypeChoices(fGptType.value || "");
+    }
+
+    function optionHtml(value, label, selected) {
+      return "<option value=\"" + value + "\"" + (selected ? " selected" : "") + ">" + label + "</option>";
+    }
+
+    function populateFilesystemChoices(selectedValue) {
+      const selected = selectedValue || "ext4";
+      fFilesystem.innerHTML = FILESYSTEM_CHOICES.map((item) => optionHtml(item.value, item.label, item.value === selected)).join("");
+      if (!FILESYSTEM_CHOICES.some((item) => item.value === selected)) {
+        fFilesystem.insertAdjacentHTML("beforeend", optionHtml(selected, selected + " (custom)", true));
+      }
+    }
+
+    function populateRoleChoices(selectedValue) {
+      const selected = selectedValue || "standard";
+      fEntryRole.innerHTML = ENTRY_ROLE_CHOICES.map((item) => optionHtml(item.value, item.label, item.value === selected)).join("");
+    }
+
+    function populateTypeChoices(selectedValue) {
+      const selected = selectedValue || "";
+      const source = currentTableType() === "mbr" ? MBR_TYPE_CHOICES : GPT_TYPE_CHOICES;
+      fGptType.innerHTML = source.map((item) => optionHtml(item.value, item.label, item.value === selected)).join("");
+      if (selected && !source.some((item) => item.value === selected)) {
+        fGptType.insertAdjacentHTML("beforeend", optionHtml(selected, selected + " (custom)", true));
+      }
+    }
+
+    function populateOrderChoices(selectedOrder) {
+      const maxOrder = entriesState.length + 1;
+      const selected = Math.max(1, Number(selectedOrder || 1));
+      const options = [];
+      for (let order = 1; order <= maxOrder; order += 1) {
+        options.push(optionHtml(String(order), String(order), order === selected));
+      }
+      fOrder.innerHTML = options.join("");
+      if (selected > maxOrder) {
+        fOrder.insertAdjacentHTML("beforeend", optionHtml(String(selected), String(selected), true));
+      }
+    }
+
+    function readEntriesFromDom() {
+      if (!tableBody) {
+        return [];
+      }
+
+      return Array.from(tableBody.querySelectorAll("tr[data-entry-id]")).map((row) => {
+        const sizeMode = row.getAttribute("data-size-mode") || "fixed";
+        const sizeVal = row.getAttribute("data-size-mib");
+        return {
+          id: Number(row.getAttribute("data-entry-id")),
+          order: Number(row.getAttribute("data-order") || 0),
+          name: row.getAttribute("data-name") || "partition",
+          entry_role: row.getAttribute("data-role") || "standard",
+          mount_point: row.getAttribute("data-mount") || "",
+          filesystem: row.getAttribute("data-fs") || "",
+          size_mode: sizeMode,
+          size_mib: sizeVal ? Number(sizeVal) : null,
+          gpt_type: row.getAttribute("data-gpt-type") || "",
+          volume_group: row.getAttribute("data-volume-group") || "",
+          logical_volume: row.getAttribute("data-logical-volume") || "",
+          luks_enabled: row.getAttribute("data-luks-enabled") === "1",
+          luks_name: row.getAttribute("data-luks-name") || "",
+          is_boot: row.getAttribute("data-boot") === "1",
+        };
+      }).sort((a, b) => a.order - b.order);
+    }
+
+    function normalizeOrders() {
+      entriesState = entriesState.map((entry, index) => ({ ...entry, order: index + 1 }));
+    }
+
+    function renderTable() {
+      if (!tableBody) {
+        return;
+      }
+
+      if (entriesState.length === 0) {
+        tableBody.innerHTML = "<tr><td colspan=\"10\">No entries yet.</td></tr>";
+        return;
+      }
+
+      const html = entriesState.map((entry) => {
+        const sizeCell = entry.size_mode === "fixed"
+          ? "<span class=\"mono\">" + String(entry.size_mib || 0) + " MiB</span>"
+          : "<span class=\"badge text-bg-success\">remainder</span>";
+        const volumeCell = entry.entry_role === "lv"
+          ? "<span class=\"mono\">" + (entry.volume_group || "-") + "/" + (entry.logical_volume || "-") + "</span>"
+          : entry.entry_role === "pv"
+            ? "<span class=\"mono\">" + (entry.volume_group || "-") + "</span>"
+            : "<span class=\"text-muted\">-</span>";
+        const roleLabel = ENTRY_ROLE_CHOICES.find((item) => item.value === entry.entry_role);
+        const luksCell = entry.luks_enabled
+          ? "<span class=\"badge text-bg-warning\">LUKS " + entry.luks_name + "</span>"
+          : "<span class=\"text-muted\">-</span>";
+        const bootBadge = entry.is_boot ? " <span class=\"badge text-bg-info\">bootable</span>" : "";
+        return ""
+          + "<tr data-entry-id=\"" + entry.id + "\">"
+          + "<td class=\"mono\">" + entry.order + "</td>"
+          + "<td>" + entry.name + "</td>"
+          + "<td>" + (roleLabel ? roleLabel.label : entry.entry_role) + "</td>"
+          + "<td>" + (entry.mount_point || "-") + "</td>"
+          + "<td>" + entry.filesystem + "</td>"
+          + "<td>" + volumeCell + "</td>"
+          + "<td class=\"mono\">" + (entry.gpt_type || "-") + "</td>"
+          + "<td>" + sizeCell + "</td>"
+          + "<td>" + luksCell + bootBadge + "</td>"
+          + "<td class=\"text-end\">"
+          + "<button type=\"button\" class=\"btn btn-sm btn-outline-primary entry-edit-btn\" data-entry-id=\"" + entry.id + "\">Edit</button> "
+          + "<button type=\"button\" class=\"btn btn-sm btn-outline-danger entry-remove-btn\" data-entry-id=\"" + entry.id + "\">Delete</button>"
+          + "</td>"
+          + "</tr>";
+      }).join("");
+
+      tableBody.innerHTML = html;
+      bindTableButtons();
+    }
+
+    async function applyTemplate(templateKey) {
+      const selectedTemplate = BUILTIN_TEMPLATES[templateKey];
+      if (!selectedTemplate) {
+        return;
+      }
+
+      if (isDirty) {
+        const confirmed = await window.tuxConfirm("Replace current unsaved layout with template?", {
+          title: "Replace Unsaved Layout",
+          confirmLabel: "Replace",
+          confirmClass: "btn-warning"
+        });
+        if (!confirmed) {
+          return;
+        }
+      }
+
+      if (tableTypeSelect) {
+        tableTypeSelect.value = selectedTemplate.table_type || "gpt";
+      }
+      updateTableTypeUi();
+
+      entriesState = selectedTemplate.entries.map((entry, index) => ({
+        id: nextTempId + index,
+        order: index + 1,
+        name: entry.name,
+        entry_role: entry.entry_role || "standard",
+        mount_point: entry.mount_point,
+        filesystem: entry.filesystem,
+        size_mode: entry.size_mode,
+        size_mib: entry.size_mode === "fixed" ? Number(entry.size_mib || 0) : null,
+        gpt_type: entry.gpt_type || "",
+        volume_group: entry.volume_group || "",
+        logical_volume: entry.logical_volume || "",
+        luks_enabled: !!entry.luks_enabled,
+        luks_name: entry.luks_name || "",
+        is_boot: !!entry.is_boot,
+      }));
+      nextTempId += entriesState.length;
+
+      normalizeOrders();
+      renderTable();
+      renderDiskMap();
+      renderYamlFromState();
+      setSaveState(true);
+    }
+
+    function csrfToken() {
+      const tokenInput = bulkForm.querySelector("input[name='csrfmiddlewaretoken']");
+      return tokenInput ? tokenInput.value : "";
+    }
+
+    function showYamlWarning(message) {
+      showWarning(warningEl, message || "");
+    }
+
+    function yamlScalar(value) {
+      if (value === null || value === undefined) {
+        return "null";
+      }
+      if (typeof value === "boolean") {
+        return value ? "true" : "false";
+      }
+      if (typeof value === "number") {
+        return String(value);
+      }
+      const str = String(value);
+      if (str.length === 0) {
+        return "''";
+      }
+      if (/^[A-Za-z0-9_\-\.\/]+$/.test(str)) {
+        return str;
+      }
+      return "'" + str.replace(/'/g, "''") + "'";
+    }
+
+    function renderYamlFromState() {
+      if (!yamlTextarea) {
+        return;
+      }
+
+      const payload = {
+        table_type: currentTableType(),
+        entries: entriesState.map((entry) => ({
+          order: entry.order,
+          name: entry.name,
+          role: entry.entry_role || "standard",
+          mount_point: entry.mount_point,
+          filesystem: entry.filesystem,
+          size_mode: entry.size_mode,
+          size_mib: entry.size_mode === "fixed" ? Number(entry.size_mib || 0) : null,
+          type_code: entry.gpt_type || "",
+          volume_group: entry.volume_group || "",
+          logical_volume: entry.logical_volume || "",
+          bootable: !!entry.is_boot,
+          luks_enabled: !!entry.luks_enabled,
+          luks_name: entry.luks_name || "",
+        })),
+      };
+
+      const lines = ["table_type: " + yamlScalar(payload.table_type), "entries:"];
+      payload.entries.forEach((entry) => {
+        lines.push("  - order: " + yamlScalar(entry.order));
+        lines.push("    name: " + yamlScalar(entry.name));
+        lines.push("    mount_point: " + yamlScalar(entry.mount_point));
+        lines.push("    filesystem: " + yamlScalar(entry.filesystem));
+        lines.push("    size_mode: " + yamlScalar(entry.size_mode));
+        lines.push("    size_mib: " + yamlScalar(entry.size_mib));
+        lines.push("    type_code: " + yamlScalar(entry.type_code));
+        lines.push("    bootable: " + yamlScalar(entry.bootable));
+        lines.push("    luks_enabled: " + yamlScalar(entry.luks_enabled));
+        lines.push("    luks_name: " + yamlScalar(entry.luks_name));
+      });
+
+      suppressYamlInput = true;
+      yamlTextarea.value = lines.join("\n") + "\n";
+      suppressYamlInput = false;
+      yamlIsValid = true;
+      showYamlWarning("");
+    }
+
+    function syncFromYaml() {
+      if (!yamlTextarea) {
+        return;
+      }
+
+      const body = new URLSearchParams();
+      body.set("yaml_fallback", yamlTextarea.value || "");
+
+      fetch(yamlPreviewUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          "X-CSRFToken": csrfToken(),
+        },
+        body: body.toString(),
+      })
+        .then((response) => response.json().then((data) => ({ status: response.status, data: data })))
+        .then((result) => {
+          if (result.status >= 400 || !result.data.ok) {
+            yamlIsValid = false;
+            showYamlWarning("YAML not applied: " + (result.data.error || "Invalid YAML"));
+            return;
+          }
+
+          if (tableTypeSelect) {
+            tableTypeSelect.value = result.data.table_type;
+          }
+          updateTableTypeUi();
+
+          entriesState = result.data.entries.map((entry) => ({
+            id: nextTempId++,
+            order: Number(entry.order || 0),
+            name: entry.name || "",
+            entry_role: entry.entry_role || "standard",
+            mount_point: entry.mount_point || "",
+            filesystem: entry.filesystem || "ext4",
+            size_mode: entry.size_mode || "fixed",
+            size_mib: entry.size_mode === "fixed" ? Number(entry.size_mib || 0) : null,
+            gpt_type: entry.gpt_type || "",
+            volume_group: entry.volume_group || "",
+            logical_volume: entry.logical_volume || "",
+            luks_enabled: !!entry.luks_enabled,
+            luks_name: entry.luks_name || "",
+            is_boot: !!entry.is_boot,
+          }));
+
+          normalizeOrders();
+          renderTable();
+          renderDiskMap();
+          renderYamlFromState();
+          yamlIsValid = true;
+        })
+        .catch(() => {
+          yamlIsValid = false;
+          showYamlWarning("YAML preview failed due to a network error.");
+        });
+    }
+
+    function openModalForCreate() {
+      titleEl.textContent = "New Partition";
+      form.action = "{% url 'layouts:entry-create' layout.pk %}";
+      populateOrderChoices(entriesState.length + 1);
+      fName.value = "";
+      populateRoleChoices("standard");
+      fMount.value = "";
+      populateFilesystemChoices("ext4");
+      fTableType.value = currentTableType();
+      fSizeMode.value = "fixed";
+      fSizeMib.value = "";
+      populateTypeChoices("");
+      fVolumeGroup.value = "";
+      fLogicalVolume.value = "";
+      fLuksEnabled.checked = false;
+      fLuksName.value = "";
+      fIsBoot.checked = false;
+      updateTableTypeUi();
+      updateRoleUi();
+      updateSizeModeUi();
+      validateEditorForm();
+      modal.show();
+    }
+
+    function openModalForEdit(entry) {
+      titleEl.textContent = "Edit Partition";
+      form.action = "/partitions/{{ layout.pk }}/entries/" + entry.id + "/edit/";
+      populateOrderChoices(entry.order);
+      fName.value = entry.name;
+      populateRoleChoices(entry.entry_role || "standard");
+      fMount.value = entry.mount_point;
+      populateFilesystemChoices(entry.filesystem);
+      fTableType.value = currentTableType();
+      fSizeMode.value = entry.size_mode;
+      fSizeMib.value = entry.size_mib || "";
+      populateTypeChoices(entry.gpt_type || "");
+      fVolumeGroup.value = entry.volume_group || "";
+      fLogicalVolume.value = entry.logical_volume || "";
+      fLuksEnabled.checked = entry.luks_enabled;
+      fLuksName.value = entry.luks_name;
+      fIsBoot.checked = entry.is_boot;
+      updateTableTypeUi();
+      updateRoleUi();
+      updateSizeModeUi();
+      validateEditorForm();
+      modal.show();
+    }
+
+    function updateRoleUi() {
+      const role = fEntryRole.value;
+      if (role === "pv") {
+        fMount.value = "";
+        populateFilesystemChoices("none");
+        const preferredType = currentTableType() === "mbr" ? "0x8e" : "e6d6d379-f507-44c2-a23c-238f2a3df928";
+        populateTypeChoices(preferredType);
+      }
+      if (role !== "lv") {
+        fLogicalVolume.value = "";
+      }
+    }
+
+    function updateSizeModeUi() {
+      const fixed = fSizeMode.value === "fixed";
+      fSizeMib.disabled = !fixed;
+      if (!fixed) {
+        fSizeMib.value = "";
+      }
+    }
+
+    function showWarning(node, message) {
+      if (!message) {
+        node.classList.add("d-none");
+        node.textContent = "";
+        return;
+      }
+      node.classList.remove("d-none");
+      node.textContent = message;
+    }
+
+    function renderDiskMap() {
+      const entries = entriesState.slice().sort((a, b) => a.order - b.order);
+      const totalDisk = Number(diskSizeInput.value || 0);
+      const fixedEntries = entries.filter((e) => e.size_mode === "fixed");
+      const remEntries = entries.filter((e) => e.size_mode === "remainder");
+      const fixedTotal = fixedEntries.reduce((sum, e) => sum + (e.size_mib || 0), 0);
+      const spaceAfterFixed = Math.max(totalDisk - fixedTotal, 0);
+      const perRemainder = remEntries.length > 0 ? Math.floor(spaceAfterFixed / remEntries.length) : 0;
+      const freeSpace = remEntries.length > 0 ? spaceAfterFixed - perRemainder * remEntries.length : spaceAfterFixed;
+
+      totalFixedEl.textContent = String(fixedTotal);
+      remainderCountEl.textContent = String(remEntries.length);
+      freeEl.textContent = String(Math.max(freeSpace, 0));
+
+      if (fixedTotal > totalDisk) {
+        showWarning(warningEl, "Fixed partitions exceed disk size. Reduce fixed sizes or increase disk MiB.");
+      } else if (remEntries.length > 1) {
+        showWarning(warningEl, "Multiple remainder partitions are split evenly in this preview. Use a single remainder partition for predictable output.");
+      } else {
+        showWarning(warningEl, "");
+      }
+
+      map.innerHTML = "";
+      if (totalDisk <= 0) {
+        return;
+      }
+
+      const pieces = [];
+      for (const entry of entries) {
+        if (entry.size_mode === "fixed") {
+          pieces.push({
+            type: "fixed",
+            entry,
+            size: Math.max(entry.size_mib || 0, 1),
+            label: entry.name + " " + String(entry.size_mib || 0) + " MiB",
+          });
+        } else {
+          pieces.push({
+            type: "remainder",
+            entry,
+            size: Math.max(perRemainder, 1),
+            label: entry.name + " remainder",
+          });
+        }
+      }
+
+      if (freeSpace > 0) {
+        pieces.push({
+          type: "free",
+          size: freeSpace,
+          label: "free " + String(freeSpace) + " MiB",
+        });
+      }
+
+      const totalPreview = pieces.reduce((sum, p) => sum + p.size, 0) || 1;
+      for (const piece of pieces) {
+        const seg = document.createElement("div");
+        seg.className = "disk-segment " + (piece.type === "fixed" ? "seg-fixed" : piece.type === "remainder" ? "seg-remainder" : "seg-free");
+        const pct = Math.max((piece.size / totalPreview) * 100, 5);
+        seg.style.width = pct + "%";
+        seg.title = piece.label;
+        const sizeLine = piece.type === "fixed"
+          ? String(piece.entry.size_mib || 0) + " MiB"
+          : piece.type === "remainder"
+            ? "remainder"
+            : String(piece.size) + " MiB";
+        const titleLine = piece.type === "free" ? "Free Space" : piece.entry.name;
+        seg.innerHTML = "<span class=\"seg-title\">" + titleLine + "</span><span class=\"seg-size mono\">" + sizeLine + "</span>";
+
+        if (piece.entry) {
+          seg.dataset.entryId = String(piece.entry.id);
+          seg.draggable = true;
+          seg.addEventListener("dragstart", function (event) {
+            seg.classList.add("dragging");
+            event.dataTransfer.setData("text/plain", String(piece.entry.id));
+          });
+          seg.addEventListener("dragend", function () {
+            seg.classList.remove("dragging");
+            map.querySelectorAll(".disk-segment").forEach((node) => node.classList.remove("drag-over"));
+          });
+          seg.addEventListener("dragover", function (event) {
+            event.preventDefault();
+            seg.classList.add("drag-over");
+          });
+          seg.addEventListener("dragleave", function () {
+            seg.classList.remove("drag-over");
+          });
+          seg.addEventListener("drop", function (event) {
+            event.preventDefault();
+            seg.classList.remove("drag-over");
+            const sourceId = Number(event.dataTransfer.getData("text/plain") || 0);
+            const targetId = Number(piece.entry.id);
+            if (!sourceId || !targetId || sourceId === targetId) {
+              return;
+            }
+            const srcIndex = entriesState.findIndex((e) => e.id === sourceId);
+            const dstIndex = entriesState.findIndex((e) => e.id === targetId);
+            if (srcIndex < 0 || dstIndex < 0) {
+              return;
+            }
+            const [moved] = entriesState.splice(srcIndex, 1);
+            entriesState.splice(dstIndex, 0, moved);
+            normalizeOrders();
+            renderTable();
+            renderDiskMap();
+            renderYamlFromState();
+            setSaveState(true);
+          });
+
+          seg.addEventListener("click", function () {
+            map.querySelectorAll(".disk-segment").forEach((node) => node.classList.remove("seg-selected"));
+            seg.classList.add("seg-selected");
+            openModalForEdit(piece.entry);
+          });
+
+          if (piece.type === "fixed") {
+            const handle = document.createElement("div");
+            handle.className = "resize-handle";
+            handle.title = "Drag to resize";
+            handle.addEventListener("mousedown", function (event) {
+              event.preventDefault();
+              event.stopPropagation();
+              startResize(event, piece.entry.id);
+            });
+            seg.appendChild(handle);
+          }
+        }
+
+        map.appendChild(seg);
+      }
+    }
+
+    function startResize(mouseDownEvent, entryId) {
+      const baseX = mouseDownEvent.clientX;
+      const totalDisk = Number(diskSizeInput.value || 0);
+      const source = entriesState.find((e) => e.id === entryId);
+      if (!source || source.size_mode !== "fixed") {
+        return;
+      }
+
+      const initialSize = Number(source.size_mib || 1);
+      const mapRect = map.getBoundingClientRect();
+      const mibPerPx = totalDisk > 0 && mapRect.width > 0 ? totalDisk / mapRect.width : 1;
+
+      function onMove(moveEvent) {
+        const deltaPx = moveEvent.clientX - baseX;
+        const deltaMib = Math.round(deltaPx * mibPerPx);
+        const nextSize = Math.max(initialSize + deltaMib, 1);
+        source.size_mib = nextSize;
+        renderTable();
+        renderDiskMap();
+        renderYamlFromState();
+        setSaveState(true);
+      }
+
+      function onUp() {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      }
+
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    }
+
+    function validateEditorForm() {
+      let warning = "";
+      if (!fName.value.trim()) {
+        warning = "Name is required.";
+      }
+      if (fEntryRole.value === "pv") {
+        if (fMount.value.trim()) {
+          warning = "LVM PV entries must not have a mount point.";
+        }
+        if (fFilesystem.value !== "none") {
+          warning = "LVM PV entries must use filesystem none.";
+        }
+      }
+      if (fEntryRole.value === "lv") {
+        if (!fVolumeGroup.value.trim()) {
+          warning = "LVM LV entries require a volume group.";
+        }
+        if (!fLogicalVolume.value.trim()) {
+          warning = "LVM LV entries require a logical volume name.";
+        }
+      }
+      if (fSizeMode.value === "fixed") {
+        const size = Number(fSizeMib.value || 0);
+        if (size <= 0) {
+          warning = "Fixed size mode requires size_mib > 0.";
+        }
+      }
+      if (fLuksEnabled.checked && !fLuksName.value.trim()) {
+        warning = "LUKS name is required when encryption is enabled.";
+      }
+      showWarning(editorWarning, warning);
+      return warning === "";
+    }
+
+    function bindTableButtons() {
+      if (!tableBody) {
+        return;
+      }
+
+      tableBody.querySelectorAll(".entry-edit-btn").forEach((btn) => {
+        btn.addEventListener("click", function () {
+          const id = Number(btn.getAttribute("data-entry-id") || 0);
+          const entry = entriesState.find((e) => e.id === id);
+          if (entry) {
+            openModalForEdit(entry);
+          }
+        });
+      });
+
+      tableBody.querySelectorAll(".entry-remove-btn").forEach((btn) => {
+        btn.addEventListener("click", async function () {
+          const id = Number(btn.getAttribute("data-entry-id") || 0);
+          if (!id) {
+            return;
+          }
+          const confirmed = await window.tuxConfirm("Delete entry?", {
+            title: "Delete Partition Entry",
+            confirmLabel: "Delete",
+          });
+          if (!confirmed) {
+            return;
+          }
+          entriesState = entriesState.filter((e) => e.id !== id);
+          normalizeOrders();
+          renderTable();
+          renderDiskMap();
+          renderYamlFromState();
+          setSaveState(true);
+        });
+      });
+    }
+
+    newBtn.addEventListener("click", openModalForCreate);
+    tplAnssiLuksAllDisk.addEventListener("click", function () {
+      applyTemplate("anssiLuksAllDisk");
+    });
+
+    tableTypeSelect.addEventListener("change", function () {
+      updateTableTypeUi();
+      renderDiskMap();
+      renderYamlFromState();
+      setSaveState(true);
+    });
+
+    fTableType.addEventListener("change", function () {
+      updateTableTypeUi();
+      renderDiskMap();
+      renderYamlFromState();
+      setSaveState(true);
+    });
+
+    fSizeMode.addEventListener("change", function () {
+      updateSizeModeUi();
+      validateEditorForm();
+    });
+    fEntryRole.addEventListener("change", function () {
+      updateRoleUi();
+      validateEditorForm();
+    });
+    [fName, fSizeMib, fLuksName, fOrder].forEach((node) => {
+      node.addEventListener("input", validateEditorForm);
+    });
+    fLuksEnabled.addEventListener("change", validateEditorForm);
+    diskSizeInput.addEventListener("input", renderDiskMap);
+
+    form.addEventListener("submit", function (event) {
+      if (!validateEditorForm()) {
+        event.preventDefault();
+        return;
+      }
+
+      event.preventDefault();
+      const payload = {
+        order: Number(fOrder.value || 0),
+        name: fName.value.trim(),
+        entry_role: fEntryRole.value,
+        mount_point: fMount.value.trim(),
+        filesystem: fFilesystem.value.trim(),
+        size_mode: fSizeMode.value,
+        size_mib: fSizeMode.value === "fixed" ? Number(fSizeMib.value || 0) : null,
+        gpt_type: fGptType.value.trim(),
+        volume_group: fVolumeGroup.value.trim(),
+        logical_volume: fLogicalVolume.value.trim(),
+        luks_enabled: fLuksEnabled.checked,
+        luks_name: fLuksName.value.trim(),
+        is_boot: fIsBoot.checked,
+      };
+
+      const isEdit = form.action.indexOf("/edit/") !== -1;
+      if (isEdit) {
+        const parts = form.action.split("/");
+        const entryId = Number(parts[parts.length - 3] || 0);
+        const currentIndex = entriesState.findIndex((e) => e.id === entryId);
+        if (currentIndex >= 0) {
+          const current = entriesState[currentIndex];
+          entriesState.splice(currentIndex, 1);
+          const targetIndex = Math.max(0, Math.min(entriesState.length, payload.order - 1));
+          entriesState.splice(targetIndex, 0, { ...current, ...payload, id: entryId });
+        }
+      } else {
+        const nextTempId = entriesState.reduce((max, e) => Math.max(max, e.id), 0) + 1;
+        const targetIndex = Math.max(0, Math.min(entriesState.length, payload.order - 1));
+        entriesState.splice(targetIndex, 0, { ...payload, id: nextTempId });
+      }
+
+      normalizeOrders();
+      renderTable();
+      renderDiskMap();
+      renderYamlFromState();
+      setSaveState(true);
+      modal.hide();
+    });
+
+    globalSaveBtn.addEventListener("click", async function () {
+      if (entriesState.length === 0) {
+        const confirmed = await window.tuxConfirm("This will clear all partition entries. Continue?", {
+          title: "Clear Partition Entries",
+          confirmLabel: "Continue",
+          confirmClass: "btn-warning"
+        });
+        if (!confirmed) {
+          return;
+        }
+      }
+
+      if (!yamlIsValid) {
+        showYamlWarning("Fix YAML before saving.");
+        return;
+      }
+
+      setSaveState(false, "Saving...");
+      saveStateIndicator.classList.remove("text-bg-secondary", "text-bg-warning", "text-bg-info");
+      saveStateIndicator.classList.add("text-bg-info");
+
+      entriesJson.value = JSON.stringify(entriesState.map((entry) => ({
+        order: entry.order,
+        name: entry.name,
+        entry_role: entry.entry_role,
+        mount_point: entry.mount_point,
+        filesystem: entry.filesystem,
+        size_mode: entry.size_mode,
+        size_mib: entry.size_mode === "fixed" ? entry.size_mib : null,
+        gpt_type: entry.gpt_type,
+        volume_group: entry.volume_group,
+        logical_volume: entry.logical_volume,
+        is_boot: entry.is_boot,
+        luks_enabled: entry.luks_enabled,
+        luks_name: entry.luks_name,
+      })));
+      tableTypeInput.value = currentTableType();
+      bulkForm.submit();
+    });
+
+    if (yamlTextarea) {
+      yamlTextarea.addEventListener("input", function () {
+        if (suppressYamlInput) {
+          return;
+        }
+        setSaveState(true);
+        if (yamlDebounceTimer) {
+          window.clearTimeout(yamlDebounceTimer);
+        }
+        yamlDebounceTimer = window.setTimeout(syncFromYaml, 350);
+      });
+    }
+
+    entriesState = readEntriesFromDom();
+    nextTempId = entriesState.reduce((max, item) => Math.max(max, item.id || 0), 0) + 1;
+    normalizeOrders();
+    populateRoleChoices("standard");
+    populateFilesystemChoices("ext4");
+    updateTableTypeUi();
+    updateRoleUi();
+    renderTable();
+    renderDiskMap();
+    renderYamlFromState();
+    setSaveState(false);
+  })();
+</script>
+{% endblock %}

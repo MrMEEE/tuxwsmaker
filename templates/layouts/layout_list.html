@@ -1,0 +1,45 @@
+{% extends 'base.html' %}
+
+{% block title %}Partition Layouts | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="mb-0">Partition Layouts</h5>
+    <a class="btn btn-sm btn-primary ms-auto" href="{% url 'layouts:layout-create' %}" data-modal="1" data-modal-title="New Layout">New Layout</a>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table table-hover align-middle">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Entries</th>
+            <th>Updated</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+      {% for item in items %}
+          <tr>
+            <td>{{ item.name }}</td>
+            <td>{{ item.entries.count }}</td>
+            <td>{{ item.updated_at }}</td>
+            <td class="text-end">
+              <a class="btn btn-sm btn-outline-primary" href="{% url 'layouts:layout-detail' item.pk %}">Manage</a>
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'layouts:layout-edit' item.pk %}" data-modal="1" data-modal-title="Edit Layout">Edit</a>
+              <form method="post" action="{% url 'layouts:layout-delete' item.pk %}" class="d-inline" data-confirm-message="Delete this layout?" data-confirm-title="Delete Layout" data-confirm-accept="Delete">
+                {% csrf_token %}
+                <button type="submit" class="btn btn-sm btn-outline-danger">Delete</button>
+              </form>
+            </td>
+          </tr>
+      {% empty %}
+          <tr><td colspan="4">No partition layouts yet.</td></tr>
+      {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}
