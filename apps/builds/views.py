@@ -7,12 +7,14 @@ from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse_lazy
 from django.views.generic import CreateView, DetailView, ListView, UpdateView, View
+import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
 
 from apps.workers.tasks import run_build_definition
 from apps.workers.tasks import build_task_cache_key
+from apps.workers.tasks import rerun_build_playbooks
 from apps.serverconfig.models import ServerConfiguration
 from apps.realtime.events import publish_event
 from config.celery import app as celery_app
@@ -38,6 +40,79 @@ def _persist_build_playbook_order(build: BuildDefinition, ordered_ids: list[int]
 	)
 
 
+def _extract_last_known_vm_ip(build: BuildDefinition) -> str:
+	for entry in BuildLogEntry.objects.filter(build=build, stage="network").order_by("-created_at", "-id"):
+		msg = (entry.message or "").strip()
+		if "Build VM is reachable at " in msg:
+			return msg.rsplit(" ", 1)[-1].strip()
+		if "Build VM obtained IP address " in msg:
+			return msg.rsplit(" ", 1)[-1].strip()
+	return ""
+
+
+def _probe_vm_ssh_ready(build: BuildDefinition) -> tuple[bool, bool, str]:
+	vm_name = f"build-{build.id}"
+	try:
+		vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+		vm_exists = vm_manager.domain_exists(vm_name)
+		if not vm_exists:
+			return False, False, ""
+		vm_running = vm_manager.domain_is_active(vm_name)
+		if not vm_running:
+			return True, False, ""
+	except Exception:
+		return False, False, ""
+
+	ip_address = ""
+	try:
+		ip_address = vm_manager.current_ipv4(
+			domain_name=vm_name,
+			network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
+		) or ""
+	except Exception:
+		ip_address = ""
+	if not ip_address:
+		ip_address = _extract_last_known_vm_ip(build)
+	if not ip_address:
+		return True, False, ""
+
+	build_key = SSHKey.objects.filter(
+		scope=SSHKey.SCOPE_IMAGE_BUILD,
+		build=build,
+		name="build",
+	).first()
+	if build_key is None or not build_key.has_keypair():
+		return True, False, ip_address
+
+	private_key_text = build_key.get_private_key().strip()
+	if not private_key_text:
+		return True, False, ip_address
+
+	with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f"build-{build.id}-", delete=False) as key_file:
+		key_file.write(private_key_text + "\n")
+		key_path = Path(key_file.name)
+	key_path.chmod(0o600)
+	try:
+		ssh_user = getattr(settings, "BUILD_VM_SSH_USER", "root")
+		cmd = [
+			"ssh",
+			"-o",
+			"BatchMode=yes",
+			"-o",
+			"StrictHostKeyChecking=no",
+			"-o",
+			"UserKnownHostsFile=/dev/null",
+			"-i",
+			str(key_path),
+			f"{ssh_user}@{ip_address}",
+			"true",
+		]
+		proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
+		return True, proc.returncode == 0, ip_address
+	finally:
+		key_path.unlink(missing_ok=True)
+
+
 class BuildListView(LoginRequiredMixin, ListView):
 	model = BuildDefinition
 	template_name = "builds/build_list.html"
@@ -57,14 +132,15 @@ class BuildDetailView(LoginRequiredMixin, DetailView):
 	def get_context_data(self, **kwargs):
 		context = super().get_context_data(**kwargs)
 		build = self.object
-		vm_name = f"build-{build.id}"
-		vm_exists = False
-		try:
-			vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
-			vm_exists = vm_manager.domain_exists(vm_name)
-		except Exception:
-			vm_exists = False
+		vm_exists, vm_ssh_ready, vm_ip = _probe_vm_ssh_ready(build)
 		context["build_vm_exists"] = vm_exists
+		context["build_vm_ssh_ready"] = vm_ssh_ready
+		context["build_vm_ip"] = vm_ip
+		has_playbooks = bool(build.playbook_path) or build.ordered_playbook_selections().exists()
+		context["show_rerun_playbooks"] = vm_exists and vm_ssh_ready and has_playbooks and build.status not in {
+			BuildDefinition.STATUS_RUNNING,
+			BuildDefinition.STATUS_QUEUED,
+		}
 		context["show_cancel_build"] = vm_exists or build.status in {
 			BuildDefinition.STATUS_RUNNING,
 			BuildDefinition.STATUS_QUEUED,
@@ -189,6 +265,28 @@ class BuildCancelView(LoginRequiredMixin, View):
 		BuildLogEntry.objects.create(build=build, stage="cancel", message="Build cancelled by user")
 		publish_event("builds", "cancelled", {"build_id": build.id, "status": build.status})
 		messages.success(request, "Build cancelled")
+		return redirect("builds:build-detail", pk=build.pk)
+
+
+class BuildRerunPlaybooksView(LoginRequiredMixin, View):
+	def post(self, request, pk):
+		build = get_object_or_404(BuildDefinition.objects.select_related("machine_config"), pk=pk)
+
+		if build.status in {BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED}:
+			messages.error(request, "Cannot re-run playbooks while build is queued or running")
+			return redirect("builds:build-detail", pk=build.pk)
+
+		vm_exists, vm_ssh_ready, vm_ip = _probe_vm_ssh_ready(build)
+		if not vm_exists:
+			messages.error(request, "Build VM is not running")
+			return redirect("builds:build-detail", pk=build.pk)
+		if not vm_ssh_ready:
+			messages.error(request, "Build VM SSH login is not ready")
+			return redirect("builds:build-detail", pk=build.pk)
+
+		task = rerun_build_playbooks.delay(build.id, vm_ip)
+		cache.set(build_task_cache_key(build.id), task.id, timeout=6 * 60 * 60)
+		messages.success(request, "Playbook re-run queued")
 		return redirect("builds:build-detail", pk=build.pk)
 
 

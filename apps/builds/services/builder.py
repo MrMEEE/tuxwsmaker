@@ -732,6 +732,8 @@ class BuilderVMManager:
 			"tftp-root=/var/lib/tftpboot\n"
 			"dhcp-match=set:efi64,option:client-arch,7\n"
 			"dhcp-match=set:efi32,option:client-arch,6\n"
+				"log-dhcp\n"
+				"log-queries\n"
 			"dhcp-boot=tag:efi64,efi64/grubx64.efi\n"
 			"dhcp-boot=tag:efi32,efi32/grubia32.efi\n"
 			"dhcp-boot=pxelinux.0\n"

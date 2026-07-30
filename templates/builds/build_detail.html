@@ -7,9 +7,29 @@
   <div>
     <h4 class="mb-0">{{ build.name }}</h4>
     <small id="build-status-text" class="text-muted">Status: {{ build.get_status_display }}</small>
+    <div class="mt-1">
+      {% if build_vm_exists %}
+        {% if build_vm_ssh_ready %}
+        <span class="badge text-bg-success">VM SSH: Ready</span>
+        {% else %}
+        <span class="badge text-bg-warning">VM SSH: Not Ready</span>
+        {% endif %}
+      {% else %}
+      <span class="badge text-bg-secondary">VM: Not Running</span>
+      {% endif %}
+      {% if build_vm_ip %}
+      <span class="small text-muted ms-2">{{ build_vm_ip }}</span>
+      {% endif %}
+    </div>
   </div>
   <div class="d-flex gap-2">
     <a class="btn btn-outline-secondary" href="{% url 'builds:build-edit' build.pk %}" data-modal="1" data-modal-title="Edit Build">Edit</a>
+    {% if show_rerun_playbooks %}
+    <form method="post" action="{% url 'builds:build-rerun-playbooks' build.pk %}" data-confirm-message="Re-run assigned playbooks on the running build VM?" data-confirm-title="Re-run Playbooks" data-confirm-accept="Re-run" data-confirm-class="btn-primary">
+      {% csrf_token %}
+      <button class="btn btn-outline-primary" type="submit">Re-run Playbooks</button>
+    </form>
+    {% endif %}
     {% if show_cancel_build %}
     <form method="post" action="{% url 'builds:build-cancel' build.pk %}" data-confirm-message="Cancel this running build?" data-confirm-title="Cancel Build" data-confirm-accept="Cancel Build" data-confirm-class="btn-warning">
       {% csrf_token %}

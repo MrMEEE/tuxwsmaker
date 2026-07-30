@@ -32,6 +32,17 @@ class VMDefinition:
 class LibvirtVMManager:
     """Manages builder VMs via libvirt Python bindings."""
 
+    UEFI_CODE_CANDIDATES = (
+        "/usr/share/OVMF/OVMF_CODE_4M.fd",
+        "/usr/share/OVMF/OVMF_CODE.fd",
+        "/usr/share/qemu/OVMF.fd",
+        "/usr/share/ovmf/OVMF.fd",
+    )
+    UEFI_VARS_CANDIDATES = (
+        "/usr/share/OVMF/OVMF_VARS_4M.fd",
+        "/usr/share/OVMF/OVMF_VARS.fd",
+    )
+
     def __init__(self, uri: str = "qemu:///system") -> None:
         self.uri = uri
 
@@ -85,6 +96,47 @@ class LibvirtVMManager:
                 return True
             except Exception:
                 return False
+        finally:
+            conn.close()
+
+    def domain_is_active(self, name: str) -> bool:
+        conn = self._connect()
+        try:
+            try:
+                domain = conn.lookupByName(name)
+            except Exception:
+                return False
+            return domain.isActive() == 1
+        finally:
+            conn.close()
+
+    def current_ipv4(
+        self,
+        *,
+        domain_name: str,
+        network_name: str,
+        mac_address: str = "",
+    ) -> Optional[str]:
+        conn = self._connect()
+        try:
+            network = conn.networkLookupByName(network_name)
+            mac_address = (mac_address or "").strip().lower()
+            try:
+                leases = network.DHCPLeases() or []
+            except Exception:
+                leases = []
+
+            for lease in leases:
+                if not isinstance(lease, dict):
+                    continue
+                hostname = (lease.get("hostname") or "").strip()
+                ipaddr = lease.get("ipaddr")
+                lease_mac = (lease.get("mac") or lease.get("macaddr") or "").strip().lower()
+                if mac_address and lease_mac == mac_address and ipaddr:
+                    return ipaddr
+                if hostname == domain_name and ipaddr:
+                    return ipaddr
+            return None
         finally:
             conn.close()
 
@@ -142,15 +194,16 @@ class LibvirtVMManager:
             self._create_qcow2_disk(disk_path=disk_path, size_gib=vm.disk_gib)
 
         if vm.boot_mode == "uefi":
+            code_path, vars_path = self._resolve_uefi_firmware()
             boot_arg = (
-                "uefi,"
+                f"loader={code_path},"
+                "loader.readonly=yes,"
+                "loader.type=pflash,"
                 "loader.secure=no,"
-                "firmware.feature0.name=secure-boot,firmware.feature0.enabled=no,"
-                "firmware.feature1.name=enrolled-keys,firmware.feature1.enabled=no,"
-                "boot0.dev=network,boot1.dev=hd"
+                f"nvram.template={vars_path}"
             )
         else:
-            boot_arg = "boot0.dev=network,boot1.dev=hd"
+            boot_arg = ""
 
         cmd = [
             "virt-install",
@@ -171,13 +224,12 @@ class LibvirtVMManager:
             "--console",
             "pty,target_type=serial",
             "--pxe",
-            "--boot",
-            boot_arg,
             "--noautoconsole",
             "--wait",
-            "-1",
-            "--noreboot",
+            "0",
         ]
+        if boot_arg:
+            cmd.extend(["--boot", boot_arg])
         env = dict(os.environ)
         env["PATH"] = f"/usr/bin:/bin:{env.get('PATH', '')}"
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
@@ -185,6 +237,17 @@ class LibvirtVMManager:
             raise VirtualizationError(
                 f"virt-install failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
             )
+
+    def _resolve_uefi_firmware(self) -> tuple[str, str]:
+        code_path = next((path for path in self.UEFI_CODE_CANDIDATES if Path(path).exists()), "")
+        vars_path = next((path for path in self.UEFI_VARS_CANDIDATES if Path(path).exists()), "")
+        if not code_path or not vars_path:
+            raise VirtualizationError(
+                "Could not find a usable generic OVMF firmware pair on the host. "
+                "Expected one of: "
+                f"code={', '.join(self.UEFI_CODE_CANDIDATES)} vars={', '.join(self.UEFI_VARS_CANDIDATES)}"
+            )
+        return code_path, vars_path
 
     def _create_qcow2_disk(self, *, disk_path: Path, size_gib: int) -> None:
         if shutil.which("qemu-img") is None:
@@ -232,11 +295,18 @@ class LibvirtVMManager:
         finally:
             conn.close()
 
-    def wait_for_ipv4(self, domain_name: str, network_name: str, timeout_seconds: int = 1200) -> Optional[str]:
+    def wait_for_ipv4(
+        self,
+        domain_name: str,
+        network_name: str,
+        timeout_seconds: int = 1200,
+        mac_address: str = "",
+    ) -> Optional[str]:
         conn = self._connect()
         try:
             network = conn.networkLookupByName(network_name)
             end = time.time() + timeout_seconds
+            mac_address = (mac_address or "").strip().lower()
             while time.time() < end:
                 try:
                     leases = network.DHCPLeases() or []
@@ -244,8 +314,13 @@ class LibvirtVMManager:
                     leases = []
 
                 for lease in leases:
-                    hostname = lease.get("hostname") or ""
+                    if not isinstance(lease, dict):
+                        continue
+                    hostname = (lease.get("hostname") or "").strip()
                     ipaddr = lease.get("ipaddr")
+                    lease_mac = (lease.get("mac") or lease.get("macaddr") or "").strip().lower()
+                    if mac_address and lease_mac == mac_address and ipaddr:
+                        return ipaddr
                     if hostname == domain_name and ipaddr:
                         return ipaddr
                 time.sleep(5)

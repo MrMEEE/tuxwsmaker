@@ -294,6 +294,19 @@ def checkout_repository(repository: PlaybookRepository, branch: str) -> Path:
         _cleanup_paths(cleanup_paths)
 
 
+def checkout_repository_url(
+    repo_url: str,
+    branch: str,
+    *,
+    force_refresh: bool = False,
+) -> Path:
+    return _checkout_repository_url(
+        repo_url=repo_url,
+        branch=branch,
+        force_refresh=force_refresh,
+    )
+
+
 def sync_playbooks(repository: PlaybookRepository, branch: str) -> list[Playbook]:
     workdir = checkout_repository(repository, branch)
     candidates: list[str] = []

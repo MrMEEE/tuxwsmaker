@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import secrets
 import shlex
+import tempfile
 from pathlib import Path
 
 from celery import shared_task
@@ -9,7 +10,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
 
-from apps.builds.models import BuildDefinition, BuildLogEntry
+from apps.builds.models import BuildDefinition, BuildLogEntry, SSHKey
 from apps.builds.models import BuildMachineConfig
 from apps.builds.services.builder import BuilderVMManager
 from apps.builds.services.artifacts import ArtifactExportError, generate_artifacts
@@ -18,7 +19,7 @@ from apps.builds.services.provisioning import AnsibleProvisioner, ProvisioningEr
 from apps.builds.services.ssh_keys import SSHKeyError, generate_build_ssh_keypair
 from apps.builds.services.virtualization import LibvirtVMManager, VMDefinition, VirtualizationError
 from apps.builds.services.artifacts import prepare_iso_pxe_assets
-from apps.playbooks.services import PlaybookSyncError, checkout_repository
+from apps.playbooks.services import PlaybookSyncError, checkout_repository, checkout_repository_url
 from apps.realtime.events import publish_event
 from apps.serverconfig.models import ServerConfiguration
 
@@ -146,6 +147,8 @@ def _ensure_builder_pxe_bootloader(
         "if [ -f /etc/dnsmasq.d/wsbuildnet.conf ]; then "
         "  sed -i 's#dhcp-boot=tag:efi64,grubx64.efi#dhcp-boot=tag:efi64,efi64/grubx64.efi#g' /etc/dnsmasq.d/wsbuildnet.conf; "
         "  sed -i 's#dhcp-boot=tag:efi32,grubia32.efi#dhcp-boot=tag:efi32,efi32/grubia32.efi#g' /etc/dnsmasq.d/wsbuildnet.conf; "
+        "  sed -i '/^log-tftp$/d' /etc/dnsmasq.d/wsbuildnet.conf; "
+        "  grep -q '^log-dhcp$' /etc/dnsmasq.d/wsbuildnet.conf || echo 'log-dhcp' >> /etc/dnsmasq.d/wsbuildnet.conf; "
         "  systemctl restart dnsmasq >/dev/null 2>&1 || true; "
         "fi; "
         "test -f \"$tftp_root/pxelinux.0\"; "
@@ -186,9 +189,9 @@ def _cleanup_builder_bootstrap_assets(
         f"rm -rf {build_root} {kickstart_file}; "
         "if [ -n \"$old_mac\" ]; then "
         "old_slug=$(printf '%s' \"$old_mac\" | tr '[:upper:]' '[:lower:]' | tr ':' '-'); "
-        f"rm -f {tftp_root}/pxelinux.cfg/01-$old_slug {tftp_root}/grub.cfg-01-$old_slug {tftp_root}/grub.cfg-$old_slug; "
+        f"rm -f {tftp_root}/pxelinux.cfg/01-$old_slug {tftp_root}/grub.cfg-01-$old_slug {tftp_root}/grub.cfg-$old_slug {tftp_root}/efi64/grub.cfg-01-$old_slug {tftp_root}/efi64/grub.cfg-$old_slug {tftp_root}/efi64/grub.cfg {tftp_root}/efi32/grub.cfg-01-$old_slug {tftp_root}/efi32/grub.cfg-$old_slug {tftp_root}/efi32/grub.cfg; "
         "fi; "
-        f"mkdir -p {tftp_root}/builds {tftp_root}/build-state {tftp_root}/pxelinux.cfg /var/www/html/kickstarts"
+        f"mkdir -p {tftp_root}/builds {tftp_root}/build-state {tftp_root}/pxelinux.cfg {tftp_root}/efi64 {tftp_root}/efi32 /var/www/html/kickstarts"
     )
     _run_remote_checked(
         provisioner=provisioner,
@@ -241,6 +244,63 @@ def _publish_builder_iso_http_source(
         timeout_seconds=timeout_seconds,
     )
     return iso_url
+
+
+def _run_selected_playbooks(
+    *,
+    build: BuildDefinition,
+    provisioner: AnsibleProvisioner,
+    ip_address: str,
+    ssh_user: str,
+    private_key_path: str,
+) -> None:
+    ordered = list(build.ordered_playbook_selections())
+    if ordered:
+        _append_build_log(build=build, stage="playbooks", message=f"Running {len(ordered)} assigned playbook(s)")
+        for selection in ordered:
+            repo = selection.playbook.repository
+            branch = selection.playbook.branch
+            repo_checkout = checkout_repository(repo, branch)
+            _append_build_log(
+                build=build,
+                stage="playbooks",
+                message=f"Running playbook {selection.playbook.repository.name} [{branch}] {selection.playbook.path}",
+            )
+            provisioner.configure_guest(
+                host=ip_address,
+                playbook_path=selection.playbook.path,
+                user=ssh_user,
+                private_key_path=private_key_path,
+                working_dir=repo_checkout,
+            )
+        return
+
+    if build.playbook_path:
+        repo_url = (build.playbook_repo or "").strip()
+        branch = (build.playbook_branch or "main").strip() or "main"
+        if repo_url:
+            repo_checkout = checkout_repository_url(repo_url, branch)
+            _append_build_log(
+                build=build,
+                stage="playbooks",
+                message=f"Running fallback playbook {build.playbook_path} from {repo_url} [{branch}]",
+            )
+            provisioner.configure_guest(
+                host=ip_address,
+                playbook_path=build.playbook_path,
+                user=ssh_user,
+                private_key_path=private_key_path,
+                working_dir=repo_checkout,
+            )
+            return
+
+        _append_build_log(build=build, stage="playbooks", message=f"Running fallback playbook {build.playbook_path}")
+        provisioner.configure_guest(
+            host=ip_address,
+            playbook_path=build.playbook_path,
+            user=ssh_user,
+            private_key_path=private_key_path,
+        )
 
 
 @shared_task(bind=True)
@@ -354,13 +414,19 @@ def run_build_definition(self, build_id: int) -> dict[str, str]:
     remote_efi_config = f"{tftp_root}/grub.cfg-01-{mac_slug}"
     remote_efi_config_alt = f"{tftp_root}/grub.cfg-{mac_slug}"
     remote_efi_default = f"{tftp_root}/grub.cfg"
+    remote_efi64_config = f"{tftp_root}/efi64/grub.cfg-01-{mac_slug}"
+    remote_efi64_config_alt = f"{tftp_root}/efi64/grub.cfg-{mac_slug}"
+    remote_efi64_default = f"{tftp_root}/efi64/grub.cfg"
+    remote_efi32_config = f"{tftp_root}/efi32/grub.cfg-01-{mac_slug}"
+    remote_efi32_config_alt = f"{tftp_root}/efi32/grub.cfg-{mac_slug}"
+    remote_efi32_default = f"{tftp_root}/efi32/grub.cfg"
 
     _run_remote_checked(
         provisioner=builder_provisioner,
         host=builder_ip,
         user=builder_ssh_user,
         private_key_path=str(builder_access.private_key_path),
-        command=f"mkdir -p {remote_build_root} {tftp_root}/pxelinux.cfg /var/www/html/kickstarts",
+        command=f"mkdir -p {remote_build_root} {tftp_root}/pxelinux.cfg {tftp_root}/efi64 {tftp_root}/efi32 /var/www/html/kickstarts",
         timeout_seconds=timeout_seconds,
     )
     builder_provisioner.upload_file(
@@ -435,6 +501,60 @@ def run_build_definition(self, build_id: int) -> dict[str, str]:
         host=builder_ip,
         user=builder_ssh_user,
         private_key_path=str(builder_access.private_key_path),
+        command=f"cat > {remote_efi64_config}",
+        timeout_seconds=timeout_seconds,
+        input_text=boot_configs["efi"],
+    )
+    _run_remote_checked(
+        provisioner=builder_provisioner,
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
+        command=f"cat > {remote_efi64_config_alt}",
+        timeout_seconds=timeout_seconds,
+        input_text=boot_configs["efi"],
+    )
+    _run_remote_checked(
+        provisioner=builder_provisioner,
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
+        command=f"cat > {remote_efi64_default}",
+        timeout_seconds=timeout_seconds,
+        input_text=boot_configs["efi"],
+    )
+    _run_remote_checked(
+        provisioner=builder_provisioner,
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
+        command=f"cat > {remote_efi32_config}",
+        timeout_seconds=timeout_seconds,
+        input_text=boot_configs["efi"],
+    )
+    _run_remote_checked(
+        provisioner=builder_provisioner,
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
+        command=f"cat > {remote_efi32_config_alt}",
+        timeout_seconds=timeout_seconds,
+        input_text=boot_configs["efi"],
+    )
+    _run_remote_checked(
+        provisioner=builder_provisioner,
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
+        command=f"cat > {remote_efi32_default}",
+        timeout_seconds=timeout_seconds,
+        input_text=boot_configs["efi"],
+    )
+    _run_remote_checked(
+        provisioner=builder_provisioner,
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
         command=f"printf '%s\\n' {vm_mac_address} > {tftp_root}/build-state/build-{build.id}.mac",
         timeout_seconds=timeout_seconds,
     )
@@ -460,61 +580,29 @@ def run_build_definition(self, build_id: int) -> dict[str, str]:
         vm_manager.ensure_domain(vm_definition, replace_existing=True)
         vm_manager.start_domain(vm_name)
         _append_build_log(build=build, stage="vm", message="Build VM started and waiting for DHCP lease")
+        _append_build_log(build=build, stage="network", message=f"Watching builder dnsmasq for MAC {vm_mac_address}")
 
-        try:
-            ip_address = builder_provisioner.wait_for_dnsmasq_lease(
-                host=builder_ip,
-                user=builder_ssh_user,
-                private_key_path=str(builder_access.private_key_path),
-                mac_address=vm_mac_address,
-                timeout_seconds=timeout_seconds,
-            )
-        except ProvisioningError:
-            ip_address = vm_manager.wait_for_ipv4(
-                domain_name=vm_name,
-                network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
-                timeout_seconds=timeout_seconds,
-            )
-
-        _append_build_log(build=build, stage="network", message=f"Build VM obtained IP address {ip_address}")
-        if not ip_address:
-            raise VirtualizationError("Timed out waiting for VM IP after kickstart")
-
-        builder_provisioner.wait_for_ssh(
-            host=ip_address,
-            user=ssh_user,
-            private_key_path=str(key_pair.private_key_path),
+        ip_address = builder_provisioner.wait_for_guest_boot_progress(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_access.private_key_path),
+            mac_address=vm_mac_address,
+            ssh_user=ssh_user,
+            ssh_private_key_path=str(key_pair.private_key_path),
+            kickstart_url=f"http://{builder_ip}/kickstarts/{kickstart_path.name}",
+            install_source_url=install_source_url,
+            progress_cb=lambda stage, message: _append_build_log(build=build, stage=stage, message=message),
             timeout_seconds=timeout_seconds,
         )
-        _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
+        _append_build_log(build=build, stage="network", message=f"Build VM is reachable at {ip_address}")
 
-        ordered = list(build.ordered_playbook_selections())
-        if ordered:
-            _append_build_log(build=build, stage="playbooks", message=f"Running {len(ordered)} assigned playbook(s)")
-            for selection in ordered:
-                repo = selection.playbook.repository
-                branch = selection.playbook.branch
-                repo_checkout = checkout_repository(repo, branch)
-                _append_build_log(
-                    build=build,
-                    stage="playbooks",
-                    message=f"Running playbook {selection.playbook.repository.name} [{branch}] {selection.playbook.path}",
-                )
-                builder_provisioner.configure_guest(
-                    host=ip_address,
-                    playbook_path=selection.playbook.path,
-                    user=ssh_user,
-                    private_key_path=str(key_pair.private_key_path),
-                    working_dir=repo_checkout,
-                )
-        elif build.playbook_path:
-            _append_build_log(build=build, stage="playbooks", message=f"Running fallback playbook {build.playbook_path}")
-            builder_provisioner.configure_guest(
-                host=ip_address,
-                playbook_path=build.playbook_path,
-                user=ssh_user,
-                private_key_path=str(key_pair.private_key_path),
-            )
+        _run_selected_playbooks(
+            build=build,
+            provisioner=builder_provisioner,
+            ip_address=ip_address,
+            ssh_user=ssh_user,
+            private_key_path=str(key_pair.private_key_path),
+        )
 
         _append_build_log(build=build, stage="shutdown", message="Waiting for installed VM to shut down and reboot")
         vm_manager.shutdown_and_wait(
@@ -556,5 +644,81 @@ def run_build_definition(self, build_id: int) -> dict[str, str]:
         raise RuntimeError(str(exc)) from exc
     finally:
         key_pair.cleanup_private()
+        if task_id and cache.get(build_task_cache_key(build_id)) == task_id:
+            cache.delete(build_task_cache_key(build_id))
+
+
+@shared_task(bind=True)
+def rerun_build_playbooks(self, build_id: int, ip_address: str = "") -> dict[str, str]:
+    task_id = str(getattr(self.request, "id", "") or "")
+    if task_id:
+        cache.set(build_task_cache_key(build_id), task_id, timeout=BUILD_TASK_CACHE_TTL_SECONDS)
+
+    build = BuildDefinition.objects.select_related("machine_config").get(pk=build_id)
+    vm_name = f"build-{build.id}"
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+
+    try:
+        if not vm_manager.domain_exists(vm_name) or not vm_manager.domain_is_active(vm_name):
+            raise ProvisioningError(f"Build VM {vm_name} is not running")
+
+        effective_ip = (ip_address or "").strip()
+        if not effective_ip:
+            effective_ip = vm_manager.current_ipv4(
+                domain_name=vm_name,
+                network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
+            ) or ""
+        if not effective_ip:
+            effective_ip = vm_manager.wait_for_ipv4(
+                domain_name=vm_name,
+                network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
+                timeout_seconds=120,
+            ) or ""
+        if not effective_ip:
+            raise ProvisioningError(f"Could not determine IP address for running VM {vm_name}")
+
+        key_obj = SSHKey.objects.filter(
+            scope=SSHKey.SCOPE_IMAGE_BUILD,
+            build=build,
+            name="build",
+        ).first()
+        if key_obj is None or not key_obj.has_keypair():
+            raise SSHKeyError("Missing build SSH keypair for re-running playbooks")
+        private_key_text = key_obj.get_private_key().strip()
+        if not private_key_text:
+            raise SSHKeyError("Build SSH private key is unavailable")
+
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f"build-{build.id}-", delete=False) as key_file:
+            key_file.write(private_key_text + "\n")
+            key_path = Path(key_file.name)
+        key_path.chmod(0o600)
+
+        try:
+            ssh_user = getattr(settings, "BUILD_VM_SSH_USER", "root")
+            provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
+            _append_build_log(build=build, stage="playbooks", message=f"Re-running playbooks on {effective_ip}")
+            _append_build_log(build=build, stage="ssh", message=f"Waiting for SSH access on {ssh_user}@{effective_ip}")
+            provisioner.wait_for_ssh(
+                host=effective_ip,
+                user=ssh_user,
+                private_key_path=str(key_path),
+                timeout_seconds=180,
+            )
+            _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
+            _run_selected_playbooks(
+                build=build,
+                provisioner=provisioner,
+                ip_address=effective_ip,
+                ssh_user=ssh_user,
+                private_key_path=str(key_path),
+            )
+            _append_build_log(build=build, stage="playbooks", message="Playbook re-run completed successfully")
+            return {"status": "ok", "ip": effective_ip, "vm": vm_name}
+        finally:
+            key_path.unlink(missing_ok=True)
+    except (ProvisioningError, SSHKeyError, PlaybookSyncError) as exc:
+        _append_build_log(build=build, stage="error", message=str(exc))
+        raise RuntimeError(str(exc)) from exc
+    finally:
         if task_id and cache.get(build_task_cache_key(build_id)) == task_id:
             cache.delete(build_task_cache_key(build_id))
