@@ -114,19 +114,25 @@ def render_pxe_boot_configs(
     kickstart_url: str,
     install_source_url: str,
 ) -> dict[str, str]:
+    common_args = (
+        f"inst.ks={kickstart_url} "
+        f"inst.repo={install_source_url} "
+        f"inst.stage2={install_source_url} "
+        "ip=dhcp console=ttyS0,115200n8 console=tty0"
+    )
     bios = (
         "DEFAULT tuxwsmaker\n"
         "PROMPT 0\n"
         "TIMEOUT 20\n"
         "LABEL tuxwsmaker\n"
         f"  KERNEL /{kernel_rel_path}\n"
-        f"  APPEND initrd=/{initrd_rel_path} inst.ks={kickstart_url} inst.repo={install_source_url} inst.stage2={install_source_url} console=ttyS0 ip=dhcp\n"
+        f"  APPEND initrd=/{initrd_rel_path} {common_args}\n"
     )
     efi = (
         "set timeout=2\n"
         "set default=0\n"
         "menuentry 'TuxWSMaker Build' {\n"
-        f"  linuxefi /{kernel_rel_path} initrd=/{initrd_rel_path} inst.ks={kickstart_url} inst.repo={install_source_url} inst.stage2={install_source_url} console=ttyS0 ip=dhcp\n"
+        f"  linuxefi /{kernel_rel_path} initrd=/{initrd_rel_path} {common_args}\n"
         f"  initrdefi /{initrd_rel_path}\n"
         "}\n"
     )

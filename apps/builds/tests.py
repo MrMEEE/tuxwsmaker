@@ -4,9 +4,13 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
 from django.conf import settings
+from django.core.cache import cache
 from pathlib import Path
+from unittest.mock import patch
 
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
+from apps.builds.views import _recover_stale_build_state
+from apps.workers.tasks import build_task_cache_key
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionLayout
 from apps.serverconfig.models import ServerConfiguration
@@ -14,11 +18,14 @@ from apps.serverconfig.models import ServerConfiguration
 
 class BuildQueueLimitTests(TestCase):
 	def setUp(self):
+		cache.clear()
 		user_model = get_user_model()
 		self.user = user_model.objects.create_user(username="tester", password="secret", is_local=True)
 		self.client.login(username="tester", password="secret")
 
-		ServerConfiguration.objects.create(name="default", concurrent_builds=1)
+		cfg = ServerConfiguration.get_solo()
+		cfg.concurrent_builds = 1
+		cfg.save()
 
 		os_obj = OperatingSystem.objects.create(name="RHEL", family=OperatingSystem.FAMILY_RHEL)
 		layout = PartitionLayout.objects.create(name="standard")
@@ -111,3 +118,64 @@ class BuildArtifactDownloadTests(TestCase):
 		)
 		self.assertEqual(response.status_code, 200)
 		self.assertIn(".tar.gz", response["Content-Disposition"])
+
+
+class BuildManualStepTests(TestCase):
+	def setUp(self):
+		user_model = get_user_model()
+		self.user = user_model.objects.create_user(username="manual", password="secret", is_local=True)
+		self.client.login(username="manual", password="secret")
+
+		os_obj = OperatingSystem.objects.create(name="RHEL-MANUAL", family=OperatingSystem.FAMILY_RHEL)
+		layout = PartitionLayout.objects.create(name="layout-manual")
+		cfg = BuildMachineConfig.objects.create(name="cfg-manual")
+		iso = ISOImage.objects.create(operating_system=os_obj, version="10.5", iso_file="isos/manual.iso")
+
+		self.build = BuildDefinition.objects.create(
+			name="build-manual",
+			operating_system=os_obj,
+			iso_image=iso,
+			partition_layout=layout,
+			machine_config=cfg,
+		)
+
+	def test_build_step_methods_follow_sequence(self):
+		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_VM_SHELL)
+		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_VM_SHELL))
+		self.assertFalse(self.build.can_run_manual_step(BuildDefinition.STEP_INSTALL_OS))
+
+		self.build.current_step = BuildDefinition.STEP_VM_SHELL
+		self.build.runtime_state = {"last_completed_step": BuildDefinition.STEP_VM_SHELL}
+		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_INSTALL_OS)
+		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_INSTALL_OS))
+		self.assertFalse(self.build.can_run_manual_step(BuildDefinition.STEP_RUN_PLAYBOOKS))
+
+	@patch("apps.builds.views.run_build_step.delay")
+	def test_manual_step_route_rejects_missing_prerequisite(self, mock_delay):
+		response = self.client.post(
+			reverse("builds:build-run-step", args=[self.build.pk, BuildDefinition.STEP_INSTALL_OS])
+		)
+		self.assertEqual(response.status_code, 302)
+		mock_delay.assert_not_called()
+
+	@patch("apps.builds.views.run_build_step.delay")
+	def test_manual_step_route_queues_allowed_step(self, mock_delay):
+		mock_delay.return_value.id = "task-1"
+		response = self.client.post(
+			reverse("builds:build-run-step", args=[self.build.pk, BuildDefinition.STEP_VM_SHELL])
+		)
+		self.assertEqual(response.status_code, 302)
+		mock_delay.assert_called_once_with(self.build.id, BuildDefinition.STEP_VM_SHELL)
+
+	def test_recover_stale_running_state_marks_build_failed(self):
+		self.build.status = BuildDefinition.STATUS_RUNNING
+		self.build.run_mode = BuildDefinition.RUN_MODE_MANUAL
+		self.build.current_step = BuildDefinition.STEP_VM_SHELL
+		self.build.save(update_fields=["status", "run_mode", "current_step", "updated_at"])
+		cache.delete(build_task_cache_key(self.build.id))
+
+		recovered = _recover_stale_build_state(self.build)
+
+		self.assertTrue(recovered)
+		self.build.refresh_from_db()
+		self.assertEqual(self.build.status, BuildDefinition.STATUS_FAILED)

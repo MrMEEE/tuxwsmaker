@@ -109,6 +109,18 @@ class BuildSnapshotView(APIView):
 			}
 			for log in build.logs.all().order_by("created_at", "id")
 		]
+		step_labels = dict(BuildDefinition.STEP_CHOICES)
+		manual_steps = []
+		for slug in BuildDefinition.STEP_SEQUENCE:
+			manual_steps.append(
+				{
+					"slug": slug,
+					"label": step_labels.get(slug, slug),
+					"enabled": build.can_run_manual_step(slug),
+					"completed": build.has_completed_step(slug),
+					"is_next": build.next_manual_step() == slug,
+				}
+			)
 
 		return Response(
 			{
@@ -116,6 +128,11 @@ class BuildSnapshotView(APIView):
 				"name": build.name,
 				"status": build.status,
 				"status_display": build.get_status_display(),
+				"run_mode": build.run_mode,
+				"run_mode_display": build.get_run_mode_display(),
+				"current_step": build.current_step,
+				"current_step_display": build.get_current_step_display(),
+				"manual_steps": manual_steps,
 				"artifacts": artifacts,
 				"logs": logs,
 			}

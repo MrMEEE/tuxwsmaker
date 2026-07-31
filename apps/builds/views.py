@@ -15,12 +15,15 @@ from pathlib import Path
 from apps.workers.tasks import run_build_definition
 from apps.workers.tasks import build_task_cache_key
 from apps.workers.tasks import rerun_build_playbooks
+from apps.workers.tasks import run_build_step
 from apps.serverconfig.models import ServerConfiguration
 from apps.realtime.events import publish_event
 from config.celery import app as celery_app
 
 from .forms import BuildDefinitionForm, BuildMachineConfigForm, UserSSHKeyForm
 from .models import BuildArtifact, BuildDefinition, BuildLogEntry, BuildMachineConfig, BuildPlaybookSelection, SSHKey
+from .services.builder import BuilderVMManager
+from .services.provisioning import AnsibleProvisioner
 from .services.virtualization import LibvirtVMManager
 
 
@@ -113,6 +116,110 @@ def _probe_vm_ssh_ready(build: BuildDefinition) -> tuple[bool, bool, str]:
 		key_path.unlink(missing_ok=True)
 
 
+def _manual_step_items(build: BuildDefinition) -> list[dict[str, object]]:
+	items: list[dict[str, object]] = []
+	next_step = build.next_manual_step()
+	for step, label in BuildDefinition.STEP_CHOICES:
+		if step == BuildDefinition.STEP_PENDING:
+			continue
+		completed = build.has_completed_step(step)
+		enabled = build.can_run_manual_step(step)
+		items.append(
+			{
+				"slug": step,
+				"label": label,
+				"completed": completed,
+				"enabled": enabled,
+				"is_next": step == next_step and not completed,
+			}
+		)
+	return items
+
+
+def _task_is_active(task_id: str) -> bool:
+	if not task_id:
+		return False
+	try:
+		state = str(celery_app.AsyncResult(task_id).state or "").upper()
+	except Exception:
+		return False
+	return state in {"PENDING", "RECEIVED", "STARTED", "RETRY"}
+
+
+def _set_build_active_task(build: BuildDefinition, task_id: str) -> None:
+	state = dict(build.runtime_state or {})
+	state["active_task_id"] = task_id
+	build.runtime_state = state
+	build.save(update_fields=["runtime_state", "updated_at"])
+
+
+def _recover_stale_build_state(build: BuildDefinition) -> bool:
+	if build.status not in {BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED}:
+		return False
+	state = dict(build.runtime_state or {})
+	task_id = str(state.get("active_task_id") or cache.get(build_task_cache_key(build.id)) or "").strip()
+	if _task_is_active(task_id):
+		return False
+	state.pop("active_task_id", None)
+	build.runtime_state = state
+	build.status = BuildDefinition.STATUS_FAILED
+	build.save(update_fields=["status", "runtime_state", "updated_at"])
+	message = f"Recovered stale build state after task exited unexpectedly during {build.get_current_step_display()}"
+	BuildLogEntry.objects.create(build=build, stage="error", message=message)
+	publish_event(
+		"builds",
+		"failed",
+		{"build_id": build.id, "status": build.status, "current_step": build.current_step, "error": message},
+	)
+	return True
+
+
+def _cleanup_builder_boot_files_for_build(build: BuildDefinition) -> None:
+	state = dict(build.runtime_state or {})
+	builder_ip = str(state.get("builder_ip") or "").strip()
+	builder_user = str(state.get("builder_ssh_user") or getattr(settings, "BUILDER_VM_SSH_USER", "root")).strip() or "root"
+	tftp_root = str(state.get("tftp_root") or "/var/lib/tftpboot").strip() or "/var/lib/tftpboot"
+	vm_mac = str(state.get("vm_mac_address") or "").strip().lower()
+
+	if not builder_ip:
+		return
+
+	builder_manager = BuilderVMManager()
+	key_pair = builder_manager.ensure_access_keypair()
+	provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
+	try:
+		mac_slug = vm_mac.replace(":", "-") if vm_mac else ""
+		cleanup_parts = [
+			"set +e",
+			f"mkdir -p {tftp_root}/builds {tftp_root}/build-state {tftp_root}/pxelinux.cfg {tftp_root}/efi64 {tftp_root}/efi32 /var/www/html/isos /var/www/html/kickstarts",
+			f"if mountpoint -q /var/www/html/isos/build-{build.id}; then umount /var/www/html/isos/build-{build.id} || umount -l /var/www/html/isos/build-{build.id} || true; fi",
+			f"rm -rf /var/www/html/isos/build-{build.id}",
+			f"rm -f /var/www/html/kickstarts/build-{build.id}.cfg",
+			f"rm -rf {tftp_root}/builds/build-{build.id}",
+			f"rm -f {tftp_root}/build-state/build-{build.id}.mac",
+		]
+		if mac_slug:
+			cleanup_parts.append(
+				f"rm -f {tftp_root}/pxelinux.cfg/01-{mac_slug} {tftp_root}/grub.cfg-01-{mac_slug} {tftp_root}/grub.cfg-{mac_slug} "
+				f"{tftp_root}/efi64/grub.cfg-01-{mac_slug} {tftp_root}/efi64/grub.cfg-{mac_slug} "
+				f"{tftp_root}/efi32/grub.cfg-01-{mac_slug} {tftp_root}/efi32/grub.cfg-{mac_slug}"
+			)
+		cleanup_parts.append("restorecon -RF /var/www/html/isos /var/www/html/kickstarts >/dev/null 2>&1 || true")
+		cleanup_cmd = "; ".join(cleanup_parts)
+		provisioner.run_remote_command(
+			host=builder_ip,
+			user=builder_user,
+			private_key_path=str(key_pair.private_key_path),
+			command=cleanup_cmd,
+			timeout_seconds=45,
+		)
+	except Exception:
+		# Best-effort cleanup: cancellation should still proceed even if builder is unreachable.
+		pass
+	finally:
+		key_pair.cleanup_private()
+
+
 class BuildListView(LoginRequiredMixin, ListView):
 	model = BuildDefinition
 	template_name = "builds/build_list.html"
@@ -132,10 +239,18 @@ class BuildDetailView(LoginRequiredMixin, DetailView):
 	def get_context_data(self, **kwargs):
 		context = super().get_context_data(**kwargs)
 		build = self.object
+		if _recover_stale_build_state(build):
+			build.refresh_from_db()
 		vm_exists, vm_ssh_ready, vm_ip = _probe_vm_ssh_ready(build)
 		context["build_vm_exists"] = vm_exists
 		context["build_vm_ssh_ready"] = vm_ssh_ready
 		context["build_vm_ip"] = vm_ip
+		context["current_step_display"] = build.get_current_step_display()
+		context["manual_steps"] = _manual_step_items(build)
+		context["show_full_build"] = build.status not in {
+			BuildDefinition.STATUS_RUNNING,
+			BuildDefinition.STATUS_QUEUED,
+		}
 		has_playbooks = bool(build.playbook_path) or build.ordered_playbook_selections().exists()
 		context["show_rerun_playbooks"] = vm_exists and vm_ssh_ready and has_playbooks and build.status not in {
 			BuildDefinition.STATUS_RUNNING,
@@ -221,6 +336,8 @@ class BuildDeleteView(LoginRequiredMixin, View):
 class BuildQueueView(LoginRequiredMixin, View):
 	def post(self, request, pk):
 		build = get_object_or_404(BuildDefinition, pk=pk)
+		if _recover_stale_build_state(build):
+			build.refresh_from_db()
 		if build.status in {BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED}:
 			messages.warning(request, "Build is already queued or running")
 			return redirect("builds:build-detail", pk=build.pk)
@@ -239,6 +356,7 @@ class BuildQueueView(LoginRequiredMixin, View):
 		publish_event("builds", "queued", {"build_id": build.id, "status": build.status})
 		BuildLogEntry.objects.create(build=build, stage="queued", message="Build queued")
 		task = run_build_definition.delay(build.id)
+		_set_build_active_task(build, task.id)
 		cache.set(build_task_cache_key(build.id), task.id, timeout=6 * 60 * 60)
 		messages.success(request, "Build queued")
 		return redirect("builds:build-detail", pk=build.pk)
@@ -260,17 +378,46 @@ class BuildCancelView(LoginRequiredMixin, View):
 		except Exception:
 			pass
 
+		_cleanup_builder_boot_files_for_build(build)
+
 		build.status = BuildDefinition.STATUS_DRAFT
-		build.save(update_fields=["status", "updated_at"])
+		build.current_step = BuildDefinition.STEP_PENDING
+		build.runtime_state = {"last_completed_step": BuildDefinition.STEP_PENDING}
+		build.save(update_fields=["status", "current_step", "runtime_state", "updated_at"])
 		BuildLogEntry.objects.create(build=build, stage="cancel", message="Build cancelled by user")
 		publish_event("builds", "cancelled", {"build_id": build.id, "status": build.status})
 		messages.success(request, "Build cancelled")
 		return redirect("builds:build-detail", pk=build.pk)
 
 
+class BuildRunStepView(LoginRequiredMixin, View):
+	def post(self, request, pk, step):
+		build = get_object_or_404(BuildDefinition.objects.select_related("machine_config"), pk=pk)
+		if _recover_stale_build_state(build):
+			build.refresh_from_db()
+
+		if step not in BuildDefinition.STEP_SEQUENCE:
+			messages.error(request, "Unknown build step")
+			return redirect("builds:build-detail", pk=build.pk)
+		if build.status in {BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED}:
+			messages.error(request, "Cannot run a manual step while the build is queued or running")
+			return redirect("builds:build-detail", pk=build.pk)
+		if not build.can_run_manual_step(step):
+			messages.error(request, "That step is not available yet. Run the previous step first.")
+			return redirect("builds:build-detail", pk=build.pk)
+
+		task = run_build_step.delay(build.id, step)
+		_set_build_active_task(build, task.id)
+		cache.set(build_task_cache_key(build.id), task.id, timeout=6 * 60 * 60)
+		messages.success(request, f"Queued manual step: {dict(BuildDefinition.STEP_CHOICES).get(step, step)}")
+		return redirect("builds:build-detail", pk=build.pk)
+
+
 class BuildRerunPlaybooksView(LoginRequiredMixin, View):
 	def post(self, request, pk):
 		build = get_object_or_404(BuildDefinition.objects.select_related("machine_config"), pk=pk)
+		if _recover_stale_build_state(build):
+			build.refresh_from_db()
 
 		if build.status in {BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED}:
 			messages.error(request, "Cannot re-run playbooks while build is queued or running")
@@ -285,6 +432,7 @@ class BuildRerunPlaybooksView(LoginRequiredMixin, View):
 			return redirect("builds:build-detail", pk=build.pk)
 
 		task = rerun_build_playbooks.delay(build.id, vm_ip)
+		_set_build_active_task(build, task.id)
 		cache.set(build_task_cache_key(build.id), task.id, timeout=6 * 60 * 60)
 		messages.success(request, "Playbook re-run queued")
 		return redirect("builds:build-detail", pk=build.pk)

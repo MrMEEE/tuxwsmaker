@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from xml.sax.saxutils import escape
 
 
 class VirtualizationError(RuntimeError):
@@ -59,7 +62,7 @@ class LibvirtVMManager:
             raise VirtualizationError(f"Failed to connect to hypervisor at {self.uri}")
         return conn
 
-    def ensure_domain(self, vm: VMDefinition, replace_existing: bool = False) -> None:
+    def ensure_domain(self, vm: VMDefinition, replace_existing: bool = False, start_domain: bool = True) -> None:
         conn = self._connect()
         try:
             try:
@@ -79,7 +82,10 @@ class LibvirtVMManager:
 
             if not vm.domain_xml.strip():
                 if vm.kickstart_path.strip() and vm.disk_path.strip():
-                    self._install_domain_with_virt_install(vm)
+                    if start_domain:
+                        self._install_domain_with_virt_install(vm, start=True)
+                    else:
+                        self._define_domain_without_start(vm)
                     return
                 raise VirtualizationError(
                     "Provide domain_xml or kickstart_path+disk_path for new domains"
@@ -183,7 +189,7 @@ class LibvirtVMManager:
 
         domain.undefineFlags(flags)
 
-    def _install_domain_with_virt_install(self, vm: VMDefinition) -> None:
+    def _install_domain_with_virt_install(self, vm: VMDefinition, *, start: bool = True) -> None:
         if shutil.which("virt-install") is None:
             raise VirtualizationError("virt-install is required to create domains from kickstart")
 
@@ -230,6 +236,8 @@ class LibvirtVMManager:
         ]
         if boot_arg:
             cmd.extend(["--boot", boot_arg])
+        if not start:
+            cmd.append("--print-xml")
         env = dict(os.environ)
         env["PATH"] = f"/usr/bin:/bin:{env.get('PATH', '')}"
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
@@ -237,6 +245,83 @@ class LibvirtVMManager:
             raise VirtualizationError(
                 f"virt-install failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
             )
+        if not start:
+            raw_output = (proc.stdout or "").strip()
+            match = re.search(r"(<domain[\\s\\S]*?</domain>)", raw_output)
+            if match is None:
+                raise VirtualizationError(
+                    "virt-install did not return parsable domain XML for define-only mode"
+                )
+            domain_xml = match.group(1)
+            conn = self._connect()
+            try:
+                conn.defineXML(domain_xml)
+            finally:
+                conn.close()
+
+    def _define_domain_without_start(self, vm: VMDefinition) -> None:
+        disk_path = Path(vm.disk_path)
+        disk_path.parent.mkdir(parents=True, exist_ok=True)
+        if not disk_path.exists():
+            self._create_qcow2_disk(disk_path=disk_path, size_gib=vm.disk_gib)
+
+        firmware_xml = ""
+        if vm.boot_mode == "uefi":
+            code_path, vars_path = self._resolve_uefi_firmware()
+            nvram_path = f"/var/lib/libvirt/qemu/nvram/{vm.name}_VARS.fd"
+            firmware_xml = (
+                "<loader readonly='yes' type='pflash' secure='no'>"
+                f"{escape(code_path)}"
+                "</loader>"
+                f"<nvram template='{escape(vars_path)}'>{escape(nvram_path)}</nvram>"
+            )
+
+        mac_xml = f"<mac address='{escape(vm.mac_address)}'/>" if vm.mac_address else ""
+
+        domain_xml = (
+            "<domain type='kvm'>"
+            f"<name>{escape(vm.name)}</name>"
+            f"<memory unit='MiB'>{int(vm.memory_mib)}</memory>"
+            "<currentMemory unit='MiB'>"
+            f"{int(vm.memory_mib)}"
+            "</currentMemory>"
+            f"<vcpu>{int(vm.vcpus)}</vcpu>"
+            "<os>"
+            "<type arch='x86_64'>hvm</type>"
+            f"{firmware_xml}"
+            "<boot dev='hd'/>"
+            "<boot dev='network'/>"
+            "</os>"
+            "<features><acpi/><apic/></features>"
+            "<cpu mode='host-model'/>"
+            "<clock offset='utc'/>"
+            "<on_poweroff>destroy</on_poweroff>"
+            "<on_reboot>restart</on_reboot>"
+            "<on_crash>destroy</on_crash>"
+            "<devices>"
+            "<disk type='file' device='disk'>"
+            "<driver name='qemu' type='qcow2'/>"
+            f"<source file='{escape(str(disk_path))}'/>"
+            "<target dev='vda' bus='virtio'/>"
+            "</disk>"
+            "<interface type='network'>"
+            f"{mac_xml}"
+            f"<source network='{escape(vm.network_name)}'/>"
+            "<model type='virtio'/>"
+            "</interface>"
+            "<serial type='pty'><target port='0'/></serial>"
+            "<console type='pty'><target type='serial' port='0'/></console>"
+            "<graphics type='vnc' autoport='yes' listen='127.0.0.1'/>"
+            "<rng model='virtio'><backend model='random'>/dev/urandom</backend></rng>"
+            "</devices>"
+            "</domain>"
+        )
+
+        conn = self._connect()
+        try:
+            conn.defineXML(domain_xml)
+        finally:
+            conn.close()
 
     def _resolve_uefi_firmware(self) -> tuple[str, str]:
         code_path = next((path for path in self.UEFI_CODE_CANDIDATES if Path(path).exists()), "")
@@ -292,6 +377,27 @@ class LibvirtVMManager:
                 time.sleep(2)
 
             domain.destroy()
+        finally:
+            conn.close()
+
+    def set_boot_order(self, name: str, order: list[str]) -> None:
+        conn = self._connect()
+        try:
+            domain = conn.lookupByName(name)
+            xml_text = domain.XMLDesc(0)
+            root = ET.fromstring(xml_text)
+            os_node = root.find("os")
+            if os_node is None:
+                raise VirtualizationError(f"Domain {name} XML is missing <os> section")
+
+            for boot_node in list(os_node.findall("boot")):
+                os_node.remove(boot_node)
+
+            for dev in order:
+                ET.SubElement(os_node, "boot", {"dev": dev})
+
+            new_xml = ET.tostring(root, encoding="unicode")
+            conn.defineXML(new_xml)
         finally:
             conn.close()
 

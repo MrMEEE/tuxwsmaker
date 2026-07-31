@@ -10,15 +10,20 @@ from django.conf import settings
 from django.core.cache import cache
 from django.db import transaction
 
-from apps.builds.models import BuildDefinition, BuildLogEntry, SSHKey
-from apps.builds.models import BuildMachineConfig
+from apps.builds.models import BuildArtifact, BuildDefinition, BuildLogEntry, BuildMachineConfig, SSHKey
+from apps.builds.services.artifacts import (
+    ArtifactExportError,
+    _sha256_of_file,
+    dump_clone_partitions,
+    generate_artifacts,
+    prepare_iso_pxe_assets,
+    save_clone_release,
+)
 from apps.builds.services.builder import BuilderVMManager
-from apps.builds.services.artifacts import ArtifactExportError, generate_artifacts
 from apps.builds.services.kickstart import calculate_layout_disk_size_gib, render_kickstart_file, render_pxe_boot_configs
 from apps.builds.services.provisioning import AnsibleProvisioner, ProvisioningError
 from apps.builds.services.ssh_keys import SSHKeyError, generate_build_ssh_keypair
 from apps.builds.services.virtualization import LibvirtVMManager, VMDefinition, VirtualizationError
-from apps.builds.services.artifacts import prepare_iso_pxe_assets
 from apps.playbooks.services import PlaybookSyncError, checkout_repository, checkout_repository_url
 from apps.realtime.events import publish_event
 from apps.serverconfig.models import ServerConfiguration
@@ -64,6 +69,121 @@ def _generate_mac_address() -> str:
     return "52:54:00:%02x:%02x:%02x" % tuple(raw)
 
 
+def _artifact_root() -> Path:
+    return Path(settings.ARTIFACT_ROOT)
+
+
+def _vm_name(build: BuildDefinition) -> str:
+    return f"build-{build.id}"
+
+
+def _disk_path(build: BuildDefinition) -> Path:
+    return _artifact_root() / "disks" / f"{_vm_name(build)}.qcow2"
+
+
+def _runtime_state(build: BuildDefinition) -> dict:
+    return dict(build.runtime_state or {})
+
+
+def _save_runtime_state(build: BuildDefinition, **updates) -> None:
+    state = _runtime_state(build)
+    state.update(updates)
+    build.runtime_state = state
+    build.save(update_fields=["runtime_state", "updated_at"])
+
+
+def _set_active_task_id(build: BuildDefinition, task_id: str) -> None:
+    if not task_id:
+        return
+    _save_runtime_state(build, active_task_id=task_id)
+
+
+def _clear_active_task_id(build: BuildDefinition, task_id: str) -> None:
+    if not task_id:
+        return
+    state = _runtime_state(build)
+    if str(state.get("active_task_id") or "") == task_id:
+        state.pop("active_task_id", None)
+        build.runtime_state = state
+        build.save(update_fields=["runtime_state", "updated_at"])
+
+
+def _begin_step(build: BuildDefinition, *, step: str) -> None:
+    build.current_step = step
+    build.save(update_fields=["current_step", "updated_at"])
+    publish_event(
+        "builds",
+        "updated",
+        {
+            "build_id": build.id,
+            "status": build.status,
+            "current_step": build.current_step,
+            "run_mode": build.run_mode,
+        },
+    )
+
+
+def _require_runtime_value(build: BuildDefinition, key: str) -> str:
+    value = str(_runtime_state(build).get(key, "") or "").strip()
+    if not value:
+        raise ProvisioningError(f"Build runtime state is missing '{key}'. Run the previous step first.")
+    return value
+
+
+def _set_build_running(build: BuildDefinition, *, run_mode: str, reset: bool) -> None:
+    with transaction.atomic():
+        if reset:
+            BuildLogEntry.objects.filter(build=build).delete()
+            build.runtime_state = {"last_completed_step": BuildDefinition.STEP_PENDING}
+            build.current_step = BuildDefinition.STEP_PENDING
+        build.status = BuildDefinition.STATUS_RUNNING
+        build.run_mode = run_mode
+        build.save(update_fields=["status", "run_mode", "current_step", "runtime_state", "updated_at"])
+    publish_event("builds", "running", {"build_id": build.id, "status": build.status, "run_mode": run_mode})
+
+
+def _complete_step(build: BuildDefinition, *, step: str, keep_running: bool) -> None:
+    state = _runtime_state(build)
+    state["last_completed_step"] = step
+    build.runtime_state = state
+    build.current_step = step
+    if keep_running:
+        build.status = BuildDefinition.STATUS_RUNNING
+    elif step == BuildDefinition.STEP_SAVE_RELEASE:
+        build.status = BuildDefinition.STATUS_SUCCEEDED
+    else:
+        build.status = BuildDefinition.STATUS_DRAFT
+    build.save(update_fields=["current_step", "runtime_state", "status", "updated_at"])
+    event_name = "succeeded" if build.status == BuildDefinition.STATUS_SUCCEEDED else "updated"
+    publish_event(
+        "builds",
+        event_name,
+        {
+            "build_id": build.id,
+            "status": build.status,
+            "current_step": build.current_step,
+            "run_mode": build.run_mode,
+        },
+    )
+
+
+def _fail_build(build: BuildDefinition, *, step: str, exc: Exception) -> None:
+    _append_build_log(build=build, stage="error", message=str(exc))
+    build.status = BuildDefinition.STATUS_FAILED
+    build.current_step = step
+    build.save(update_fields=["status", "current_step", "updated_at"])
+    publish_event(
+        "builds",
+        "failed",
+        {
+            "build_id": build.id,
+            "status": build.status,
+            "current_step": build.current_step,
+            "error": str(exc),
+        },
+    )
+
+
 def _run_remote_checked(
     *,
     provisioner: AnsibleProvisioner,
@@ -97,6 +217,8 @@ def _ensure_builder_pxe_bootloader(
     private_key_path: str,
     timeout_seconds: int,
 ) -> str:
+    network_gateway = str(getattr(settings, "BUILDER_LIBVIRT_NETWORK_GATEWAY", "192.168.200.1"))
+    builder_dns_ip = str(getattr(settings, "BUILDER_VM_STATIC_IPV4", "192.168.200.10"))
     command = (
         "tftp_root=; "
         "if [ -f /etc/dnsmasq.d/wsbuildnet.conf ]; then "
@@ -104,6 +226,14 @@ def _ensure_builder_pxe_bootloader(
         "fi; "
         "if [ -z \"$tftp_root\" ]; then tftp_root=/var/lib/tftpboot; fi; "
         "if [ ! -d \"$tftp_root\" ] && [ -d /tftpboot ]; then tftp_root=/tftpboot; fi; "
+        "dnf -y install dnsmasq >/dev/null 2>&1 || true; "
+        "if ! command -v dnsmasq >/dev/null 2>&1; then "
+        "  local_iso=$(find /var/www/html/isos -maxdepth 1 -mindepth 1 -type d -name 'build-*' 2>/dev/null | head -n 1); "
+        "  if [ -n \"$local_iso\" ]; then "
+        "    dnf --disablerepo='*' --repofrompath=baseos,file://$local_iso/BaseOS --repofrompath=appstream,file://$local_iso/AppStream --setopt=baseos.gpgcheck=0 --setopt=appstream.gpgcheck=0 -y install dnsmasq syslinux-tftpboot syslinux grub2-efi-x64 shim-x64 >/dev/null 2>&1 || true; "
+        "  fi; "
+        "fi; "
+        "if ! command -v dnsmasq >/dev/null 2>&1; then echo 'dnsmasq is not installed on builder VM and no enabled repositories are available; provision builder packages or enable repos.' >&2; exit 1; fi; "
         "mkdir -p \"$tftp_root\"/pxelinux.cfg \"$tftp_root\"/builds \"$tftp_root\"/build-state /var/www/html/kickstarts; "
         "if [ ! -f \"$tftp_root/pxelinux.0\" ]; then "
         "  dnf -y install syslinux-tftpboot syslinux grub2-efi-x64 shim-x64 >/dev/null 2>&1 || true; "
@@ -118,12 +248,12 @@ def _ensure_builder_pxe_bootloader(
         "    if [ -n \"$mod_src\" ]; then cp -f \"$mod_src\" \"$tftp_root/$mod\"; fi; "
         "  fi; "
         "done; "
-        "mkdir -p \"$tftp_root/efi64\" \"$tftp_root/efi32\"; "
-		"efi64_src=; "
-		"for candidate in /tftpboot/efi64/grubnetx64.efi /usr/lib/grub/x86_64-efi/grubnetx64.efi /usr/share/grub/x86_64-efi/grubnetx64.efi /boot/efi/EFI/redhat/grubx64.efi /usr/lib/grub/x86_64-efi/grubx64.efi /usr/share/grub/x86_64-efi/grubx64.efi /tftpboot/efi64/grubx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI; do "
-		"  if [ -f \"$candidate\" ]; then efi64_src=$candidate; break; fi; "
-		"done; "
-		"if [ -n \"$efi64_src\" ]; then cp -f \"$efi64_src\" \"$tftp_root/efi64/grubx64.efi\"; fi; "
+        "mkdir -p \"$tftp_root\"/efi64 \"$tftp_root\"/efi32; "
+        "efi64_src=; "
+        "for candidate in /tftpboot/efi64/grubnetx64.efi /usr/lib/grub/x86_64-efi/grubnetx64.efi /usr/share/grub/x86_64-efi/grubnetx64.efi /boot/efi/EFI/redhat/grubx64.efi /usr/lib/grub/x86_64-efi/grubx64.efi /usr/share/grub/x86_64-efi/grubx64.efi /tftpboot/efi64/grubx64.efi /boot/efi/EFI/BOOT/BOOTX64.EFI; do "
+        "  if [ -f \"$candidate\" ]; then efi64_src=$candidate; break; fi; "
+        "done; "
+        "if [ -n \"$efi64_src\" ]; then cp -f \"$efi64_src\" \"$tftp_root/efi64/grubx64.efi\"; fi; "
         "if [ -f /tftpboot/efi32/grubia32.efi ]; then cp -f /tftpboot/efi32/grubia32.efi \"$tftp_root/efi32/grubia32.efi\"; fi; "
         "if [ ! -f \"$tftp_root/efi64/grubx64.efi\" ]; then "
         "  efi64_src=$(find /usr/lib /usr/share /boot /tftpboot -maxdepth 8 -type f \\( -name grubnetx64.efi -o -name grubx64.efi -o -name BOOTX64.EFI -o -name bootx64.efi \\) 2>/dev/null | grep -E '/(grubnetx64\\.efi|grubx64\\.efi|BOOTX64\\.EFI|bootx64\\.efi)$' | head -n 1); "
@@ -144,11 +274,37 @@ def _ensure_builder_pxe_bootloader(
         "  echo 'UEFI boot is enabled but grubx64.efi is missing from TFTP root' >&2; "
         "  exit 1; "
         "fi; "
+        "if [ ! -f /etc/dnsmasq.d/wsbuildnet.conf ]; then "
+        f"  iface=$(ip -o -4 addr show | awk '$4 ~ /^" + network_gateway.rsplit('.',1)[0].replace('.', '\\.') + "\\./ {{print $2; exit}}'); "
+        f"  if [ -z \"$iface\" ]; then iface=$(ip route get {network_gateway} | awk 'BEGIN {{for (i=1; i<=NF; i++) if ($i == \"dev\") {{print $(i+1); exit}}}}'); fi; "
+        "  if [ -z \"$iface\" ]; then iface=$(ip -o -4 route show to default | awk '{print $5; exit}'); fi; "
+        "  mkdir -p /etc/dnsmasq.d; "
+        "  cat > /etc/dnsmasq.d/wsbuildnet.conf <<'EOF'\n"
+        "bind-interfaces\n"
+        "domain=wsbuildnet\n"
+        "expand-hosts\n"
+        "local=/wsbuildnet/\n"
+        "enable-tftp\n"
+        "tftp-root=/var/lib/tftpboot\n"
+        "dhcp-match=set:efi64,option:client-arch,7\n"
+        "dhcp-match=set:efi32,option:client-arch,6\n"
+        "dhcp-boot=tag:efi64,efi64/grubx64.efi\n"
+        "dhcp-boot=tag:efi32,efi32/grubia32.efi\n"
+        "dhcp-boot=pxelinux.0\n"
+        "dhcp-authoritative\n"
+        "dhcp-range=192.168.200.100,192.168.200.254,255.255.255.0,12h\n"
+        f"dhcp-option=option:router,{network_gateway}\n"
+        f"dhcp-option=option:dns-server,{builder_dns_ip}\n"
+        "log-dhcp\n"
+        "EOF\n"
+        "  if [ -n \"$iface\" ]; then echo \"interface=$iface\" | cat - /etc/dnsmasq.d/wsbuildnet.conf > /etc/dnsmasq.d/wsbuildnet.conf.tmp && mv /etc/dnsmasq.d/wsbuildnet.conf.tmp /etc/dnsmasq.d/wsbuildnet.conf; fi; "
+        "fi; "
         "if [ -f /etc/dnsmasq.d/wsbuildnet.conf ]; then "
         "  sed -i 's#dhcp-boot=tag:efi64,grubx64.efi#dhcp-boot=tag:efi64,efi64/grubx64.efi#g' /etc/dnsmasq.d/wsbuildnet.conf; "
         "  sed -i 's#dhcp-boot=tag:efi32,grubia32.efi#dhcp-boot=tag:efi32,efi32/grubia32.efi#g' /etc/dnsmasq.d/wsbuildnet.conf; "
         "  sed -i '/^log-tftp$/d' /etc/dnsmasq.d/wsbuildnet.conf; "
         "  grep -q '^log-dhcp$' /etc/dnsmasq.d/wsbuildnet.conf || echo 'log-dhcp' >> /etc/dnsmasq.d/wsbuildnet.conf; "
+        "  systemctl enable --now dnsmasq >/dev/null 2>&1 || true; "
         "  systemctl restart dnsmasq >/dev/null 2>&1 || true; "
         "fi; "
         "test -f \"$tftp_root/pxelinux.0\"; "
@@ -177,16 +333,10 @@ def _cleanup_builder_bootstrap_assets(
 ) -> None:
     state_file = f"{tftp_root}/build-state/build-{build_id}.mac"
     build_root = f"{tftp_root}/builds/build-{build_id}"
-    kickstart_file = f"/var/www/html/kickstarts/build-{build_id}.cfg"
-    iso_mount_path = f"/var/www/html/isos/build-{build_id}"
-    iso_symlink_path = f"/var/www/html/isos/build-{build_id}.iso"
     cleanup_command = (
-        "mkdir -p /var/www/html/isos; "
-        f"if mountpoint -q {iso_mount_path}; then umount {iso_mount_path} || umount -l {iso_mount_path} || true; fi; "
-        f"rm -f {iso_symlink_path}; "
-        f"rm -rf {iso_mount_path}; "
+        "mkdir -p /var/www/html/isos /var/www/html/kickstarts; "
         f"old_mac=; if [ -f {state_file} ]; then old_mac=$(cat {state_file} | tr -d '[:space:]'); fi; "
-        f"rm -rf {build_root} {kickstart_file}; "
+        f"rm -rf {build_root}; "
         "if [ -n \"$old_mac\" ]; then "
         "old_slug=$(printf '%s' \"$old_mac\" | tr '[:upper:]' '[:lower:]' | tr ':' '-'); "
         f"rm -f {tftp_root}/pxelinux.cfg/01-$old_slug {tftp_root}/grub.cfg-01-$old_slug {tftp_root}/grub.cfg-$old_slug {tftp_root}/efi64/grub.cfg-01-$old_slug {tftp_root}/efi64/grub.cfg-$old_slug {tftp_root}/efi64/grub.cfg {tftp_root}/efi32/grub.cfg-01-$old_slug {tftp_root}/efi32/grub.cfg-$old_slug {tftp_root}/efi32/grub.cfg; "
@@ -220,6 +370,21 @@ def _publish_builder_iso_http_source(
         "mkdir -p /var/www/html/isos; "
         f"iso_src={quoted_iso_guest_path}; "
         "if [ ! -f \"$iso_src\" ]; then "
+        "  mkdir -p /mnt/buildisos; "
+        "  if ! mountpoint -q /mnt/buildisos; then "
+        "    mount -t virtiofs buildisos /mnt/buildisos >/dev/null 2>&1 || mount -t fuse.buildisos buildisos /mnt/buildisos >/dev/null 2>&1 || true; "
+        "  fi; "
+        "fi; "
+        "if [ ! -f \"$iso_src\" ]; then "
+        "  alt_src=\"/buildisos/${iso_src#/mnt/buildisos/}\"; "
+        "  if [ -f \"$alt_src\" ]; then iso_src=\"$alt_src\"; fi; "
+        "fi; "
+        "if [ ! -f \"$iso_src\" ]; then "
+        "  iso_name=$(basename \"$iso_src\"); "
+        "  probe=$(find /mnt/buildisos /buildisos /mnt -maxdepth 6 -type f -name \"$iso_name\" 2>/dev/null | head -n 1 || true); "
+        "  if [ -n \"$probe\" ]; then iso_src=\"$probe\"; fi; "
+        "fi; "
+        "if [ ! -f \"$iso_src\" ]; then "
         "  echo \"ISO source is not visible in builder guest: $iso_src\" >&2; "
         "  exit 1; "
         "fi; "
@@ -233,7 +398,20 @@ def _publish_builder_iso_http_source(
         "    echo 'Mounted ISO is missing expected installer metadata/content' >&2; "
         "    exit 1; "
         "  fi; "
-        "fi"
+        "fi; "
+        "restorecon -RF /var/www/html/isos /var/www/html/kickstarts >/dev/null 2>&1 || true; "
+        "dnf -y install httpd >/dev/null 2>&1 || true; "
+        "if ! command -v httpd >/dev/null 2>&1; then "
+        f"  dnf --disablerepo='*' --repofrompath=baseos,file://{mount_path}/BaseOS --repofrompath=appstream,file://{mount_path}/AppStream --setopt=baseos.gpgcheck=0 --setopt=appstream.gpgcheck=0 -y install httpd >/dev/null 2>&1 || true; "
+        "fi; "
+        "if ! command -v httpd >/dev/null 2>&1; then "
+        "  echo 'httpd is not installed on builder VM; cannot publish HTTP install source' >&2; "
+        "  exit 1; "
+        "fi; "
+        "systemctl enable --now httpd >/dev/null 2>&1 || true; "
+        "systemctl restart httpd >/dev/null 2>&1 || true; "
+        "if command -v firewall-cmd >/dev/null 2>&1; then firewall-cmd --permanent --add-service=http >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true; fi; "
+        "if ! systemctl is-active --quiet httpd; then echo 'httpd service is not active after setup' >&2; exit 1; fi"
     )
     _run_remote_checked(
         provisioner=provisioner,
@@ -244,6 +422,72 @@ def _publish_builder_iso_http_source(
         timeout_seconds=timeout_seconds,
     )
     return iso_url
+
+
+def _build_timeout_seconds(build: BuildDefinition) -> int:
+    return build.machine_config.kickstart_timeout_minutes * 60
+
+
+def _builder_ready_timeout_seconds(build: BuildDefinition) -> int:
+    configured = int(getattr(settings, "BUILDER_READY_TIMEOUT_SECONDS", 180))
+    return max(30, min(_build_timeout_seconds(build), configured))
+
+
+def _builder_session(build: BuildDefinition, *, ensure_iso_shared: bool) -> tuple[BuilderVMManager, AnsibleProvisioner, str, str, Path]:
+    builder_manager = BuilderVMManager()
+    builder_timeout = _builder_ready_timeout_seconds(build)
+    if ensure_iso_shared:
+        builder_manager.ensure_iso_shared(Path(build.iso_image.iso_file.path))
+    _append_build_log(build=build, stage="builder", message="Ensuring builder VM exists")
+    builder_manager.ensure_builder_vm()
+    _append_build_log(build=build, stage="builder", message="Checking whether builder VM is running")
+    if not builder_manager.builder_vm_running():
+        _append_build_log(build=build, stage="builder", message="Builder VM is not running; starting it")
+        builder_manager.start_builder_vm()
+    else:
+        _append_build_log(build=build, stage="builder", message="Builder VM is already running")
+    _append_build_log(build=build, stage="builder", message="Waiting for builder DHCP/IP address")
+    builder_ip = builder_manager.wait_for_ipv4(timeout_seconds=builder_timeout)
+    _append_build_log(build=build, stage="builder", message=f"Builder VM IP detected: {builder_ip}")
+    builder_access = builder_manager.ensure_access_keypair()
+    builder_ssh_user = getattr(settings, "BUILDER_VM_SSH_USER", "root")
+    provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
+    _append_build_log(build=build, stage="ssh", message=f"Waiting for builder SSH on {builder_ssh_user}@{builder_ip}")
+    provisioner.wait_for_ssh(
+        host=builder_ip,
+        user=builder_ssh_user,
+        private_key_path=str(builder_access.private_key_path),
+        timeout_seconds=builder_timeout,
+    )
+    return builder_manager, provisioner, builder_ip, builder_ssh_user, builder_access.private_key_path
+
+
+def _materialize_build_keypair(build: BuildDefinition):
+    key_dir = _artifact_root() / "keys"
+    return generate_build_ssh_keypair(build.id, key_dir)
+
+
+def _resolve_ip_for_existing_vm(build: BuildDefinition) -> str:
+    state = _runtime_state(build)
+    vm_name = str(state.get("vm_name") or _vm_name(build))
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+    ip_address = str(state.get("build_ip_address") or "").strip()
+    if ip_address:
+        return ip_address
+    ip_address = vm_manager.current_ipv4(domain_name=vm_name, network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK) or ""
+    if ip_address:
+        _save_runtime_state(build, build_ip_address=ip_address)
+        return ip_address
+    ip_address = vm_manager.wait_for_ipv4(
+        domain_name=vm_name,
+        network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
+        timeout_seconds=120,
+        mac_address=str(state.get("vm_mac_address") or ""),
+    ) or ""
+    if not ip_address:
+        raise ProvisioningError(f"Could not determine IP address for running VM {vm_name}")
+    _save_runtime_state(build, build_ip_address=ip_address)
+    return ip_address
 
 
 def _run_selected_playbooks(
@@ -303,347 +547,421 @@ def _run_selected_playbooks(
         )
 
 
+def _step_create_vm_shell(build: BuildDefinition) -> dict[str, str]:
+    timeout_seconds = _build_timeout_seconds(build)
+    effective_boot_mode = _resolve_effective_boot_mode(build=build)
+    _validate_boot_layout_compatibility(build=build, effective_boot_mode=effective_boot_mode)
+    _append_build_log(build=build, stage="start", message="Preparing build environment")
+    _append_build_log(build=build, stage="vm", message=f"Effective boot mode: {effective_boot_mode}")
+    _append_build_log(build=build, stage="builder", message="Ensuring builder VM is available")
+
+    builder_manager, builder_provisioner, builder_ip, builder_ssh_user, builder_key_path = _builder_session(
+        build,
+        ensure_iso_shared=True,
+    )
+    _append_build_log(build=build, stage="builder", message=f"Builder VM ready at {builder_ip}")
+    _append_build_log(build=build, stage="builder", message="Builder SSH access is ready")
+
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+    vm_name = _vm_name(build)
+    vm_mac_address = _generate_mac_address()
+    ssh_user = getattr(settings, "BUILD_VM_SSH_USER", "root")
+    artifact_root = _artifact_root()
+    kickstart_dir = artifact_root / "kickstarts"
+    disk_path = _disk_path(build)
+    key_pair = _materialize_build_keypair(build)
+    try:
+        _append_build_log(build=build, stage="ssh", message="Generated guest SSH keypair")
+        kickstart_path = render_kickstart_file(
+            output_dir=kickstart_dir,
+            vm_name=vm_name,
+            ssh_public_key=key_pair.public_key,
+            partition_layout=build.partition_layout,
+        )
+        _append_build_log(build=build, stage="kickstart", message=f"Rendered kickstart file {kickstart_path.name}")
+        pxe_assets_dir = prepare_iso_pxe_assets(iso_path=Path(build.iso_image.iso_file.path))
+        _append_build_log(build=build, stage="pxe", message=f"Prepared PXE assets from {build.iso_image.iso_file.name}")
+
+        iso_path = Path(build.iso_image.iso_file.path).resolve()
+        shared_iso_root = Path(builder_manager.definition.shared_iso_dir).resolve()
+        try:
+            iso_rel = iso_path.relative_to(shared_iso_root)
+        except ValueError as exc:
+            raise ProvisioningError(
+                f"ISO is outside shared builder path ({shared_iso_root}): {iso_path}"
+            ) from exc
+        iso_guest_path = f"/mnt/buildisos/{iso_rel.as_posix()}"
+        install_source_url = _publish_builder_iso_http_source(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            timeout_seconds=timeout_seconds,
+            build_id=build.id,
+            iso_guest_path=iso_guest_path,
+        )
+        _append_build_log(build=build, stage="pxe", message=f"Published ISO source URL {install_source_url}")
+
+        _append_build_log(build=build, stage="pxe", message="Ensuring builder TFTP bootloader files")
+        tftp_root = _ensure_builder_pxe_bootloader(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            timeout_seconds=timeout_seconds,
+        )
+        _append_build_log(build=build, stage="pxe", message=f"Using TFTP root {tftp_root}")
+
+        _cleanup_builder_bootstrap_assets(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            tftp_root=tftp_root,
+            build_id=build.id,
+            timeout_seconds=timeout_seconds,
+        )
+
+        remote_build_root = f"{tftp_root}/builds/{vm_name}"
+        remote_kickstart_path = f"/var/www/html/kickstarts/{kickstart_path.name}"
+        remote_boot_kernel = f"{remote_build_root}/vmlinuz"
+        remote_boot_initrd = f"{remote_build_root}/initrd.img"
+        mac_slug = vm_mac_address.lower().replace(':', '-')
+        remote_bios_config = f"{tftp_root}/pxelinux.cfg/01-{mac_slug}"
+        remote_efi_config = f"{tftp_root}/grub.cfg-01-{mac_slug}"
+        remote_efi_config_alt = f"{tftp_root}/grub.cfg-{mac_slug}"
+        remote_efi_default = f"{tftp_root}/grub.cfg"
+        remote_efi64_config = f"{tftp_root}/efi64/grub.cfg-01-{mac_slug}"
+        remote_efi64_config_alt = f"{tftp_root}/efi64/grub.cfg-{mac_slug}"
+        remote_efi64_default = f"{tftp_root}/efi64/grub.cfg"
+        remote_efi32_config = f"{tftp_root}/efi32/grub.cfg-01-{mac_slug}"
+        remote_efi32_config_alt = f"{tftp_root}/efi32/grub.cfg-{mac_slug}"
+        remote_efi32_default = f"{tftp_root}/efi32/grub.cfg"
+
+        _run_remote_checked(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            command=f"mkdir -p {remote_build_root} {tftp_root}/pxelinux.cfg {tftp_root}/efi64 {tftp_root}/efi32 /var/www/html/kickstarts",
+            timeout_seconds=timeout_seconds,
+        )
+        builder_provisioner.upload_file(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            local_path=kickstart_path,
+            remote_path=remote_kickstart_path,
+            timeout_seconds=timeout_seconds,
+        )
+        _run_remote_checked(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            command=(
+                "mkdir -p /var/www/html/kickstarts /var/www/html/isos; "
+                "restorecon -RF /var/www/html/kickstarts /var/www/html/isos >/dev/null 2>&1 || true; "
+                f"restorecon -v {remote_kickstart_path} >/dev/null 2>&1 || chcon -t httpd_sys_content_t {remote_kickstart_path} >/dev/null 2>&1 || true"
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+        builder_provisioner.upload_file(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            local_path=pxe_assets_dir / "boot" / "vmlinuz",
+            remote_path=remote_boot_kernel,
+            timeout_seconds=timeout_seconds,
+        )
+        builder_provisioner.upload_file(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            local_path=pxe_assets_dir / "boot" / "initrd.img",
+            remote_path=remote_boot_initrd,
+            timeout_seconds=timeout_seconds,
+        )
+        boot_configs = render_pxe_boot_configs(
+            vm_name=vm_name,
+            kernel_rel_path=f"builds/{vm_name}/vmlinuz",
+            initrd_rel_path=f"builds/{vm_name}/initrd.img",
+            kickstart_url=f"http://{builder_ip}/kickstarts/{kickstart_path.name}",
+            install_source_url=install_source_url,
+        )
+        for remote_path, content in [
+            (remote_bios_config, boot_configs["bios"]),
+            (remote_efi_config, boot_configs["efi"]),
+            (remote_efi_config_alt, boot_configs["efi"]),
+            (remote_efi_default, boot_configs["efi"]),
+            (remote_efi64_config, boot_configs["efi"]),
+            (remote_efi64_config_alt, boot_configs["efi"]),
+            (remote_efi64_default, boot_configs["efi"]),
+            (remote_efi32_config, boot_configs["efi"]),
+            (remote_efi32_config_alt, boot_configs["efi"]),
+            (remote_efi32_default, boot_configs["efi"]),
+        ]:
+            _run_remote_checked(
+                provisioner=builder_provisioner,
+                host=builder_ip,
+                user=builder_ssh_user,
+                private_key_path=str(builder_key_path),
+                command=f"cat > {remote_path}",
+                timeout_seconds=timeout_seconds,
+                input_text=content,
+            )
+        _run_remote_checked(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            command=f"printf '%s\\n' {vm_mac_address} > {tftp_root}/build-state/build-{build.id}.mac",
+            timeout_seconds=timeout_seconds,
+        )
+        _append_build_log(build=build, stage="pxe", message=f"Published MAC-specific PXE config for {vm_mac_address}")
+
+        vm_definition = VMDefinition(
+            name=vm_name,
+            memory_mib=build.machine_config.memory_mib,
+            vcpus=build.machine_config.cpu,
+            disk_gib=calculate_layout_disk_size_gib(build.partition_layout),
+            network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
+            iso_path=build.iso_image.iso_file.path,
+            kickstart_path=str(kickstart_path),
+            domain_xml="",
+            ssh_public_key=key_pair.public_key,
+            mac_address=vm_mac_address,
+            disk_path=str(disk_path),
+            boot_mode=effective_boot_mode,
+        )
+        _append_build_log(build=build, stage="vm", message=f"Defining PXE boot VM {vm_name} with MAC {vm_mac_address}")
+        vm_manager.ensure_domain(vm_definition, replace_existing=True, start_domain=False)
+        _append_build_log(build=build, stage="vm", message="Build VM shell is prepared and ready for Install OS")
+        _save_runtime_state(
+            build,
+            builder_ip=builder_ip,
+            builder_ssh_user=builder_ssh_user,
+            tftp_root=tftp_root,
+            vm_name=vm_name,
+            vm_mac_address=vm_mac_address,
+            disk_path=str(disk_path),
+            effective_boot_mode=effective_boot_mode,
+            kickstart_name=kickstart_path.name,
+            install_source_url=install_source_url,
+            build_ssh_user=ssh_user,
+            build_ip_address="",
+            partition_dump_dir="",
+            clone_release_path="",
+        )
+        return {"vm": vm_name, "mac": vm_mac_address}
+    finally:
+        key_pair.cleanup_private()
+
+
+def _step_install_os(build: BuildDefinition) -> dict[str, str]:
+    timeout_seconds = _build_timeout_seconds(build)
+    builder_manager, builder_provisioner, builder_ip, builder_ssh_user, builder_key_path = _builder_session(
+        build,
+        ensure_iso_shared=False,
+    )
+    state = _runtime_state(build)
+    vm_name = str(state.get("vm_name") or _vm_name(build))
+    vm_mac_address = str(state.get("vm_mac_address") or "").strip()
+    tftp_root = str(state.get("tftp_root") or "/var/lib/tftpboot").strip() or "/var/lib/tftpboot"
+    install_source_url = _require_runtime_value(build, "install_source_url")
+    kickstart_name = _require_runtime_value(build, "kickstart_name")
+    ssh_user = str(state.get("build_ssh_user") or getattr(settings, "BUILD_VM_SSH_USER", "root"))
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+    if not vm_manager.domain_exists(vm_name):
+        raise ProvisioningError(f"Build VM {vm_name} is not defined. Run Create VM first.")
+    if not vm_manager.domain_is_active(vm_name):
+        _append_build_log(build=build, stage="vm", message=f"Starting build VM {vm_name} for OS installation")
+        vm_manager.start_domain(vm_name)
+    else:
+        _append_build_log(build=build, stage="vm", message=f"Build VM {vm_name} is already running")
+    _append_build_log(build=build, stage="network", message=f"Watching builder dnsmasq for MAC {vm_mac_address}")
+    key_pair = _materialize_build_keypair(build)
+    try:
+        ip_address = builder_provisioner.wait_for_guest_boot_progress(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            mac_address=vm_mac_address,
+            ssh_user=ssh_user,
+            ssh_private_key_path=str(key_pair.private_key_path),
+            kickstart_url=f"http://{builder_ip}/kickstarts/{kickstart_name}",
+            install_source_url=install_source_url,
+            progress_cb=lambda stage, message: _append_build_log(build=build, stage=stage, message=message),
+            timeout_seconds=timeout_seconds,
+        )
+        _append_build_log(build=build, stage="network", message=f"Build VM is reachable at {ip_address}")
+        _save_runtime_state(build, builder_ip=builder_ip, build_ip_address=ip_address)
+        return {"ip": ip_address}
+    finally:
+        key_pair.cleanup_private()
+
+
+def _step_run_playbooks(build: BuildDefinition) -> dict[str, str]:
+    vm_name = str(_runtime_state(build).get("vm_name") or _vm_name(build))
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+    if not vm_manager.domain_exists(vm_name) or not vm_manager.domain_is_active(vm_name):
+        raise ProvisioningError(f"Build VM {vm_name} is not running")
+
+    ip_address = _resolve_ip_for_existing_vm(build)
+    key_pair = _materialize_build_keypair(build)
+    try:
+        ssh_user = str(_runtime_state(build).get("build_ssh_user") or getattr(settings, "BUILD_VM_SSH_USER", "root"))
+        provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
+        _append_build_log(build=build, stage="ssh", message=f"Waiting for SSH access on {ssh_user}@{ip_address}")
+        provisioner.wait_for_ssh(
+            host=ip_address,
+            user=ssh_user,
+            private_key_path=str(key_pair.private_key_path),
+            timeout_seconds=180,
+        )
+        _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
+        _run_selected_playbooks(
+            build=build,
+            provisioner=provisioner,
+            ip_address=ip_address,
+            ssh_user=ssh_user,
+            private_key_path=str(key_pair.private_key_path),
+        )
+        _save_runtime_state(build, build_ip_address=ip_address)
+        return {"ip": ip_address}
+    finally:
+        key_pair.cleanup_private()
+
+
+def _step_shutdown(build: BuildDefinition) -> dict[str, str]:
+    vm_name = str(_runtime_state(build).get("vm_name") or _vm_name(build))
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+    _append_build_log(build=build, stage="shutdown", message="Shutting down build VM")
+    vm_manager.shutdown_and_wait(vm_name, timeout_seconds=_build_timeout_seconds(build))
+    return {"vm": vm_name}
+
+
+def _step_dump_partitions(build: BuildDefinition) -> dict[str, str]:
+    artifact_root = _artifact_root()
+    build_dir = artifact_root / f"build-{build.id}"
+    dump_dir = build_dir / "clone-release"
+    if dump_dir.exists():
+        import shutil
+        shutil.rmtree(dump_dir)
+    _append_build_log(build=build, stage="artifacts", message="Dumping build partitions to clone workspace")
+    dump_clone_partitions(
+        build=build,
+        qcow2_disk_path=Path(_require_runtime_value(build, "disk_path")),
+        output_dir=dump_dir,
+        compress=ServerConfiguration.compression_enabled(),
+    )
+    _save_runtime_state(build, partition_dump_dir=str(dump_dir), clone_release_path="")
+    return {"partition_dump_dir": str(dump_dir)}
+
+
+def _step_save_release(build: BuildDefinition) -> dict[str, str]:
+    artifact_root = _artifact_root()
+    build_dir = artifact_root / f"build-{build.id}"
+    dump_dir = Path(_require_runtime_value(build, "partition_dump_dir"))
+    release_path = build_dir / "clone-release.tar.gz"
+    build.artifacts.all().delete()
+    _append_build_log(build=build, stage="artifacts", message="Generating build artifacts")
+    generate_artifacts(
+        build=build,
+        root=artifact_root,
+        qcow2_disk_path=Path(_require_runtime_value(build, "disk_path")),
+        compress=ServerConfiguration.compression_enabled(),
+    )
+    save_clone_release(dump_dir=dump_dir, output_path=release_path)
+    BuildArtifact.objects.create(
+        build=build,
+        artifact_type=BuildArtifact.TYPE_CLONE,
+        file_path=str(release_path),
+        sha256=_sha256_of_file(release_path),
+        compressed=True,
+    )
+    _save_runtime_state(build, clone_release_path=str(release_path))
+    _append_build_log(build=build, stage="done", message="Build completed successfully")
+    return {"clone_release_path": str(release_path)}
+
+
+def _execute_step(build: BuildDefinition, step: str) -> dict[str, str]:
+    if step == BuildDefinition.STEP_VM_SHELL:
+        return _step_create_vm_shell(build)
+    if step == BuildDefinition.STEP_INSTALL_OS:
+        return _step_install_os(build)
+    if step == BuildDefinition.STEP_RUN_PLAYBOOKS:
+        return _step_run_playbooks(build)
+    if step == BuildDefinition.STEP_SHUTDOWN:
+        return _step_shutdown(build)
+    if step == BuildDefinition.STEP_DUMP_PARTITIONS:
+        return _step_dump_partitions(build)
+    if step == BuildDefinition.STEP_SAVE_RELEASE:
+        return _step_save_release(build)
+    raise ProvisioningError(f"Unknown build step '{step}'")
+
+
+def _load_build(build_id: int) -> BuildDefinition:
+    return BuildDefinition.objects.select_related(
+        "machine_config", "iso_image", "operating_system", "partition_layout"
+    ).get(pk=build_id)
+
+
 @shared_task(bind=True)
 def run_build_definition(self, build_id: int) -> dict[str, str]:
     task_id = str(getattr(self.request, "id", "") or "")
     if task_id:
         cache.set(build_task_cache_key(build_id), task_id, timeout=BUILD_TASK_CACHE_TTL_SECONDS)
 
-    build = BuildDefinition.objects.select_related(
-        "machine_config", "iso_image", "operating_system"
-    ).get(pk=build_id)
-
-    effective_boot_mode = _resolve_effective_boot_mode(build=build)
-    _validate_boot_layout_compatibility(build=build, effective_boot_mode=effective_boot_mode)
-
-    timeout_seconds = build.machine_config.kickstart_timeout_minutes * 60
-
-    with transaction.atomic():
-        build.status = BuildDefinition.STATUS_RUNNING
-        build.save(update_fields=["status", "updated_at"])
-        BuildLogEntry.objects.filter(build=build).delete()
-    publish_event("builds", "running", {"build_id": build.id, "status": build.status})
-    _append_build_log(build=build, stage="start", message="Build worker started")
-    _append_build_log(build=build, stage="vm", message=f"Effective boot mode: {effective_boot_mode}")
-
-    builder_manager = BuilderVMManager()
-    builder_manager.ensure_iso_shared(Path(build.iso_image.iso_file.path))
-    builder_manager.ensure_builder_vm()
-    builder_ip = builder_manager.wait_for_ipv4(timeout_seconds=timeout_seconds)
-    builder_access = builder_manager.ensure_access_keypair()
-    builder_ssh_user = getattr(settings, "BUILDER_VM_SSH_USER", "root")
-    builder_provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
-
-    _append_build_log(build=build, stage="builder", message=f"Builder VM ready at {builder_ip}")
-
-    builder_provisioner.wait_for_ssh(
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        timeout_seconds=timeout_seconds,
-    )
-
-    _append_build_log(build=build, stage="pxe", message="Ensuring builder TFTP bootloader files")
-    tftp_root = _ensure_builder_pxe_bootloader(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        timeout_seconds=timeout_seconds,
-    )
-    _append_build_log(build=build, stage="pxe", message=f"Using TFTP root {tftp_root}")
-
-    _cleanup_builder_bootstrap_assets(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        tftp_root=tftp_root,
-        build_id=build.id,
-        timeout_seconds=timeout_seconds,
-    )
-
-    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
-    vm_name = f"build-{build.id}"
-    vm_mac_address = _generate_mac_address()
-    ssh_user = getattr(settings, "BUILD_VM_SSH_USER", "root")
-    artifact_root = Path(settings.ARTIFACT_ROOT)
-    key_dir = artifact_root / "keys"
-    kickstart_dir = artifact_root / "kickstarts"
-    disk_dir = artifact_root / "disks"
-    key_pair = generate_build_ssh_keypair(build.id, key_dir)
-    _append_build_log(build=build, stage="ssh", message="Generated guest SSH keypair")
-    kickstart_path = render_kickstart_file(
-        output_dir=kickstart_dir,
-        vm_name=vm_name,
-        ssh_public_key=key_pair.public_key,
-        partition_layout=build.partition_layout,
-    )
-    _append_build_log(build=build, stage="kickstart", message=f"Rendered kickstart file {kickstart_path.name}")
-    pxe_assets_dir = prepare_iso_pxe_assets(iso_path=Path(build.iso_image.iso_file.path))
-    _append_build_log(build=build, stage="pxe", message=f"Prepared PXE assets from {build.iso_image.iso_file.name}")
-
-    iso_path = Path(build.iso_image.iso_file.path).resolve()
-    shared_iso_root = Path(builder_manager.definition.shared_iso_dir).resolve()
+    build = _load_build(build_id)
+    _set_build_running(build, run_mode=BuildDefinition.RUN_MODE_AUTO, reset=True)
+    _set_active_task_id(build, task_id)
+    result: dict[str, str] = {}
+    current_step = BuildDefinition.STEP_PENDING
     try:
-        iso_rel = iso_path.relative_to(shared_iso_root)
-    except ValueError as exc:
-        raise ProvisioningError(
-            f"ISO is outside shared builder path ({shared_iso_root}): {iso_path}"
-        ) from exc
-    iso_guest_path = f"/mnt/buildisos/{iso_rel.as_posix()}"
-    install_source_url = _publish_builder_iso_http_source(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        timeout_seconds=timeout_seconds,
-        build_id=build.id,
-        iso_guest_path=iso_guest_path,
-    )
-    _append_build_log(build=build, stage="pxe", message=f"Published ISO source URL {install_source_url}")
-
-    disk_path = disk_dir / f"{vm_name}.qcow2"
-
-    remote_build_root = f"{tftp_root}/builds/{vm_name}"
-    remote_kickstart_path = f"/var/www/html/kickstarts/{kickstart_path.name}"
-    remote_boot_kernel = f"{remote_build_root}/vmlinuz"
-    remote_boot_initrd = f"{remote_build_root}/initrd.img"
-    mac_slug = vm_mac_address.lower().replace(':', '-')
-    remote_bios_config = f"{tftp_root}/pxelinux.cfg/01-{mac_slug}"
-    remote_efi_config = f"{tftp_root}/grub.cfg-01-{mac_slug}"
-    remote_efi_config_alt = f"{tftp_root}/grub.cfg-{mac_slug}"
-    remote_efi_default = f"{tftp_root}/grub.cfg"
-    remote_efi64_config = f"{tftp_root}/efi64/grub.cfg-01-{mac_slug}"
-    remote_efi64_config_alt = f"{tftp_root}/efi64/grub.cfg-{mac_slug}"
-    remote_efi64_default = f"{tftp_root}/efi64/grub.cfg"
-    remote_efi32_config = f"{tftp_root}/efi32/grub.cfg-01-{mac_slug}"
-    remote_efi32_config_alt = f"{tftp_root}/efi32/grub.cfg-{mac_slug}"
-    remote_efi32_default = f"{tftp_root}/efi32/grub.cfg"
-
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"mkdir -p {remote_build_root} {tftp_root}/pxelinux.cfg {tftp_root}/efi64 {tftp_root}/efi32 /var/www/html/kickstarts",
-        timeout_seconds=timeout_seconds,
-    )
-    builder_provisioner.upload_file(
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        local_path=kickstart_path,
-        remote_path=remote_kickstart_path,
-        timeout_seconds=timeout_seconds,
-    )
-    builder_provisioner.upload_file(
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        local_path=pxe_assets_dir / "boot" / "vmlinuz",
-        remote_path=remote_boot_kernel,
-        timeout_seconds=timeout_seconds,
-    )
-    builder_provisioner.upload_file(
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        local_path=pxe_assets_dir / "boot" / "initrd.img",
-        remote_path=remote_boot_initrd,
-        timeout_seconds=timeout_seconds,
-    )
-    boot_configs = render_pxe_boot_configs(
-        vm_name=vm_name,
-        kernel_rel_path=f"builds/{vm_name}/vmlinuz",
-        initrd_rel_path=f"builds/{vm_name}/initrd.img",
-        kickstart_url=f"http://{builder_ip}/kickstarts/{kickstart_path.name}",
-        install_source_url=install_source_url,
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_bios_config}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["bios"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi_config}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi_config_alt}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi_default}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi64_config}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi64_config_alt}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi64_default}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi32_config}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi32_config_alt}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"cat > {remote_efi32_default}",
-        timeout_seconds=timeout_seconds,
-        input_text=boot_configs["efi"],
-    )
-    _run_remote_checked(
-        provisioner=builder_provisioner,
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        command=f"printf '%s\\n' {vm_mac_address} > {tftp_root}/build-state/build-{build.id}.mac",
-        timeout_seconds=timeout_seconds,
-    )
-    _append_build_log(build=build, stage="pxe", message=f"Published MAC-specific PXE config for {vm_mac_address}")
-
-    vm_definition = VMDefinition(
-        name=vm_name,
-        memory_mib=build.machine_config.memory_mib,
-        vcpus=build.machine_config.cpu,
-        disk_gib=calculate_layout_disk_size_gib(build.partition_layout),
-        network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
-        iso_path=build.iso_image.iso_file.path,
-        kickstart_path=str(kickstart_path),
-        domain_xml="",
-        ssh_public_key=key_pair.public_key,
-        mac_address=vm_mac_address,
-        disk_path=str(disk_path),
-        boot_mode=effective_boot_mode,
-    )
-
-    try:
-        _append_build_log(build=build, stage="vm", message=f"Defining PXE boot VM {vm_name} with MAC {vm_mac_address}")
-        vm_manager.ensure_domain(vm_definition, replace_existing=True)
-        vm_manager.start_domain(vm_name)
-        _append_build_log(build=build, stage="vm", message="Build VM started and waiting for DHCP lease")
-        _append_build_log(build=build, stage="network", message=f"Watching builder dnsmasq for MAC {vm_mac_address}")
-
-        ip_address = builder_provisioner.wait_for_guest_boot_progress(
-            host=builder_ip,
-            user=builder_ssh_user,
-            private_key_path=str(builder_access.private_key_path),
-            mac_address=vm_mac_address,
-            ssh_user=ssh_user,
-            ssh_private_key_path=str(key_pair.private_key_path),
-            kickstart_url=f"http://{builder_ip}/kickstarts/{kickstart_path.name}",
-            install_source_url=install_source_url,
-            progress_cb=lambda stage, message: _append_build_log(build=build, stage=stage, message=message),
-            timeout_seconds=timeout_seconds,
-        )
-        _append_build_log(build=build, stage="network", message=f"Build VM is reachable at {ip_address}")
-
-        _run_selected_playbooks(
-            build=build,
-            provisioner=builder_provisioner,
-            ip_address=ip_address,
-            ssh_user=ssh_user,
-            private_key_path=str(key_pair.private_key_path),
-        )
-
-        _append_build_log(build=build, stage="shutdown", message="Waiting for installed VM to shut down and reboot")
-        vm_manager.shutdown_and_wait(
-            vm_name,
-            timeout_seconds=timeout_seconds,
-        )
-
-        build.artifacts.all().delete()
-        _append_build_log(build=build, stage="artifacts", message="Generating build artifacts")
-        generate_artifacts(
-            build=build,
-            root=artifact_root,
-            qcow2_disk_path=disk_path,
-            compress=ServerConfiguration.compression_enabled(),
-        )
-
-        build.status = BuildDefinition.STATUS_SUCCEEDED
-        build.save(update_fields=["status", "updated_at"])
-        _append_build_log(build=build, stage="done", message="Build completed successfully")
-        publish_event(
-            "builds",
-            "succeeded",
-            {
-                "build_id": build.id,
-                "status": build.status,
-                "artifact_count": build.artifacts.count(),
-            },
-        )
-        return {"status": build.status, "vm": vm_name, "ip": ip_address}
+        for step in BuildDefinition.STEP_SEQUENCE:
+            current_step = step
+            build.refresh_from_db()
+            _begin_step(build, step=step)
+            result.update(_execute_step(build, step))
+            build.refresh_from_db()
+            _complete_step(build, step=step, keep_running=step != BuildDefinition.STEP_SAVE_RELEASE)
+        return {"status": build.status, **result}
     except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError) as exc:
-        _append_build_log(build=build, stage="error", message=str(exc))
-        build.status = BuildDefinition.STATUS_FAILED
-        build.save(update_fields=["status", "updated_at"])
-        publish_event(
-            "builds",
-            "failed",
-            {"build_id": build.id, "status": build.status, "error": str(exc)},
-        )
+        _fail_build(build, step=current_step, exc=exc)
         raise RuntimeError(str(exc)) from exc
     finally:
-        key_pair.cleanup_private()
+        build.refresh_from_db()
+        _clear_active_task_id(build, task_id)
+        if task_id and cache.get(build_task_cache_key(build_id)) == task_id:
+            cache.delete(build_task_cache_key(build_id))
+
+
+@shared_task(bind=True)
+def run_build_step(self, build_id: int, step: str) -> dict[str, str]:
+    task_id = str(getattr(self.request, "id", "") or "")
+    if task_id:
+        cache.set(build_task_cache_key(build_id), task_id, timeout=BUILD_TASK_CACHE_TTL_SECONDS)
+
+    build = _load_build(build_id)
+    if not build.can_run_manual_step(step):
+        raise RuntimeError(f"Step '{step}' is not available for this build right now")
+
+    _set_build_running(build, run_mode=BuildDefinition.RUN_MODE_MANUAL, reset=step == BuildDefinition.STEP_VM_SHELL)
+    _set_active_task_id(build, task_id)
+    _begin_step(build, step=step)
+    _append_build_log(build=build, stage="manual", message=f"Running manual step: {dict(BuildDefinition.STEP_CHOICES).get(step, step)}")
+    try:
+        result = _execute_step(build, step)
+        build.refresh_from_db()
+        _complete_step(build, step=step, keep_running=False)
+        return {"status": build.status, "step": step, **result}
+    except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError) as exc:
+        _fail_build(build, step=step, exc=exc)
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        build.refresh_from_db()
+        _clear_active_task_id(build, task_id)
         if task_id and cache.get(build_task_cache_key(build_id)) == task_id:
             cache.delete(build_task_cache_key(build_id))
 
@@ -654,54 +972,26 @@ def rerun_build_playbooks(self, build_id: int, ip_address: str = "") -> dict[str
     if task_id:
         cache.set(build_task_cache_key(build_id), task_id, timeout=BUILD_TASK_CACHE_TTL_SECONDS)
 
-    build = BuildDefinition.objects.select_related("machine_config").get(pk=build_id)
-    vm_name = f"build-{build.id}"
+    build = _load_build(build_id)
+    _set_active_task_id(build, task_id)
+    vm_name = str(_runtime_state(build).get("vm_name") or _vm_name(build))
     vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
 
     try:
         if not vm_manager.domain_exists(vm_name) or not vm_manager.domain_is_active(vm_name):
             raise ProvisioningError(f"Build VM {vm_name} is not running")
 
-        effective_ip = (ip_address or "").strip()
-        if not effective_ip:
-            effective_ip = vm_manager.current_ipv4(
-                domain_name=vm_name,
-                network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
-            ) or ""
-        if not effective_ip:
-            effective_ip = vm_manager.wait_for_ipv4(
-                domain_name=vm_name,
-                network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
-                timeout_seconds=120,
-            ) or ""
-        if not effective_ip:
-            raise ProvisioningError(f"Could not determine IP address for running VM {vm_name}")
-
-        key_obj = SSHKey.objects.filter(
-            scope=SSHKey.SCOPE_IMAGE_BUILD,
-            build=build,
-            name="build",
-        ).first()
-        if key_obj is None or not key_obj.has_keypair():
-            raise SSHKeyError("Missing build SSH keypair for re-running playbooks")
-        private_key_text = key_obj.get_private_key().strip()
-        if not private_key_text:
-            raise SSHKeyError("Build SSH private key is unavailable")
-
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", prefix=f"build-{build.id}-", delete=False) as key_file:
-            key_file.write(private_key_text + "\n")
-            key_path = Path(key_file.name)
-        key_path.chmod(0o600)
-
+        effective_ip = (ip_address or "").strip() or _resolve_ip_for_existing_vm(build)
+        key_pair = _materialize_build_keypair(build)
         try:
-            ssh_user = getattr(settings, "BUILD_VM_SSH_USER", "root")
+            ssh_user = str(_runtime_state(build).get("build_ssh_user") or getattr(settings, "BUILD_VM_SSH_USER", "root"))
             provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
             _append_build_log(build=build, stage="playbooks", message=f"Re-running playbooks on {effective_ip}")
             _append_build_log(build=build, stage="ssh", message=f"Waiting for SSH access on {ssh_user}@{effective_ip}")
             provisioner.wait_for_ssh(
                 host=effective_ip,
                 user=ssh_user,
-                private_key_path=str(key_path),
+                private_key_path=str(key_pair.private_key_path),
                 timeout_seconds=180,
             )
             _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
@@ -710,15 +1000,18 @@ def rerun_build_playbooks(self, build_id: int, ip_address: str = "") -> dict[str
                 provisioner=provisioner,
                 ip_address=effective_ip,
                 ssh_user=ssh_user,
-                private_key_path=str(key_path),
+                private_key_path=str(key_pair.private_key_path),
             )
             _append_build_log(build=build, stage="playbooks", message="Playbook re-run completed successfully")
+            _save_runtime_state(build, build_ip_address=effective_ip)
             return {"status": "ok", "ip": effective_ip, "vm": vm_name}
         finally:
-            key_path.unlink(missing_ok=True)
+            key_pair.cleanup_private()
     except (ProvisioningError, SSHKeyError, PlaybookSyncError) as exc:
         _append_build_log(build=build, stage="error", message=str(exc))
         raise RuntimeError(str(exc)) from exc
     finally:
+        build.refresh_from_db()
+        _clear_active_task_id(build, task_id)
         if task_id and cache.get(build_task_cache_key(build_id)) == task_id:
             cache.delete(build_task_cache_key(build_id))

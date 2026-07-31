@@ -53,6 +53,36 @@ class BuildDefinition(models.Model):
 		(STATUS_FAILED, "Failed"),
 		(STATUS_SUCCEEDED, "Succeeded"),
 	]
+	RUN_MODE_AUTO = "auto"
+	RUN_MODE_MANUAL = "manual"
+	RUN_MODE_CHOICES = [
+		(RUN_MODE_AUTO, "Automatic"),
+		(RUN_MODE_MANUAL, "Manual"),
+	]
+	STEP_PENDING = "pending"
+	STEP_VM_SHELL = "vm_shell"
+	STEP_INSTALL_OS = "install_os"
+	STEP_RUN_PLAYBOOKS = "run_playbooks"
+	STEP_SHUTDOWN = "shutdown"
+	STEP_DUMP_PARTITIONS = "dump_partitions"
+	STEP_SAVE_RELEASE = "save_release"
+	STEP_CHOICES = [
+		(STEP_PENDING, "Pending"),
+		(STEP_VM_SHELL, "Create VM"),
+		(STEP_INSTALL_OS, "Install OS"),
+		(STEP_RUN_PLAYBOOKS, "Run Playbooks"),
+		(STEP_SHUTDOWN, "Shutdown"),
+		(STEP_DUMP_PARTITIONS, "Dump Partitions"),
+		(STEP_SAVE_RELEASE, "Save Release"),
+	]
+	STEP_SEQUENCE = [
+		STEP_VM_SHELL,
+		STEP_INSTALL_OS,
+		STEP_RUN_PLAYBOOKS,
+		STEP_SHUTDOWN,
+		STEP_DUMP_PARTITIONS,
+		STEP_SAVE_RELEASE,
+	]
 
 	name = models.CharField(max_length=120, unique=True)
 	operating_system = models.ForeignKey("catalog.OperatingSystem", on_delete=models.PROTECT)
@@ -72,6 +102,9 @@ class BuildDefinition(models.Model):
 	output_pxe = models.BooleanField(default=True)
 	output_usb_img = models.BooleanField(default=True)
 	status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+	run_mode = models.CharField(max_length=16, choices=RUN_MODE_CHOICES, default=RUN_MODE_AUTO)
+	current_step = models.CharField(max_length=32, choices=STEP_CHOICES, default=STEP_PENDING)
+	runtime_state = models.JSONField(default=dict, blank=True)
 	started_by = models.ForeignKey("users.User", null=True, blank=True, on_delete=models.SET_NULL)
 	created_at = models.DateTimeField(auto_now_add=True)
 	updated_at = models.DateTimeField(auto_now=True)
@@ -108,11 +141,39 @@ class BuildDefinition(models.Model):
 	def ordered_playbook_selections(self):
 		return self.playbook_selections.select_related("playbook", "playbook__repository").order_by("order")
 
+	def next_manual_step(self) -> str:
+		last_completed = str((self.runtime_state or {}).get("last_completed_step") or self.STEP_PENDING)
+		if last_completed not in self.STEP_SEQUENCE:
+			return self.STEP_VM_SHELL
+		index = self.STEP_SEQUENCE.index(last_completed) + 1
+		if index >= len(self.STEP_SEQUENCE):
+			return self.STEP_SAVE_RELEASE
+		return self.STEP_SEQUENCE[index]
+
+	def has_completed_step(self, step: str) -> bool:
+		if step == self.STEP_PENDING:
+			return True
+		last_completed = str((self.runtime_state or {}).get("last_completed_step") or self.STEP_PENDING)
+		if last_completed not in self.STEP_SEQUENCE:
+			return False
+		return self.STEP_SEQUENCE.index(last_completed) >= self.STEP_SEQUENCE.index(step)
+
+	def can_run_manual_step(self, step: str) -> bool:
+		if step not in self.STEP_SEQUENCE:
+			return False
+		if self.status in {self.STATUS_QUEUED, self.STATUS_RUNNING}:
+			return False
+		if step == self.STEP_VM_SHELL:
+			return True
+		previous_step = self.STEP_SEQUENCE[self.STEP_SEQUENCE.index(step) - 1]
+		return self.has_completed_step(previous_step)
+
 
 class BuildArtifact(models.Model):
 	TYPE_PXE = "pxe"
 	TYPE_USB = "usb"
-	TYPE_CHOICES = [(TYPE_PXE, "PXE bundle"), (TYPE_USB, "USB image")]
+	TYPE_CLONE = "clone"
+	TYPE_CHOICES = [(TYPE_PXE, "PXE bundle"), (TYPE_USB, "USB image"), (TYPE_CLONE, "Clone release")]
 
 	build = models.ForeignKey(BuildDefinition, on_delete=models.CASCADE, related_name="artifacts")
 	artifact_type = models.CharField(max_length=8, choices=TYPE_CHOICES)

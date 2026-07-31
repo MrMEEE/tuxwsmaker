@@ -5,6 +5,8 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tarfile
+import tempfile
 from pathlib import Path
 
 from apps.builds.models import BuildArtifact, BuildDefinition
@@ -137,6 +139,164 @@ def _gzip_file(src: Path) -> Path:
         shutil.copyfileobj(in_f, out_f)
     src.unlink()
     return dst
+
+
+def _run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(args, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise ArtifactExportError(
+            f"{' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+        )
+    return proc
+
+
+def _convert_qcow2_to_raw(*, qcow2_path: Path, raw_path: Path) -> None:
+    if shutil.which("qemu-img") is None:
+        raise ArtifactExportError("qemu-img is required to export clone partition images")
+    _run_checked([
+        "qemu-img",
+        "convert",
+        "-f",
+        "qcow2",
+        "-O",
+        "raw",
+        "-S",
+        "4k",
+        str(qcow2_path),
+        str(raw_path),
+    ])
+
+
+def _partition_table_from_raw(raw_path: Path) -> dict:
+    if shutil.which("parted") is None:
+        raise ArtifactExportError("parted is required to inspect disk partitions for clone export")
+    proc = _run_checked(["parted", "-s", "-m", str(raw_path), "unit", "B", "print"])
+    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    if len(lines) < 2:
+        raise ArtifactExportError("parted did not return a usable partition table")
+
+    disk_parts = lines[1].split(":")
+    table_type = disk_parts[5] if len(disk_parts) > 5 else ""
+    disk_size = int((disk_parts[1] or "0").rstrip("B") or "0") if len(disk_parts) > 1 else 0
+    partitions: list[dict[str, object]] = []
+    for line in lines[2:]:
+        if not line[0].isdigit():
+            continue
+        parts = line.rstrip(";").split(":")
+        if len(parts) < 5:
+            continue
+        number = int(parts[0])
+        start = int(parts[1].rstrip("B") or "0")
+        end = int(parts[2].rstrip("B") or "0")
+        size = int(parts[3].rstrip("B") or "0")
+        filesystem = parts[4]
+        name = parts[5] if len(parts) > 5 else ""
+        flags = parts[6] if len(parts) > 6 else ""
+        partitions.append(
+            {
+                "number": number,
+                "start_byte": start,
+                "end_byte": end,
+                "size_bytes": size,
+                "filesystem": filesystem,
+                "name": name,
+                "flags": flags,
+            }
+        )
+
+    if not partitions:
+        raise ArtifactExportError("No partitions were discovered in the build disk image")
+
+    return {
+        "table_type": table_type,
+        "disk_size_bytes": disk_size,
+        "partitions": partitions,
+    }
+
+
+def dump_clone_partitions(
+    *,
+    build: BuildDefinition,
+    qcow2_disk_path: Path,
+    output_dir: Path,
+    compress: bool,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(prefix=f"build-{build.id}-", suffix=".raw", delete=False) as raw_tmp:
+        raw_path = Path(raw_tmp.name)
+
+    try:
+        _convert_qcow2_to_raw(qcow2_path=qcow2_disk_path, raw_path=raw_path)
+        table = _partition_table_from_raw(raw_path)
+        partition_manifest: list[dict[str, object]] = []
+
+        with raw_path.open("rb") as raw_handle:
+            for partition in table["partitions"]:
+                number = int(partition["number"])
+                start = int(partition["start_byte"])
+                size = int(partition["size_bytes"])
+                target = output_dir / f"partition-{number:02d}.img"
+                actual_target = target.with_suffix(target.suffix + ".gz") if compress else target
+
+                raw_handle.seek(start)
+                remaining = size
+                if compress:
+                    writer = gzip.open(actual_target, "wb", compresslevel=1)
+                else:
+                    writer = actual_target.open("wb")
+                try:
+                    while remaining > 0:
+                        chunk = raw_handle.read(min(8 * 1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        writer.write(chunk)
+                        remaining -= len(chunk)
+                finally:
+                    writer.close()
+
+                partition_manifest.append(
+                    {
+                        **partition,
+                        "file_name": actual_target.name,
+                        "sha256": _sha256_of_file(actual_target),
+                        "compressed": compress,
+                    }
+                )
+
+        manifest = {
+            "build_id": build.id,
+            "build_name": build.name,
+            "disk_image": str(qcow2_disk_path),
+            "boot_mode": build.machine_config.boot_mode,
+            "table_type": table["table_type"],
+            "disk_size_bytes": table["disk_size_bytes"],
+            "partitions": partition_manifest,
+            "layout_entries": [
+                {
+                    "order": entry.order,
+                    "name": entry.name,
+                    "entry_role": entry.entry_role,
+                    "mount_point": entry.mount_point,
+                    "filesystem": entry.filesystem,
+                    "luks_enabled": entry.luks_enabled,
+                    "luks_name": entry.luks_name,
+                    "volume_group": entry.volume_group,
+                    "logical_volume": entry.logical_volume,
+                }
+                for entry in build.partition_layout.entries.order_by("order")
+            ],
+        }
+        (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        return output_dir
+    finally:
+        raw_path.unlink(missing_ok=True)
+
+
+def save_clone_release(*, dump_dir: Path, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(output_path, mode="w:gz") as tar:
+        tar.add(dump_dir, arcname=dump_dir.name)
+    return output_path
 
 
 def _export_usb_image(*, qcow2_path: Path, output_path: Path) -> None:

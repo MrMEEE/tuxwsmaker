@@ -125,6 +125,7 @@ class AnsibleProvisioner:
         mac_address = mac_address.lower()
         mac_pattern = re.compile(rf"\b{re.escape(mac_address)}\b")
         ipv4_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        http_request_pattern = re.compile(r'"(?:GET|HEAD)\s+([^\s]+)\s+HTTP/[^\"]+"')
         seen_lines: set[str] = set()
         saw_dhcp_request = False
         command = f"if [ -f {shlex.quote(lease_path)} ]; then cat {shlex.quote(lease_path)}; fi"
@@ -205,6 +206,7 @@ class AnsibleProvisioner:
         )
         mac_pattern = re.compile(rf"\b{re.escape(mac_address)}\b")
         ipv4_pattern = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+        http_request_pattern = re.compile(r'"(?:GET|HEAD)\s+([^\s]+)\s+HTTP/[^\"]+"')
         seen_lines: set[str] = set()
         current_ip = ""
         initial_request_logged = False
@@ -302,12 +304,23 @@ class AnsibleProvisioner:
 
         def observe_http(line: str) -> None:
             nonlocal kickstart_logged, install_source_logged
-            if current_ip and current_ip not in line:
+            if not current_ip or current_ip not in line:
                 return
+            req_match = http_request_pattern.search(line)
+            if req_match is None:
+                return
+            request_path = req_match.group(1)
+            install_source_root = install_source_path.rstrip("/")
+            kickstart_root = kickstart_path.rstrip("/")
             if not kickstart_logged and kickstart_path and kickstart_path in line:
-                emit("kickstart", f"VM {mac_address} requested kickstart file {kickstart_path}")
-                kickstart_logged = True
-            if not install_source_logged and install_source_path and install_source_path in line:
+                if request_path == kickstart_root or request_path.startswith(kickstart_root + "/"):
+                    emit("kickstart", f"VM {mac_address} requested kickstart file {kickstart_path}")
+                    kickstart_logged = True
+            if (
+                not install_source_logged
+                and install_source_path
+                and (request_path == install_source_root or request_path.startswith(install_source_root + "/"))
+            ):
                 emit("install", f"VM {mac_address} requested installation source {install_source_path}")
                 install_source_logged = True
 

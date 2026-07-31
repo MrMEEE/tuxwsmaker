@@ -8,6 +8,8 @@
     <h4 class="mb-0">{{ build.name }}</h4>
     <small id="build-status-text" class="text-muted">Status: {{ build.get_status_display }}</small>
     <div class="mt-1">
+      <span class="badge text-bg-light border">Mode: {{ build.get_run_mode_display }}</span>
+      <span id="build-current-step" class="badge text-bg-light border">Step: {{ current_step_display }}</span>
       {% if build_vm_exists %}
         {% if build_vm_ssh_ready %}
         <span class="badge text-bg-success">VM SSH: Ready</span>
@@ -24,6 +26,12 @@
   </div>
   <div class="d-flex gap-2">
     <a class="btn btn-outline-secondary" href="{% url 'builds:build-edit' build.pk %}" data-modal="1" data-modal-title="Edit Build">Edit</a>
+    {% if show_full_build %}
+    <form method="post" action="{% url 'builds:build-queue' build.pk %}" data-confirm-message="Run the full build from VM creation through release export?" data-confirm-title="Run Full Build" data-confirm-accept="Run Full Build" data-confirm-class="btn-primary">
+      {% csrf_token %}
+      <button class="btn btn-primary" type="submit">Run Full Build</button>
+    </form>
+    {% endif %}
     {% if show_rerun_playbooks %}
     <form method="post" action="{% url 'builds:build-rerun-playbooks' build.pk %}" data-confirm-message="Re-run assigned playbooks on the running build VM?" data-confirm-title="Re-run Playbooks" data-confirm-accept="Re-run" data-confirm-class="btn-primary">
       {% csrf_token %}
@@ -34,11 +42,6 @@
     <form method="post" action="{% url 'builds:build-cancel' build.pk %}" data-confirm-message="Cancel this running build?" data-confirm-title="Cancel Build" data-confirm-accept="Cancel Build" data-confirm-class="btn-warning">
       {% csrf_token %}
       <button class="btn btn-outline-danger" type="submit">Cancel Build</button>
-    </form>
-    {% else %}
-    <form method="post" action="{% url 'builds:build-queue' build.pk %}">
-      {% csrf_token %}
-      <button class="btn btn-primary" type="submit">Queue Build</button>
     </form>
     {% endif %}
   </div>
@@ -73,6 +76,28 @@
             {% if build.output_usb_img %}<span class="badge text-bg-secondary">USB IMG</span>{% endif %}
           </dd>
         </dl>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><h6 class="mb-0">Manual Steps</h6></div>
+      <div class="card-body">
+        <div class="d-grid gap-2">
+          {% for step in manual_steps %}
+          <form method="post" action="{% url 'builds:build-run-step' build.pk step.slug %}" data-manual-step-form="{{ step.slug }}">
+            {% csrf_token %}
+            <button class="btn {% if step.enabled %}btn-outline-primary{% else %}btn-outline-secondary{% endif %} w-100 text-start" type="submit" data-manual-step="{{ step.slug }}" data-step-label="{{ step.label }}" {% if not step.enabled %}disabled{% endif %}>
+              <span class="step-label">{{ step.label }}</span>
+              <span class="step-badges">
+                {% if step.completed %}<span class="badge text-bg-success ms-2">Done</span>{% endif %}
+                {% if step.is_next %}<span class="badge text-bg-warning ms-2">Next</span>{% endif %}
+              </span>
+            </button>
+          </form>
+          {% endfor %}
+        </div>
       </div>
     </div>
   </div>
@@ -156,6 +181,37 @@
         + "</li>";
     }
 
+    function refreshManualStepButtons(manualSteps) {
+      if (!Array.isArray(manualSteps)) {
+        return;
+      }
+
+      manualSteps.forEach(function (step) {
+        const button = document.querySelector("button[data-manual-step='" + step.slug + "']");
+        if (!button) {
+          return;
+        }
+
+        button.disabled = !step.enabled;
+        button.classList.remove("btn-outline-primary", "btn-outline-secondary");
+        button.classList.add(step.enabled ? "btn-outline-primary" : "btn-outline-secondary");
+
+        const badgeContainer = button.querySelector(".step-badges");
+        if (!badgeContainer) {
+          return;
+        }
+
+        let badges = "";
+        if (step.completed) {
+          badges += '<span class="badge text-bg-success ms-2">Done</span>';
+        }
+        if (step.is_next) {
+          badges += '<span class="badge text-bg-warning ms-2">Next</span>';
+        }
+        badgeContainer.innerHTML = badges;
+      });
+    }
+
     async function refreshBuildDetail() {
       const response = await fetch("/api/builds/" + buildId + "/snapshot/", { credentials: "same-origin" });
       if (!response.ok) {
@@ -163,9 +219,14 @@
       }
       const data = await response.json();
       const status = document.getElementById("build-status-text");
+      const currentStep = document.getElementById("build-current-step");
       if (status) {
         status.textContent = "Status: " + data.status_display;
       }
+      if (currentStep && data.current_step_display) {
+        currentStep.textContent = "Step: " + data.current_step_display;
+      }
+      refreshManualStepButtons(data.manual_steps);
 
       const artifactList = document.getElementById("artifact-list");
       const logList = document.getElementById("build-log-list");

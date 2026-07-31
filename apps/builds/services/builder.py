@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -261,6 +262,16 @@ class BuilderVMManager:
 		finally:
 			conn.close()
 
+	def builder_vm_running(self) -> bool:
+		conn = self._connect()
+		try:
+			domain = conn.lookupByName(self.definition.name)
+			return domain.isActive() == 1
+		except Exception:
+			return False
+		finally:
+			conn.close()
+
 	def _filesystem_mapping_arg(self, shared_iso_dir: Path) -> str:
 		virtiofsd_bin = shutil.which("virtiofsd")
 		if virtiofsd_bin is None:
@@ -506,8 +517,15 @@ class BuilderVMManager:
 	def wait_for_ipv4(self, timeout_seconds: int = 900, progress_cb: Callable[[str, str], None] | None = None) -> str:
 		bootstrap_ip = str(getattr(settings, "BUILDER_VM_BOOTSTRAP_IP", "")).strip()
 		if bootstrap_ip:
-			self._progress(progress_cb, "network", f"Using configured builder bootstrap IP {bootstrap_ip}")
-			return bootstrap_ip
+			self._progress(progress_cb, "network", f"Configured builder bootstrap IP is {bootstrap_ip}")
+			if self._is_tcp_port_open(bootstrap_ip, 22, timeout_seconds=2):
+				self._progress(progress_cb, "network", f"Bootstrap IP {bootstrap_ip} is reachable on SSH")
+				return bootstrap_ip
+			self._progress(
+				progress_cb,
+				"network",
+				f"Bootstrap IP {bootstrap_ip} is not reachable yet; discovering IP via libvirt lease/ARP",
+			)
 
 		conn = self._connect()
 		try:
@@ -535,9 +553,19 @@ class BuilderVMManager:
 		finally:
 			conn.close()
 
+		extra_hint = ""
+		if bootstrap_ip:
+			extra_hint = f" Configured bootstrap IP {bootstrap_ip} was not reachable and no dynamic address was discovered."
 		raise BuilderError(
-			f"Timed out waiting for IPv4 address for builder VM {self.definition.name} on network {self.definition.network_name}. Set BUILDER_VM_BOOTSTRAP_IP if DHCP is disabled."
+			f"Timed out waiting for IPv4 address for builder VM {self.definition.name} on network {self.definition.network_name}.{extra_hint}"
 		)
+
+	def _is_tcp_port_open(self, host: str, port: int, timeout_seconds: float = 2.0) -> bool:
+		try:
+			with socket.create_connection((host, port), timeout=timeout_seconds):
+				return True
+		except OSError:
+			return False
 
 	def _lookup_ipv4_via_virsh_arp(self) -> str:
 		env = dict(os.environ)
