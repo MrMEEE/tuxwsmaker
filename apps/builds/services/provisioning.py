@@ -564,9 +564,7 @@ class AnsibleProvisioner:
             return "unknown"
 
         # A real playbook contains play-level hosts/import_playbook keys.
-        if re.search(r"(?m)^\s*hosts\s*:", content):
-            return "playbook"
-        if re.search(r"(?m)^\s*-\s*import_playbook\s*:", content):
+        if re.search(r"(?m)^\s*(?:-\s*)?(?:hosts|import_playbook)\s*:", content):
             return "playbook"
 
         # Task files typically start with list items and omit play-level hosts.

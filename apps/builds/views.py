@@ -533,11 +533,10 @@ class BuildArtifactDownloadView(LoginRequiredMixin, View):
 			)
 
 		if artifact_path.is_dir():
-			tmp = tempfile.NamedTemporaryFile(prefix=f"build-{build.id}-", suffix=".tar.gz", delete=False)
-			tmp.close()
-			tar_path = Path(tmp.name)
-			with tarfile.open(tar_path, mode="w:gz") as tar:
-				tar.add(artifact_path, arcname=artifact_path.name)
+			tar_path = artifact_path.with_name(f"{artifact_path.name}.tar.gz")
+			if not tar_path.exists():
+				with tarfile.open(tar_path, mode="w:gz") as tar:
+					tar.add(artifact_path, arcname=artifact_path.name)
 			return FileResponse(
 				tar_path.open("rb"),
 				as_attachment=True,

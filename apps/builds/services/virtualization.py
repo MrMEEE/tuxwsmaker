@@ -166,6 +166,26 @@ class LibvirtVMManager:
 
     def _undefine_domain(self, domain) -> None:
         try:
+            import libvirt  # type: ignore
+        except Exception:
+            libvirt = None
+
+        flags = 0
+        if libvirt is not None:
+            flags |= int(getattr(libvirt, "VIR_DOMAIN_UNDEFINE_NVRAM", 0))
+            flags |= int(getattr(libvirt, "VIR_DOMAIN_UNDEFINE_MANAGED_SAVE", 0))
+            flags |= int(getattr(libvirt, "VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA", 0))
+
+        # Prefer flagged undefine first when supported so UEFI/NVRAM guests
+        # avoid emitting expected "cannot undefine domain with nvram" errors.
+        if hasattr(domain, "undefineFlags") and flags:
+            try:
+                domain.undefineFlags(flags)
+                return
+            except Exception:
+                pass
+
+        try:
             domain.undefine()
             return
         except Exception as exc:
@@ -173,16 +193,6 @@ class LibvirtVMManager:
             message = str(exc).lower()
             if "nvram" not in message and "managed save" not in message and "snapshot" not in message:
                 raise
-
-        try:
-            import libvirt  # type: ignore
-        except Exception as exc:
-            raise VirtualizationError("libvirt Python bindings are required for VM lifecycle management") from exc
-
-        flags = 0
-        flags |= int(getattr(libvirt, "VIR_DOMAIN_UNDEFINE_NVRAM", 0))
-        flags |= int(getattr(libvirt, "VIR_DOMAIN_UNDEFINE_MANAGED_SAVE", 0))
-        flags |= int(getattr(libvirt, "VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA", 0))
 
         if not hasattr(domain, "undefineFlags") or flags == 0:
             raise VirtualizationError("Domain requires flagged undefine (NVRAM/managed state), but libvirt flags are unavailable")

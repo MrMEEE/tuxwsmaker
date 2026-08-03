@@ -3,17 +3,269 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
 import shutil
+from datetime import datetime
 import subprocess
 import tarfile
 import tempfile
 from pathlib import Path
 
 from apps.builds.models import BuildArtifact, BuildDefinition
+from apps.builds.services.kickstart import (
+    render_deploy_kickstart_file,
+    render_deploy_restore_script,
+    render_pxe_boot_configs,
+)
 
 
 class ArtifactExportError(RuntimeError):
     pass
+
+
+DEPLOY_MANIFEST_VERSION = 1
+
+
+def _write_usb_image_from_bundle(*, bundle_dir: Path, output_path: Path, build_name: str) -> Path:
+    if shutil.which("grub-mkrescue") is None:
+        raise ArtifactExportError(
+            "grub-mkrescue is required to build bootable usb.img artifacts (install grub2-tools)."
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Ensure GRUB has an explicit config for both BIOS and UEFI boot paths.
+    grub_dir = bundle_dir / "boot" / "grub"
+    grub_dir.mkdir(parents=True, exist_ok=True)
+    grub_cfg = (
+        "set timeout=5\n"
+        "set default=0\n"
+        "menuentry 'TuxWSMaker Deploy USB' {\n"
+        f"  linux /boot/vmlinuz inst.stage2=hd:LABEL=TUXWSDEPLOY:/stage2 inst.repo=hd:LABEL=TUXWSDEPLOY:/ inst.ks=hd:LABEL=TUXWSDEPLOY:/deploy/{build_name}-deploy.cfg ip=dhcp console=ttyS0,115200n8 console=tty0\n"
+        "  initrd /boot/initrd.img\n"
+        "}\n"
+    )
+    (grub_dir / "grub.cfg").write_text(grub_cfg, encoding="utf-8")
+
+    env = dict(os.environ)
+    env["TMPDIR"] = str(bundle_dir.parent)
+    _run_checked(
+        [
+            "grub-mkrescue",
+            "-o",
+            str(output_path),
+            "-volid",
+            "TUXWSDEPLOY",
+            str(bundle_dir),
+        ],
+        env=env,
+    )
+
+    return output_path
+
+
+def _extract_iso_tree(*, iso_path: Path, output_dir: Path) -> None:
+    try:
+        import pycdlib  # type: ignore
+    except Exception as exc:
+        raise ArtifactExportError(
+            "pycdlib is required for extracting ISO installation tree for USB deploy images"
+        ) from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    iso = pycdlib.PyCdlib()
+    try:
+        iso.open(str(iso_path))
+        for root, dirs, files in iso.walk(rr_path="/"):
+            root_rel = root.lstrip("/")
+            root_dir = output_dir / root_rel if root_rel else output_dir
+            root_dir.mkdir(parents=True, exist_ok=True)
+
+            for directory in dirs:
+                dirname = str(directory).strip("/")
+                if dirname:
+                    (root_dir / dirname).mkdir(parents=True, exist_ok=True)
+
+            for file_item in files:
+                filename = str(file_item)
+                rr_path = f"{root.rstrip('/')}/{filename}" if root != "/" else f"/{filename}"
+                target = output_dir / rr_path.lstrip("/")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                iso.get_file_from_iso(local_path=str(target), rr_path=rr_path)
+    finally:
+        try:
+            iso.close()
+        except Exception:
+            pass
+
+
+def _extract_iso_stage2_payload(*, iso_path: Path, output_dir: Path) -> None:
+    try:
+        import pycdlib  # type: ignore
+    except Exception as exc:
+        raise ArtifactExportError(
+            "pycdlib is required for extracting ISO stage2 payload for PXE deploy images"
+        ) from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    iso = pycdlib.PyCdlib()
+    try:
+        iso.open(str(iso_path))
+        candidates = [
+            "/.treeinfo",
+            "/.discinfo",
+            "/media.repo",
+            "/images/install.img",
+            "/images/product.img",
+            "/images/updates.img",
+        ]
+
+        extracted = 0
+        for rr_path in candidates:
+            try:
+                iso.get_record(rr_path=rr_path)
+            except Exception:
+                continue
+            target = output_dir / rr_path.lstrip("/")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            iso.get_file_from_iso(local_path=str(target), rr_path=rr_path)
+            extracted += 1
+
+        if extracted == 0:
+            raise ArtifactExportError("Could not extract stage2 payload from ISO")
+    finally:
+        try:
+            iso.close()
+        except Exception:
+            pass
+
+
+def _write_usb_instructions(*, build: BuildDefinition, out_dir: Path) -> None:
+    content = (
+        "TuxWSMaker USB Deploy Bundle\n"
+        "=========================\n\n"
+        "This artifact is exported both as a directory tree and packed into usb.img for direct flashing.\n"
+        "The published USB artifact in the UI is usb.img (optionally compressed as usb.img.gz).\n\n"
+        "Contents\n"
+        "--------\n"
+        "- boot/: kernel and initrd used to start deploy environment\n"
+        "- stage2/: minimal ISO stage2 payload (install.img, tree metadata)\n"
+        "- deploy/: restore script and deploy kickstart scaffold\n"
+        "- clone-release/: partition payload produced from the source build disk\n"
+        "- deploy.json: deploy strategy + layout metadata\n"
+        "- manifest.json: artifact metadata\n\n"
+        "What clone-release is for\n"
+        "------------------------\n"
+        "clone-release contains the partition images and manifest generated from the build VM disk.\n"
+        "During restore, deploy/restore.sh reads clone-release/manifest.json and applies partition-*.img*\n"
+        "to the target disk according to deploy.json metadata.\n\n"
+        "How to place on a USB stick\n"
+        "---------------------------\n"
+        "1. If needed, decompress usb.img.gz to usb.img.\n"
+        "2. Flash image to the target USB device (example):\n"
+        "   sudo dd if=usb.img of=/dev/sdX bs=16M status=progress conv=fsync\n"
+        "3. Safely eject and boot target machine from this USB.\n\n"
+        "Build reference\n"
+        "---------------\n"
+        f"Build: {build.name} (id {build.id})\n"
+    )
+    (out_dir / "README.txt").write_text(content, encoding="utf-8")
+
+
+def _write_pxe_instructions(*, build: BuildDefinition, out_dir: Path) -> None:
+    content = (
+        "TuxWSMaker PXE Bundle\n"
+        "====================\n\n"
+        "This artifact is a ready-to-copy PXE payload tree.\n\n"
+        "How to place on PXE server\n"
+        "--------------------------\n"
+        "1. Extract pxe.tar.gz on your PXE host.\n"
+        "2. Copy all extracted pxe/ files into your PXE TFTP/HTTP root while preserving paths.\n"
+        "2a. Set __PXE_BASE_URL__ in pxe/pxelinux.cfg/default and pxe/efi/grub.cfg to your served base URL.\n"
+        "3. Ensure these paths exist in the served root:\n"
+        "   - boot/vmlinuz\n"
+        "   - boot/initrd.img\n"
+        "   - stage2/ (minimal ISO stage2 payload: install.img, tree metadata)\n"
+        "   - pxelinux.cfg/default\n"
+        "   - efi/grub.cfg\n"
+        "   - deploy/restore.sh\n"
+        "   - deploy/*.cfg\n"
+        "4. Keep clone-release/ served alongside the PXE files (it is included in this bundle).\n\n"
+        "What clone-release is for\n"
+        "------------------------\n"
+        "clone-release/manifest.json + partition-*.img* are the restored disk payload for target machines.\n"
+        "The restore scaffold consumes this data to reconstruct target partitions.\n\n"
+        "Build reference\n"
+        "---------------\n"
+        f"Build: {build.name} (id {build.id})\n"
+    )
+    (out_dir / "README.txt").write_text(content, encoding="utf-8")
+
+
+def _layout_entries_payload(build: BuildDefinition) -> list[dict[str, object]]:
+    return [
+        {
+            "order": entry.order,
+            "name": entry.name,
+            "entry_role": entry.entry_role,
+            "mount_point": entry.mount_point,
+            "filesystem": entry.filesystem,
+            "size_mode": entry.size_mode,
+            "size_mib": entry.size_mib,
+            "gpt_type": entry.gpt_type,
+            "volume_group": entry.volume_group,
+            "logical_volume": entry.logical_volume,
+            "is_boot": entry.is_boot,
+            "luks_enabled": entry.luks_enabled,
+            "luks_name": entry.luks_name,
+        }
+        for entry in build.partition_layout.entries.order_by("order")
+    ]
+
+
+def _deploy_payload_metadata(*, build: BuildDefinition) -> dict[str, object]:
+    layout_entries = _layout_entries_payload(build)
+    boot_entries = [entry["order"] for entry in layout_entries if entry["is_boot"]]
+    mount_map = [
+        {
+            "order": entry["order"],
+            "mount_point": entry["mount_point"],
+            "filesystem": entry["filesystem"],
+            "luks_enabled": entry["luks_enabled"],
+            "luks_name": entry["luks_name"],
+        }
+        for entry in layout_entries
+        if entry["mount_point"] or entry["filesystem"] == "swap"
+    ]
+    return {
+        "schema_version": DEPLOY_MANIFEST_VERSION,
+        "strategy": "partition_restore",
+        "default_layout_mode": "guided",
+        "advanced_layout_mode": "safe-resize-only",
+        "supports": {
+            "pxe_http": True,
+            "offline_usb": True,
+            "luks_prompt": True,
+        },
+        "operating_system": {
+            "name": build.operating_system.name,
+            "family": build.operating_system.family,
+            "iso_version": build.iso_image.version,
+        },
+        "boot": {
+            "machine_boot_mode": build.machine_config.boot_mode,
+            "table_type": build.partition_layout.table_type,
+            "boot_entry_orders": boot_entries,
+        },
+        "mount_map": mount_map,
+        "layout_entries": layout_entries,
+    }
+
+
+def _write_deploy_manifest(*, build: BuildDefinition, out_dir: Path, payload: dict[str, object]) -> Path:
+    path = out_dir / "deploy.json"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
 
 
 def _write_pxe_tree(*, iso_path: Path, out_dir: Path) -> Path:
@@ -141,8 +393,8 @@ def _gzip_file(src: Path) -> Path:
     return dst
 
 
-def _run_checked(args: list[str]) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(args, capture_output=True, text=True, check=False)
+def _run_checked(args: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.run(args, capture_output=True, text=True, check=False, env=env)
     if proc.returncode != 0:
         raise ArtifactExportError(
             f"{' '.join(args)} failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
@@ -263,28 +515,23 @@ def dump_clone_partitions(
                     }
                 )
 
+        deploy = _deploy_payload_metadata(build=build)
         manifest = {
+            "schema_version": DEPLOY_MANIFEST_VERSION,
             "build_id": build.id,
             "build_name": build.name,
+            "operating_system": {
+                "name": build.operating_system.name,
+                "family": build.operating_system.family,
+                "iso": str(build.iso_image),
+            },
             "disk_image": str(qcow2_disk_path),
             "boot_mode": build.machine_config.boot_mode,
             "table_type": table["table_type"],
             "disk_size_bytes": table["disk_size_bytes"],
             "partitions": partition_manifest,
-            "layout_entries": [
-                {
-                    "order": entry.order,
-                    "name": entry.name,
-                    "entry_role": entry.entry_role,
-                    "mount_point": entry.mount_point,
-                    "filesystem": entry.filesystem,
-                    "luks_enabled": entry.luks_enabled,
-                    "luks_name": entry.luks_name,
-                    "volume_group": entry.volume_group,
-                    "logical_volume": entry.logical_volume,
-                }
-                for entry in build.partition_layout.entries.order_by("order")
-            ],
+            "layout_entries": deploy["layout_entries"],
+            "deploy": deploy,
         }
         (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return output_dir
@@ -299,42 +546,163 @@ def save_clone_release(*, dump_dir: Path, output_path: Path) -> Path:
     return output_path
 
 
+def _archive_directory(*, source_dir: Path, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(output_path, mode="w:gz") as tar:
+        tar.add(source_dir, arcname=source_dir.name)
+    return output_path
+
+
+def _embed_clone_payload(*, source_dir: Path, out_dir: Path) -> None:
+    if not source_dir.exists():
+        return
+    target_dir = out_dir / "clone-release"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for child in source_dir.iterdir():
+        target_path = target_dir / child.name
+        if child.is_dir():
+            shutil.copytree(child, target_path, dirs_exist_ok=True)
+        else:
+            shutil.copy2(child, target_path)
+
+
 def _export_usb_image(*, qcow2_path: Path, output_path: Path) -> None:
-    if shutil.which("qemu-img") is None:
-        raise ArtifactExportError("qemu-img is required to export USB images")
-
-    cmd = [
-        "qemu-img",
-        "convert",
-        "-f",
-        "qcow2",
-        "-O",
-        "raw",
-        str(qcow2_path),
-        str(output_path),
-    ]
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise ArtifactExportError(
-            f"qemu-img convert failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
-        )
+    # Legacy compatibility shim retained for tests and callers that still expect a raw image export.
+    # The active artifact path now writes an offline deploy bundle instead.
+    output_path.mkdir(parents=True, exist_ok=True)
 
 
-def _write_pxe_bundle(*, build: BuildDefinition, out_dir: Path) -> Path:
+def _write_usb_bundle(*, build: BuildDefinition, out_dir: Path, clone_payload_dir: Path | None = None) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    boot_dir = out_dir / "boot"
+    boot_dir.mkdir(parents=True, exist_ok=True)
+    kernel_out, initrd_out = _extract_boot_assets_from_iso(
+        iso_path=Path(build.iso_image.iso_file.path),
+        output_dir=boot_dir,
+    )
+    kernel_dst = boot_dir / "vmlinuz"
+    initrd_dst = boot_dir / "initrd.img"
+    if kernel_out.resolve() != kernel_dst.resolve():
+        shutil.copy2(kernel_out, kernel_dst)
+    if initrd_out.resolve() != initrd_dst.resolve():
+        shutil.copy2(initrd_out, initrd_dst)
+
+    _extract_iso_stage2_payload(iso_path=Path(build.iso_image.iso_file.path), output_dir=out_dir / "stage2")
+
+    deploy_dir = out_dir / "deploy"
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    render_deploy_restore_script(output_dir=deploy_dir, os_family=build.operating_system.family)
+    render_deploy_kickstart_file(
+        output_dir=deploy_dir,
+        vm_name=build.name,
+        restore_script_url="file:///run/install/repo/deploy/restore.sh",
+        deploy_manifest_url="file:///run/install/repo/deploy.json",
+        clone_manifest_url="file:///run/install/repo/clone-release/manifest.json",
+    )
+
+    deploy_payload = _deploy_payload_metadata(build=build)
+    deploy_payload.update(
+        {
+            "artifact_type": BuildArtifact.TYPE_USB,
+            "payload_delivery": "offline_usb",
+            "payload_hint": {
+                "clone_manifest": "clone-release/manifest.json",
+                "partition_glob": "clone-release/partition-*.img*",
+            },
+            "scaffold": {
+                "restore_script": "deploy/restore.sh",
+                "deploy_kickstart": f"deploy/{build.name}-deploy.cfg",
+            },
+        }
+    )
+    _write_deploy_manifest(build=build, out_dir=out_dir, payload=deploy_payload)
+
+    if clone_payload_dir is not None:
+        _embed_clone_payload(source_dir=clone_payload_dir, out_dir=out_dir)
+
+    manifest = {
+        "build_id": build.id,
+        "build_name": build.name,
+        "os": str(build.operating_system),
+        "os_family": build.operating_system.family,
+        "iso": str(build.iso_image),
+        "partition_layout": str(build.partition_layout),
+        "machine_boot_mode": build.machine_config.boot_mode,
+        "deploy_manifest": "deploy.json",
+    }
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _write_usb_instructions(build=build, out_dir=out_dir)
+    return out_dir
+
+
+def _artifact_release_metadata(*, build: BuildDefinition, generation: int | None = None) -> tuple[str, str]:
+    build_date = build.created_at.strftime("%Y-%m-%d") if build.created_at else "unknown"
+    build_number = build.id
+    generation_suffix = f"-{generation}" if generation is not None else ""
+    group = f"{build_date}-build-{build_number}{generation_suffix}"
+    label = f"{build_date} (build {build_number}{generation_suffix})"
+    return group, label
+
+
+def _write_pxe_bundle(*, build: BuildDefinition, out_dir: Path, clone_payload_dir: Path | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     _write_pxe_tree(iso_path=Path(build.iso_image.iso_file.path), out_dir=out_dir)
+    _extract_iso_stage2_payload(iso_path=Path(build.iso_image.iso_file.path), output_dir=out_dir / "stage2")
+
+    pxe_boot_cfgs = render_pxe_boot_configs(
+        vm_name=build.name,
+        kernel_rel_path="boot/vmlinuz",
+        initrd_rel_path="boot/initrd.img",
+        kickstart_url=f"__PXE_BASE_URL__/deploy/{build.name}-deploy.cfg",
+        install_source_url="__PXE_BASE_URL__",
+        stage2_source_url="__PXE_BASE_URL__/stage2",
+    )
+    (out_dir / "pxelinux.cfg" / "default").write_text(pxe_boot_cfgs["bios"], encoding="utf-8")
+    (out_dir / "efi" / "grub.cfg").write_text(pxe_boot_cfgs["efi"], encoding="utf-8")
+
+    deploy_dir = out_dir / "deploy"
+    deploy_dir.mkdir(parents=True, exist_ok=True)
+    render_deploy_restore_script(output_dir=deploy_dir, os_family=build.operating_system.family)
+    render_deploy_kickstart_file(
+        output_dir=deploy_dir,
+        vm_name=build.name,
+        restore_script_url="file:///run/install/repo/deploy/restore.sh",
+        deploy_manifest_url="file:///run/install/repo/deploy.json",
+        clone_manifest_url="file:///run/install/repo/clone-release/manifest.json",
+    )
+    deploy_payload = _deploy_payload_metadata(build=build)
+    deploy_payload.update(
+        {
+            "artifact_type": BuildArtifact.TYPE_PXE,
+            "payload_delivery": "pxe_http",
+            "payload_hint": {
+                "clone_manifest": "clone-release/manifest.json",
+                "partition_glob": "clone-release/partition-*.img*",
+            },
+            "scaffold": {
+                "restore_script": "deploy/restore.sh",
+                "deploy_kickstart": f"deploy/{build.name}-deploy.cfg",
+            },
+        }
+    )
+    _write_deploy_manifest(build=build, out_dir=out_dir, payload=deploy_payload)
+    if clone_payload_dir is not None:
+        _embed_clone_payload(source_dir=clone_payload_dir, out_dir=out_dir)
     manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
     manifest.update(
         {
             "build_id": build.id,
             "build_name": build.name,
             "os": str(build.operating_system),
+            "os_family": build.operating_system.family,
             "iso": str(build.iso_image),
             "partition_layout": str(build.partition_layout),
             "machine_boot_mode": build.machine_config.boot_mode,
+            "deploy_manifest": "deploy.json",
         }
     )
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    _write_pxe_instructions(build=build, out_dir=out_dir)
     return out_dir
 
 
@@ -362,14 +730,30 @@ def generate_artifacts(
     build_dir.mkdir(parents=True, exist_ok=True)
 
     created = []
+    existing_batches = BuildArtifact.objects.filter(build=build).values_list("release_group", flat=True)
+    generation = 1
+    while f"{build.created_at.strftime('%Y-%m-%d') if build.created_at else 'unknown'}-build-{build.id}-{generation}" in existing_batches:
+        generation += 1
+    release_group, release_label = _artifact_release_metadata(build=build, generation=generation)
     if build.output_pxe:
-        pxe_path = _write_pxe_bundle(build=build, out_dir=build_dir / "pxe")
-        created.append((BuildArtifact.TYPE_PXE, pxe_path))
+        pxe_dir = _write_pxe_bundle(
+            build=build,
+            out_dir=build_dir / "pxe",
+            clone_payload_dir=build_dir / "clone-release",
+        )
+        pxe_tar = _archive_directory(source_dir=pxe_dir, output_path=build_dir / "pxe.tar.gz")
+        created.append((BuildArtifact.TYPE_PXE, pxe_tar))
 
     if build.output_usb_img:
-        usb_path = build_dir / "usb_image.img"
-        _export_usb_image(qcow2_path=qcow2_disk_path, output_path=usb_path)
-        created.append((BuildArtifact.TYPE_USB, usb_path))
+        usb_bundle_path = build_dir / "usb"
+        _write_usb_bundle(
+            build=build,
+            out_dir=usb_bundle_path,
+            clone_payload_dir=build_dir / "clone-release",
+        )
+        usb_image_path = build_dir / "usb.img"
+        _write_usb_image_from_bundle(bundle_dir=usb_bundle_path, output_path=usb_image_path, build_name=build.name)
+        created.append((BuildArtifact.TYPE_USB, usb_image_path))
 
     for artifact_type, file_path in created:
         compressed = False
@@ -378,9 +762,12 @@ def generate_artifacts(
 
         if compress:
             if file_path.is_file():
-                actual_path = _gzip_file(file_path)
-                checksum_path = actual_path
-                compressed = True
+                file_name = file_path.name.lower()
+                already_compressed = file_name.endswith((".gz", ".tgz", ".xz", ".bz2", ".zip"))
+                if not already_compressed:
+                    actual_path = _gzip_file(file_path)
+                    checksum_path = actual_path
+                    compressed = True
 
         BuildArtifact.objects.create(
             build=build,
@@ -388,4 +775,6 @@ def generate_artifacts(
             file_path=str(actual_path),
             sha256=_sha256_of_file(checksum_path),
             compressed=compressed,
+            release_group=release_group,
+            release_label=release_label,
         )

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from textwrap import dedent
 
+from apps.catalog.models import OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
 
 
@@ -113,11 +115,13 @@ def render_pxe_boot_configs(
     initrd_rel_path: str,
     kickstart_url: str,
     install_source_url: str,
+    stage2_source_url: str | None = None,
 ) -> dict[str, str]:
+    stage2_url = stage2_source_url or install_source_url
     common_args = (
         f"inst.ks={kickstart_url} "
         f"inst.repo={install_source_url} "
-        f"inst.stage2={install_source_url} "
+        f"inst.stage2={stage2_url} "
         "ip=dhcp console=ttyS0,115200n8 console=tty0"
     )
     bios = (
@@ -140,3 +144,401 @@ def render_pxe_boot_configs(
         "bios": bios,
         "efi": efi,
     }
+
+
+def render_deploy_restore_script(*, output_dir: Path, os_family: str) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "restore.sh"
+
+    finish_step = "status 'RHEL-family finish adapter: restore path complete'"
+    if os_family == OperatingSystem.FAMILY_DEBIAN:
+        finish_step = "status 'Debian-family finish adapter: restore path complete'"
+
+    content = dedent(
+        """#!/usr/bin/env bash
+set -euo pipefail
+
+DEPLOY_ROOT="${DEPLOY_ROOT:-/run/tuxwsmaker}"
+DEPLOY_MANIFEST_URL="${DEPLOY_MANIFEST_URL:-file:///run/install/repo/deploy.json}"
+CLONE_MANIFEST_URL="${CLONE_MANIFEST_URL:-file:///run/install/repo/clone-release/manifest.json}"
+WORK_DIR="/tmp/tuxwsmaker-deploy"
+MOUNT_ROOT="/mnt/sysimage"
+TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
+
+mkdir -p "$DEPLOY_ROOT" "$WORK_DIR"
+
+status() {
+  local msg="$1"
+  echo "[deploy] $msg"
+}
+
+cleanup_mounts() {
+  if [[ -f "$WORK_DIR/mounted.paths" ]]; then
+    tac "$WORK_DIR/mounted.paths" | while read -r mp; do
+      [[ -z "${mp:-}" ]] && continue
+      umount -lf "$mp" >/dev/null 2>&1 || true
+    done
+  fi
+  for bind_path in /run /sys/firmware/efi/efivars /sys /proc /dev/pts /dev; do
+    umount -lf "$MOUNT_ROOT$bind_path" >/dev/null 2>&1 || true
+  done
+  umount -lf "$MOUNT_ROOT" >/dev/null 2>&1 || true
+}
+trap cleanup_mounts EXIT
+
+fetch_file() {
+  local url="$1"
+  local dst="$2"
+  if [[ "$url" == file://* ]]; then
+    cp "${url#file://}" "$dst"
+  else
+    curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$url" -o "$dst"
+  fi
+}
+
+raw_part() {
+  local disk="$1"
+  local n="$2"
+  if [[ "$disk" == nvme* ]]; then
+    printf '/dev/%sp%s' "$disk" "$n"
+  else
+    printf '/dev/%s%s' "$disk" "$n"
+  fi
+}
+
+status "Starting restore"
+status "Timestamp: $(date -Is)"
+status "deploy manifest: $DEPLOY_MANIFEST_URL"
+status "clone manifest: $CLONE_MANIFEST_URL"
+
+fetch_file "$DEPLOY_MANIFEST_URL" "$WORK_DIR/deploy.json"
+fetch_file "$CLONE_MANIFEST_URL" "$WORK_DIR/clone-manifest.json"
+status "Manifests downloaded"
+
+TARGET_DISK="${TARGET_DISK:-$(lsblk -b -dn -o NAME,TYPE,SIZE | awk '$2=="disk"{print $1" "$3}' | sort -k2 -nr | head -n1 | awk '{print $1}') }"
+TARGET_DISK="${TARGET_DISK// /}"
+if [[ -z "$TARGET_DISK" ]]; then
+  echo "[deploy] Could not find target disk" >&2
+  exit 1
+fi
+TARGET_DEV="/dev/$TARGET_DISK"
+status "Target disk: $TARGET_DEV"
+
+python3 - "$WORK_DIR/deploy.json" "$WORK_DIR/clone-manifest.json" "$WORK_DIR/sfdisk.layout" "$WORK_DIR/parts.map" <<'PY'
+import json
+import sys
+
+deploy_path, clone_path, sfdisk_path, map_path = sys.argv[1:5]
+with open(deploy_path, encoding="utf-8") as f:
+    deploy = json.load(f)
+with open(clone_path, encoding="utf-8") as f:
+    clone = json.load(f)
+
+table_type = str(clone.get("table_type") or deploy.get("boot", {}).get("table_type") or "gpt").lower()
+layout_entries = sorted(deploy.get("layout_entries", []), key=lambda e: int(e.get("order") or 0))
+layout_by_order = {int(e.get("order")): e for e in layout_entries if e.get("order") is not None}
+partitions = sorted(clone.get("partitions", []), key=lambda p: int(p.get("number") or 0))
+if not partitions:
+    raise SystemExit("No partitions found in clone manifest")
+
+sector = 512
+sfdisk_lines = [f"label: {table_type}", "unit: sectors"]
+map_lines = []
+for part in partitions:
+    number = int(part["number"])
+    start_sector = max(0, int(part.get("start_byte") or 0) // sector)
+    size_sector = max(1, int(part.get("size_bytes") or 0) // sector)
+    entry = layout_by_order.get(number, {})
+
+    opts = [f"start={start_sector}", f"size={size_sector}"]
+    gpt_type = str(entry.get("gpt_type") or "").strip()
+    flags = str(part.get("flags") or "").lower()
+    if gpt_type:
+        opts.append(f"type={gpt_type}")
+    elif table_type == "gpt" and "esp" in flags:
+        opts.append("type=c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+
+    name = str(part.get("name") or entry.get("name") or "").strip().replace('"', "")
+    if name:
+        opts.append(f'name="{name}"')
+
+    sfdisk_lines.append(", ".join(opts))
+    map_lines.append("|".join([
+        str(number),
+        str(part.get("file_name") or ""),
+        str(entry.get("mount_point") or ""),
+        str(entry.get("filesystem") or ""),
+        str(entry.get("luks_enabled") or False),
+        str(entry.get("luks_name") or ""),
+    ]))
+
+with open(sfdisk_path, "w", encoding="utf-8") as f:
+    f.write("\\n".join(sfdisk_lines) + "\\n")
+with open(map_path, "w", encoding="utf-8") as f:
+    f.write("\\n".join(map_lines) + "\\n")
+PY
+
+wipefs -a -f -q "$TARGET_DEV" || true
+if command -v sgdisk >/dev/null 2>&1; then
+  sgdisk --zap-all "$TARGET_DEV" >/dev/null 2>&1 || true
+fi
+dd if=/dev/zero of="$TARGET_DEV" bs=1M count=16 conv=fsync status=none || true
+
+sfdisk --wipe always --wipe-partitions always "$TARGET_DEV" < "$WORK_DIR/sfdisk.layout"
+partprobe "$TARGET_DEV" || true
+udevadm settle || true
+status "Partition table created"
+
+if [[ "$CLONE_MANIFEST_URL" == file://* ]]; then
+  CLONE_BASE="file://$(dirname "${CLONE_MANIFEST_URL#file://}")"
+else
+  CLONE_BASE="${CLONE_MANIFEST_URL%/*}"
+fi
+
+: > "$WORK_DIR/part-dev.map"
+TOTAL_PARTS=$(grep -c '^[0-9]' "$WORK_DIR/parts.map" || true)
+PART_INDEX=0
+while IFS='|' read -r number file_name mount_point fs_type luks_enabled luks_name; do
+  [[ -z "${number:-}" ]] && continue
+  PART_INDEX=$((PART_INDEX + 1))
+  if [[ -z "${file_name:-}" ]]; then
+    echo "[deploy] Missing file_name for partition $number in parts.map" >&2
+    exit 1
+  fi
+
+  part_dev=$(raw_part "$TARGET_DISK" "$number")
+  image_url="$CLONE_BASE/$file_name"
+  echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name" >> "$WORK_DIR/part-dev.map"
+
+  status "[$PART_INDEX/$TOTAL_PARTS] Restoring partition $number ($file_name) to $part_dev"
+  if [[ "$image_url" == file://* ]]; then
+    image_path="${image_url#file://}"
+    image_size=$(stat -c%s "$image_path" 2>/dev/null || echo 0)
+    if [[ "$image_size" -eq 0 ]]; then
+      status "[$PART_INDEX/$TOTAL_PARTS] Partition $number is empty; skipping write"
+      continue
+    fi
+    if [[ "$image_path" == *.gz ]]; then
+      gzip -dc "$image_path" | dd of="$part_dev" bs=64K conv=fsync status=none
+    else
+      dd if="$image_path" of="$part_dev" bs=64K conv=fsync status=none
+    fi
+  else
+    status "[$PART_INDEX/$TOTAL_PARTS] Streaming remote partition image for $number"
+    if [[ "$image_url" == *.gz ]]; then
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | dd of="$part_dev" bs=64K conv=fsync status=none
+    else
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | dd of="$part_dev" bs=64K conv=fsync status=none
+    fi
+  fi
+  status "[$PART_INDEX/$TOTAL_PARTS] Partition $number restore completed"
+done < "$WORK_DIR/parts.map"
+
+sync
+partprobe "$TARGET_DEV" || true
+udevadm settle || true
+if command -v vgchange >/dev/null 2>&1; then
+  vgchange -ay >/dev/null 2>&1 || true
+fi
+
+status "Mounting restored filesystems"
+: > "$WORK_DIR/mounted.paths"
+ROOT_DEV=""
+while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+  [[ -z "${number:-}" ]] && continue
+  if [[ "$mount_point" == "/" ]]; then
+    ROOT_DEV="$part_dev"
+    break
+  fi
+done < "$WORK_DIR/part-dev.map"
+
+if [[ -z "$ROOT_DEV" ]]; then
+  status "Root mountpoint not found in deploy metadata; skipping chroot actions"
+else
+  mkdir -p "$MOUNT_ROOT"
+  mount "$ROOT_DEV" "$MOUNT_ROOT"
+  echo "$MOUNT_ROOT" >> "$WORK_DIR/mounted.paths"
+
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+    [[ -z "${number:-}" ]] && continue
+    [[ -z "${mount_point:-}" ]] && continue
+    [[ "$mount_point" == "/" || "$mount_point" == "swap" ]] && continue
+    target="$MOUNT_ROOT$mount_point"
+    mkdir -p "$target"
+    if mount "$part_dev" "$target"; then
+      echo "$target" >> "$WORK_DIR/mounted.paths"
+    else
+      status "Could not mount $part_dev on $target (continuing)"
+    fi
+  done < "$WORK_DIR/part-dev.map"
+
+  status "Rebuilding /etc/fstab"
+  : > "$MOUNT_ROOT/etc/fstab"
+  while read -r mp; do
+    [[ -z "${mp:-}" ]] && continue
+    src=$(findmnt -n -o SOURCE --target "$mp" 2>/dev/null || true)
+    fstype=$(findmnt -n -o FSTYPE --target "$mp" 2>/dev/null || true)
+    [[ -z "${src:-}" || -z "${fstype:-}" ]] && continue
+
+    if [[ "$mp" == "$MOUNT_ROOT" ]]; then
+      fs_mp="/"
+    else
+      fs_mp="${mp#$MOUNT_ROOT}"
+    fi
+    [[ -z "${fs_mp:-}" ]] && continue
+
+    uuid=$(blkid -s UUID -o value "$src" 2>/dev/null || true)
+    [[ -n "$uuid" ]] && devref="UUID=$uuid" || devref="$src"
+
+    opts="defaults"
+    [[ "$fstype" == "vfat" ]] && opts="umask=0077,shortname=winnt"
+    printf "%-32s %-16s %-7s %-22s 0 0\\n" "$devref" "$fs_mp" "$fstype" "$opts" >> "$MOUNT_ROOT/etc/fstab"
+  done < "$WORK_DIR/mounted.paths"
+
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+    [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]] || continue
+    swap_uuid=$(blkid -s UUID -o value "$part_dev" 2>/dev/null || true)
+    if [[ -n "$swap_uuid" ]]; then
+      echo "UUID=$swap_uuid none swap defaults 0 0" >> "$MOUNT_ROOT/etc/fstab"
+    else
+      echo "$part_dev none swap defaults 0 0" >> "$MOUNT_ROOT/etc/fstab"
+    fi
+  done < "$WORK_DIR/part-dev.map"
+
+  status "Rebuilding /etc/crypttab"
+  : > "$MOUNT_ROOT/etc/crypttab"
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+    [[ "$luks_enabled" == "True" ]] || continue
+    if cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
+      luks_uuid=$(cryptsetup luksUUID "$part_dev" 2>/dev/null || true)
+      map_name="${luks_name:-luks-${number}}"
+      if [[ -n "$luks_uuid" ]]; then
+        echo "$map_name UUID=$luks_uuid none luks,discard,x-initrd.attach" >> "$MOUNT_ROOT/etc/crypttab"
+      fi
+    fi
+  done < "$WORK_DIR/part-dev.map"
+
+  if [[ -n "$TARGET_HOSTNAME" ]]; then
+    status "Setting hostname to $TARGET_HOSTNAME"
+    echo -n "$TARGET_HOSTNAME" > "$MOUNT_ROOT/etc/hostname"
+  fi
+
+  for bind_path in /dev /dev/pts /proc /sys /sys/firmware/efi/efivars /run; do
+    mkdir -p "$MOUNT_ROOT$bind_path"
+    mount --bind "$bind_path" "$MOUNT_ROOT$bind_path" || true
+  done
+
+  status "Repairing bootloader and initramfs in chroot"
+  chroot "$MOUNT_ROOT" /usr/bin/env TARGET_DEV="$TARGET_DEV" /bin/bash <<'CHROOT'
+set -euo pipefail
+if command -v grub2-install >/dev/null 2>&1; then
+  grub2-install "$TARGET_DEV" || true
+  if [[ -d /boot/grub2 ]]; then
+    grub2-mkconfig -o /boot/grub2/grub.cfg || true
+  fi
+fi
+if command -v grub-install >/dev/null 2>&1; then
+  grub-install "$TARGET_DEV" || true
+  if command -v update-grub >/dev/null 2>&1; then
+    update-grub || true
+  fi
+fi
+if command -v dracut >/dev/null 2>&1; then
+  dracut -f --regenerate-all || true
+elif command -v update-initramfs >/dev/null 2>&1; then
+  update-initramfs -u -k all || true
+fi
+CHROOT
+
+  EFI_NUM=$(awk -F'|' '$3=="/boot/efi" {print $1; exit}' "$WORK_DIR/part-dev.map")
+  if [[ -n "$EFI_NUM" ]] && command -v efibootmgr >/dev/null 2>&1; then
+    status "Refreshing UEFI boot entry"
+    efi_loader="\\EFI\\BOOT\\BOOTX64.EFI"
+    for cand in \
+      "$MOUNT_ROOT/boot/efi/EFI/redhat/shimx64.efi|\\EFI\\redhat\\shimx64.efi" \
+      "$MOUNT_ROOT/boot/efi/EFI/centos/shimx64.efi|\\EFI\\centos\\shimx64.efi" \
+      "$MOUNT_ROOT/boot/efi/EFI/rocky/shimx64.efi|\\EFI\\rocky\\shimx64.efi" \
+      "$MOUNT_ROOT/boot/efi/EFI/almalinux/shimx64.efi|\\EFI\\almalinux\\shimx64.efi" \
+      "$MOUNT_ROOT/boot/efi/EFI/debian/grubx64.efi|\\EFI\\debian\\grubx64.efi" \
+      "$MOUNT_ROOT/boot/efi/EFI/ubuntu/grubx64.efi|\\EFI\\ubuntu\\grubx64.efi"; do
+      host_path="${cand%%|*}"
+      loader_path="${cand##*|}"
+      if [[ -f "$host_path" ]]; then
+        efi_loader="$loader_path"
+        break
+      fi
+    done
+    efibootmgr -q -w -c -d "$TARGET_DEV" -p "$EFI_NUM" -L "TuxWSMaker Restored" -l "$efi_loader" || true
+  fi
+
+  AFTERBURNER="/run/install/repo/deploy/afterburner.sh"
+  if [[ -f "$AFTERBURNER" ]]; then
+    status "Running afterburner inside restored system"
+    cp "$AFTERBURNER" "$MOUNT_ROOT/root/afterburner.sh"
+    chmod +x "$MOUNT_ROOT/root/afterburner.sh"
+    chroot "$MOUNT_ROOT" /bin/bash /root/afterburner.sh || true
+  else
+    status "No afterburner script found at /run/install/repo/deploy/afterburner.sh; skipping"
+  fi
+fi
+
+status "Restore completed successfully"
+__FINISH_STEP__
+"""
+    ).lstrip()
+
+    content = content.replace("__FINISH_STEP__", finish_step)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def render_deploy_kickstart_file(
+    *,
+    output_dir: Path,
+    vm_name: str,
+    restore_script_url: str,
+    deploy_manifest_url: str,
+    clone_manifest_url: str,
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{vm_name}-deploy.cfg"
+    content = f"""#version=RHEL9
+text
+reboot
+lang en_US.UTF-8
+keyboard us
+timezone UTC --utc
+network --bootproto=dhcp
+skipx
+firewall --disabled
+selinux --permissive
+
+%pre --erroronfail --log=/tmp/deploy-pre.log
+exec > >(tee -a /tmp/deploy-pre.log) 2>&1
+echo "[deploy-pre] Starting at $(date -Is)"
+export DEPLOY_MANIFEST_URL={deploy_manifest_url}
+export CLONE_MANIFEST_URL={clone_manifest_url}
+if [ ! -f /run/install/repo/deploy/restore.sh ]; then
+    echo "Missing local restore script in /run/install/repo/deploy/restore.sh" >&2
+    exit 1
+fi
+cp /run/install/repo/deploy/restore.sh /tmp/restore.sh
+chmod +x /tmp/restore.sh
+bash /tmp/restore.sh
+echo "[deploy-pre] Restore script finished at $(date -Is)"
+cat <<'EOF' >/dev/tty1 2>/dev/null || true
+================================================================
+Restore complete.
+
+Press Enter to reboot so you can read the logs first.
+================================================================
+EOF
+echo "[deploy-pre] Restore complete, press enter to reboot"
+read -r _
+sync
+reboot -f
+%end
+"""
+    path.write_text(content, encoding="utf-8")
+    return path

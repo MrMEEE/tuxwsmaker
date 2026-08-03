@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import secrets
 import shlex
+import shutil
 import tempfile
 from pathlib import Path
 
 from celery import shared_task
 from django.conf import settings
 from django.core.cache import cache
+from django.db import DatabaseError
 from django.db import transaction
 
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildLogEntry, BuildMachineConfig, SSHKey
@@ -27,6 +29,7 @@ from apps.builds.services.virtualization import LibvirtVMManager, VMDefinition, 
 from apps.playbooks.services import PlaybookSyncError, checkout_repository, checkout_repository_url
 from apps.realtime.events import publish_event
 from apps.serverconfig.models import ServerConfiguration
+from config.celery import app as celery_app
 
 
 BUILD_TASK_CACHE_TTL_SECONDS = 6 * 60 * 60
@@ -34,6 +37,58 @@ BUILD_TASK_CACHE_TTL_SECONDS = 6 * 60 * 60
 
 def build_task_cache_key(build_id: int) -> str:
     return f"builds:active-task:{build_id}"
+
+
+def _task_state(task_id: str) -> str:
+    if not task_id:
+        return ""
+    try:
+        return str(celery_app.AsyncResult(task_id).state or "").upper()
+    except Exception:
+        return ""
+
+
+def reconcile_stale_build_states_on_startup() -> int:
+    recovered = 0
+    try:
+        stuck_builds = BuildDefinition.objects.filter(
+            status__in=[BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED]
+        ).only("id", "status", "current_step", "runtime_state", "updated_at")
+    except DatabaseError:
+        return 0
+
+    for build in stuck_builds:
+        state = dict(build.runtime_state or {})
+        runtime_task_id = str(state.get("active_task_id") or "").strip()
+        cache_task_id = str(cache.get(build_task_cache_key(build.id)) or "").strip()
+        task_id = runtime_task_id or cache_task_id
+        task_state = _task_state(task_id)
+        if task_state in {"RECEIVED", "STARTED", "RETRY"}:
+            continue
+        if task_state == "PENDING" and task_id and cache_task_id == task_id:
+            # Task is still known in cache and likely queued; leave it alone.
+            continue
+
+        state.pop("active_task_id", None)
+        build.runtime_state = state
+        build.status = BuildDefinition.STATUS_FAILED
+        build.save(update_fields=["status", "runtime_state", "updated_at"])
+
+        message = f"Recovered stale build state after service restart during {build.get_current_step_display()}"
+        BuildLogEntry.objects.create(build=build, stage="error", message=message)
+        publish_event(
+            "builds",
+            "failed",
+            {
+                "build_id": build.id,
+                "status": build.status,
+                "current_step": build.current_step,
+                "error": message,
+            },
+        )
+        recovered += 1
+
+    return recovered
 
 
 def _append_build_log(*, build: BuildDefinition, stage: str, message: str) -> None:
@@ -880,6 +935,19 @@ def _step_save_release(build: BuildDefinition) -> dict[str, str]:
         sha256=_sha256_of_file(release_path),
         compressed=True,
     )
+
+    # Space cleanup: keep published artifacts, remove intermediate staging trees and stale legacy outputs.
+    shutil.rmtree(build_dir / "pxe", ignore_errors=True)
+    shutil.rmtree(build_dir / "usb", ignore_errors=True)
+    for stale_name in (
+        "pxe.tar.gz.gz",
+        "usb_image.img",
+        "usb_image.img.gz",
+    ):
+        stale_path = build_dir / stale_name
+        if stale_path.exists():
+            stale_path.unlink(missing_ok=True)
+
     _save_runtime_state(build, clone_release_path=str(release_path))
     _append_build_log(build=build, stage="done", message="Build completed successfully")
     return {"clone_release_path": str(release_path)}
@@ -898,6 +966,21 @@ def _execute_step(build: BuildDefinition, step: str) -> dict[str, str]:
         return _step_dump_partitions(build)
     if step == BuildDefinition.STEP_SAVE_RELEASE:
         return _step_save_release(build)
+    if step == BuildDefinition.STEP_CLEANUP:
+        vm_name = str(_runtime_state(build).get("vm_name") or _vm_name(build))
+        vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+        vm_manager.remove_domain(name=vm_name, disk_path="")
+        build.status = BuildDefinition.STATUS_DRAFT
+        build.current_step = BuildDefinition.STEP_PENDING
+        build.runtime_state = {
+            "last_completed_step": BuildDefinition.STEP_PENDING,
+            "vm_name": None,
+            "build_ip_address": None,
+            "partition_dump_dir": None,
+            "clone_release_path": None,
+        }
+        build.save(update_fields=["status", "current_step", "runtime_state", "updated_at"])
+        return {"status": BuildDefinition.STATUS_DRAFT}
     raise ProvisioningError(f"Unknown build step '{step}'")
 
 
@@ -954,7 +1037,8 @@ def run_build_step(self, build_id: int, step: str) -> dict[str, str]:
     try:
         result = _execute_step(build, step)
         build.refresh_from_db()
-        _complete_step(build, step=step, keep_running=False)
+        if step != BuildDefinition.STEP_CLEANUP:
+            _complete_step(build, step=step, keep_running=False)
         return {"status": build.status, "step": step, **result}
     except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError) as exc:
         _fail_build(build, step=step, exc=exc)

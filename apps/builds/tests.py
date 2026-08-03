@@ -5,12 +5,14 @@ from django.test import TestCase
 from django.urls import reverse
 from django.conf import settings
 from django.core.cache import cache
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
+from apps.builds.services.artifacts import generate_artifacts
 from apps.builds.views import _recover_stale_build_state
-from apps.workers.tasks import build_task_cache_key
+from apps.workers.tasks import _execute_step, build_task_cache_key, reconcile_stale_build_states_on_startup
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionLayout
 from apps.serverconfig.models import ServerConfiguration
@@ -150,6 +152,58 @@ class BuildManualStepTests(TestCase):
 		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_INSTALL_OS))
 		self.assertFalse(self.build.can_run_manual_step(BuildDefinition.STEP_RUN_PLAYBOOKS))
 
+	def test_cleanup_step_is_available_after_release(self):
+		self.build.runtime_state = {"last_completed_step": BuildDefinition.STEP_SAVE_RELEASE}
+		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_CLEANUP)
+		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_CLEANUP))
+
+	@patch("apps.workers.tasks.LibvirtVMManager.remove_domain")
+	def test_cleanup_step_resets_manual_build_to_start(self, mock_remove_domain):
+		self.build.status = BuildDefinition.STATUS_DRAFT
+		self.build.current_step = BuildDefinition.STEP_SAVE_RELEASE
+		self.build.runtime_state = {
+			"last_completed_step": BuildDefinition.STEP_SAVE_RELEASE,
+			"vm_name": "build-vm",
+		}
+		self.build.save(update_fields=["status", "current_step", "runtime_state", "updated_at"])
+
+		result = _execute_step(self.build, BuildDefinition.STEP_CLEANUP)
+
+		self.build.refresh_from_db()
+		self.assertEqual(result["status"], BuildDefinition.STATUS_DRAFT)
+		self.assertEqual(self.build.current_step, BuildDefinition.STEP_PENDING)
+		self.assertEqual(self.build.runtime_state.get("last_completed_step"), BuildDefinition.STEP_PENDING)
+		self.assertEqual(self.build.runtime_state.get("vm_name"), None)
+		mock_remove_domain.assert_called_once_with(name="build-vm", disk_path="")
+
+	@patch("apps.builds.services.artifacts._write_usb_image_from_bundle")
+	@patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+	@patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+	def test_generate_artifacts_preserves_multiple_release_batches(self, mock_extract, _mock_stage2, mock_write_image):
+		root = Path("/tmp/tuxwsmaker-test-multi-release")
+		shutil.rmtree(root, ignore_errors=True)
+		root.mkdir(parents=True, exist_ok=True)
+
+		kernel = root / "fake-vmlinuz"
+		initrd = root / "fake-initrd"
+		kernel.write_text("k", encoding="utf-8")
+		initrd.write_text("i", encoding="utf-8")
+		mock_extract.return_value = (kernel, initrd)
+
+		def fake_usb_image(*, bundle_dir, output_path, build_name):
+			output_path.write_bytes(b"usb-image")
+			return output_path
+
+		mock_write_image.side_effect = fake_usb_image
+
+		generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+		generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+		artifacts = list(BuildArtifact.objects.filter(build=self.build).order_by("created_at"))
+		self.assertEqual(len(artifacts), 4)
+		self.assertEqual(len({artifact.release_group for artifact in artifacts}), 2)
+		self.assertEqual(len({artifact.release_label for artifact in artifacts}), 2)
+
 	@patch("apps.builds.views.run_build_step.delay")
 	def test_manual_step_route_rejects_missing_prerequisite(self, mock_delay):
 		response = self.client.post(
@@ -179,3 +233,17 @@ class BuildManualStepTests(TestCase):
 		self.assertTrue(recovered)
 		self.build.refresh_from_db()
 		self.assertEqual(self.build.status, BuildDefinition.STATUS_FAILED)
+
+	def test_startup_reconcile_marks_stale_running_build_failed(self):
+		self.build.status = BuildDefinition.STATUS_RUNNING
+		self.build.current_step = BuildDefinition.STEP_SAVE_RELEASE
+		self.build.runtime_state = {"active_task_id": "missing-task-id"}
+		self.build.save(update_fields=["status", "current_step", "runtime_state", "updated_at"])
+		cache.delete(build_task_cache_key(self.build.id))
+
+		recovered_count = reconcile_stale_build_states_on_startup()
+
+		self.build.refresh_from_db()
+		self.assertEqual(recovered_count, 1)
+		self.assertEqual(self.build.status, BuildDefinition.STATUS_FAILED)
+		self.assertEqual(self.build.runtime_state.get("active_task_id"), None)

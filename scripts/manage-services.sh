@@ -155,6 +155,14 @@ run_migrations() {
   )
 }
 
+run_build_state_reconcile() {
+  echo "==> reconciling stale build task states"
+  (
+    cd "${ROOT_DIR}"
+    bash -lc ". .venv/bin/activate && python manage.py reconcile_build_states"
+  )
+}
+
 wait_for_redis() {
   local redis_port="${TUXWS_REDIS_PORT:-6379}"
 
@@ -372,6 +380,12 @@ if [[ "$action" == "restart" ]]; then
       wait_for_redis
     fi
   done
+fi
+
+if [[ "$action" == "start" || "$action" == "restart" ]]; then
+  if needs_django_migration; then
+    run_build_state_reconcile
+  fi
 fi
 
 if [[ "$action" != "status" ]]; then

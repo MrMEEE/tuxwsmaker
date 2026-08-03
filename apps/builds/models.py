@@ -66,6 +66,7 @@ class BuildDefinition(models.Model):
 	STEP_SHUTDOWN = "shutdown"
 	STEP_DUMP_PARTITIONS = "dump_partitions"
 	STEP_SAVE_RELEASE = "save_release"
+	STEP_CLEANUP = "cleanup"
 	STEP_CHOICES = [
 		(STEP_PENDING, "Pending"),
 		(STEP_VM_SHELL, "Create VM"),
@@ -74,6 +75,7 @@ class BuildDefinition(models.Model):
 		(STEP_SHUTDOWN, "Shutdown"),
 		(STEP_DUMP_PARTITIONS, "Dump Partitions"),
 		(STEP_SAVE_RELEASE, "Save Release"),
+		(STEP_CLEANUP, "Cleanup"),
 	]
 	STEP_SEQUENCE = [
 		STEP_VM_SHELL,
@@ -82,6 +84,7 @@ class BuildDefinition(models.Model):
 		STEP_SHUTDOWN,
 		STEP_DUMP_PARTITIONS,
 		STEP_SAVE_RELEASE,
+		STEP_CLEANUP,
 	]
 
 	name = models.CharField(max_length=120, unique=True)
@@ -180,6 +183,8 @@ class BuildArtifact(models.Model):
 	file_path = models.CharField(max_length=500)
 	sha256 = models.CharField(max_length=64)
 	compressed = models.BooleanField(default=False)
+	release_group = models.CharField(max_length=64, default="default", blank=True)
+	release_label = models.CharField(max_length=64, default="latest", blank=True)
 	created_at = models.DateTimeField(auto_now_add=True)
 
 	class Meta:

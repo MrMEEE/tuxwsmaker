@@ -106,6 +106,11 @@
     <div class="card">
       <div class="card-header"><h6 class="mb-0">Artifacts</h6></div>
       <div class="card-body">
+        <div class="alert alert-light border small" role="alert">
+          <div><strong>USB image:</strong> Downloaded as <code>usb.img</code> (or <code>usb.img.gz</code>). Flash directly to USB media (for example with <code>dd</code>).</div>
+          <div class="mt-1"><strong>PXE bundle:</strong> Downloaded as <code>pxe.tar.gz</code>. Extract and copy the contents of <code>pxe/</code> into your PXE TFTP/HTTP root while preserving folder paths.</div>
+          <div class="mt-1"><strong>clone-release:</strong> Partition payload images and manifest used by the restore flow to reconstruct the target disk.</div>
+        </div>
         <ul id="artifact-list" class="list-group">
           {% for artifact in build.artifacts.all %}
           <li class="list-group-item">
