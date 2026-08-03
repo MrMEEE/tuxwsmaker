@@ -172,6 +172,56 @@ status() {
   echo "[deploy] $msg"
 }
 
+write_sparse_blocks() {
+  local source_path="$1"
+  local target_path="$2"
+  local block_size="${3:-65536}"
+
+  if command -v blkdiscard >/dev/null 2>&1; then
+    blkdiscard -f "$target_path" >/dev/null 2>&1 || true
+  fi
+
+  python3 - "$source_path" "$target_path" "$block_size" <<'PY'
+import sys
+
+source_path, target_path, block_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(source_path, 'rb') as source_handle, open(target_path, 'r+b', buffering=0) as target_handle:
+    offset = 0
+    while True:
+        chunk = source_handle.read(block_size)
+        if not chunk:
+            break
+        if any(chunk):
+            target_handle.seek(offset)
+            target_handle.write(chunk)
+        offset += len(chunk)
+PY
+}
+
+sparse_restore_stream() {
+  local target_path="$1"
+  local block_size="${2:-65536}"
+
+  if command -v blkdiscard >/dev/null 2>&1; then
+    blkdiscard -f "$target_path" >/dev/null 2>&1 || true
+  fi
+
+  python3 -c 'import sys
+target_path = sys.argv[1]
+block_size = int(sys.argv[2])
+with open(target_path, "r+b", buffering=0) as target_handle:
+    offset = 0
+    stdin = sys.stdin.buffer
+    while True:
+        chunk = stdin.read(block_size)
+        if not chunk:
+            break
+        if any(chunk):
+            target_handle.seek(offset)
+            target_handle.write(chunk)
+        offset += len(chunk)' "$target_path" "$block_size"
+}
+
 cleanup_mounts() {
   if [[ -f "$WORK_DIR/mounted.paths" ]]; then
     tac "$WORK_DIR/mounted.paths" | while read -r mp; do
@@ -319,16 +369,18 @@ while IFS='|' read -r number file_name mount_point fs_type luks_enabled luks_nam
       continue
     fi
     if [[ "$image_path" == *.gz ]]; then
-      gzip -dc "$image_path" | dd of="$part_dev" bs=64K conv=fsync status=none
+      status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
+      gzip -dc "$image_path" | sparse_restore_stream "$part_dev" 65536
     else
-      dd if="$image_path" of="$part_dev" bs=64K conv=fsync status=none
+      status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
+      write_sparse_blocks "$image_path" "$part_dev" 65536
     fi
   else
     status "[$PART_INDEX/$TOTAL_PARTS] Streaming remote partition image for $number"
     if [[ "$image_url" == *.gz ]]; then
-      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | dd of="$part_dev" bs=64K conv=fsync status=none
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | sparse_restore_stream "$part_dev" 65536
     else
-      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | dd of="$part_dev" bs=64K conv=fsync status=none
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$part_dev" 65536
     fi
   fi
   status "[$PART_INDEX/$TOTAL_PARTS] Partition $number restore completed"
@@ -535,7 +587,7 @@ Press Enter to reboot so you can read the logs first.
 ================================================================
 EOF
 echo "[deploy-pre] Restore complete, press enter to reboot"
-read -r _
+read -r _ </dev/tty1 2>/dev/null || read -r _
 sync
 reboot -f
 %end
