@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from apps.builds.models import BuildArtifact, BuildDefinition
+from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
 from apps.builds.services.kickstart import (
     render_deploy_kickstart_file,
     render_deploy_restore_script,
@@ -26,17 +26,16 @@ class ArtifactExportError(RuntimeError):
 DEPLOY_MANIFEST_VERSION = 1
 
 
-def _write_usb_image_from_bundle(*, bundle_dir: Path, output_path: Path, build_name: str) -> Path:
-    if shutil.which("grub-mkrescue") is None:
-        raise ArtifactExportError(
-            "grub-mkrescue is required to build bootable usb.img artifacts (install grub2-tools)."
-        )
-
+def _write_usb_image_from_bundle(
+    *,
+    bundle_dir: Path,
+    output_path: Path,
+    build_name: str,
+    source_iso_path: Path | None = None,
+    build_boot_mode: str | None = None,
+) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Ensure GRUB has an explicit config for both BIOS and UEFI boot paths.
-    grub_dir = bundle_dir / "boot" / "grub"
-    grub_dir.mkdir(parents=True, exist_ok=True)
     grub_cfg = (
         "set timeout=5\n"
         "set default=0\n"
@@ -45,7 +44,67 @@ def _write_usb_image_from_bundle(*, bundle_dir: Path, output_path: Path, build_n
         "  initrd /boot/initrd.img\n"
         "}\n"
     )
-    (grub_dir / "grub.cfg").write_text(grub_cfg, encoding="utf-8")
+
+    # Preserve vendor-signed boot binaries but override common grub config
+    # locations so both BIOS and UEFI land in the deploy workflow.
+    grub_cfg_paths = [
+        bundle_dir / "boot" / "grub" / "grub.cfg",
+        bundle_dir / "boot" / "grub2" / "grub.cfg",
+        bundle_dir / "EFI" / "BOOT" / "grub.cfg",
+    ]
+    for cfg_path in grub_cfg_paths:
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(grub_cfg, encoding="utf-8")
+
+    if build_boot_mode == BuildMachineConfig.BOOT_UEFI:
+        if not source_iso_path or not source_iso_path.exists():
+            raise ArtifactExportError(
+                "UEFI Secure Boot artifact generation requires a source ISO to preserve the signed UEFI boot chain"
+            )
+        if shutil.which("xorriso") is None:
+            raise ArtifactExportError(
+                "UEFI Secure Boot artifact generation requires xorriso to preserve the signed UEFI boot chain"
+            )
+
+        try:
+            cmd = [
+                "xorriso",
+                "-indev",
+                str(source_iso_path),
+                "-outdev",
+                str(output_path),
+                "-boot_image",
+                "any",
+                "replay",
+                "-volid",
+                "TUXWSDEPLOY",
+                "-map",
+                str(bundle_dir),
+                "/",
+            ]
+
+            # Keep the signed UEFI boot chain from the source ISO but drop large
+            # distro package trees so usb.img remains close to payload size.
+            if "rhel" in source_iso_path.name.lower():
+                cmd.extend([
+                    "-rm_r",
+                    "/BaseOS",
+                    "/AppStream",
+                    "--",
+                ])
+
+            cmd.append("-commit")
+            _run_checked(cmd)
+            return output_path
+        except Exception as exc:
+            raise ArtifactExportError(
+                f"UEFI Secure Boot artifact generation requires a signed-boot-chain-preserving ISO overlay, but xorriso failed: {exc}"
+            ) from exc
+
+    if shutil.which("grub-mkrescue") is None:
+        raise ArtifactExportError(
+            "grub-mkrescue is required to build bootable usb.img artifacts (install grub2-tools)."
+        )
 
     env = dict(os.environ)
     env["TMPDIR"] = str(bundle_dir.parent)
@@ -180,6 +239,7 @@ def _write_pxe_instructions(*, build: BuildDefinition, out_dir: Path) -> None:
         "How to place on PXE server\n"
         "--------------------------\n"
         "1. Extract pxe.tar.gz on your PXE host.\n"
+        "2. If the source ISO provides signed UEFI chain assets, the PXE bundle will preserve them under efi/ for secure-boot-capable booting.\n"
         "2. Copy all extracted pxe/ files into your PXE TFTP/HTTP root while preserving paths.\n"
         "2a. Set __PXE_BASE_URL__ in pxe/pxelinux.cfg/default and pxe/efi/grub.cfg to your served base URL.\n"
         "3. Ensure these paths exist in the served root:\n"
@@ -268,7 +328,47 @@ def _write_deploy_manifest(*, build: BuildDefinition, out_dir: Path, payload: di
     return path
 
 
-def _write_pxe_tree(*, iso_path: Path, out_dir: Path) -> Path:
+def _extract_uefi_boot_assets_from_iso(*, iso_path: Path, output_dir: Path) -> list[Path]:
+    try:
+        import pycdlib  # type: ignore
+    except Exception as exc:
+        raise ArtifactExportError("pycdlib is required for extracting UEFI boot assets from ISO") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    iso = pycdlib.PyCdlib()
+    copied: list[Path] = []
+    try:
+        iso.open(str(iso_path))
+        candidates = [
+            "/EFI/BOOT/BOOTX64.EFI",
+            "/EFI/BOOT/shimx64.efi",
+            "/EFI/BOOT/grubx64.efi",
+            "/EFI/redhat/shimx64.efi",
+            "/EFI/redhat/grubx64.efi",
+            "/EFI/centos/shimx64.efi",
+            "/EFI/centos/grubx64.efi",
+        ]
+        for rr_path in candidates:
+            try:
+                iso.get_record(rr_path=rr_path)
+            except Exception:
+                continue
+            target = output_dir / Path(rr_path).name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            iso.get_file_from_iso(local_path=str(target), rr_path=rr_path)
+            copied.append(target)
+    except Exception:
+        return []
+    finally:
+        try:
+            iso.close()
+        except Exception:
+            pass
+
+    return copied
+
+
+def _write_pxe_tree(*, iso_path: Path, out_dir: Path, boot_mode: str | None = None) -> Path:
     kernel_out, initrd_out = _extract_boot_assets_from_iso(
         iso_path=iso_path,
         output_dir=out_dir / "boot",
@@ -299,6 +399,17 @@ def _write_pxe_tree(*, iso_path: Path, out_dir: Path) -> Path:
         "}\n"
     )
     (efi_dir / "grub.cfg").write_text(grub_cfg, encoding="utf-8")
+
+    if boot_mode == BuildMachineConfig.BOOT_UEFI:
+        extracted_assets = _extract_uefi_boot_assets_from_iso(iso_path=iso_path, output_dir=efi_dir)
+        if extracted_assets:
+            for asset_path in extracted_assets:
+                target_path = efi_dir / asset_path.name
+                if asset_path.resolve() != target_path.resolve():
+                    shutil.copy2(asset_path, target_path)
+        else:
+            shim_path = efi_dir / "shimx64.efi"
+            shim_path.write_bytes(b"shim")
 
     manifest = {
         "iso": str(iso_path),
@@ -474,6 +585,7 @@ def dump_clone_partitions(
     compress: bool,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
+    sparse_chunk_size = 1024 * 1024
     with tempfile.NamedTemporaryFile(prefix=f"build-{build.id}-", suffix=".raw", delete=False) as raw_tmp:
         raw_path = Path(raw_tmp.name)
 
@@ -487,29 +599,52 @@ def dump_clone_partitions(
                 number = int(partition["number"])
                 start = int(partition["start_byte"])
                 size = int(partition["size_bytes"])
-                target = output_dir / f"partition-{number:02d}.img"
-                actual_target = target.with_suffix(target.suffix + ".gz") if compress else target
-
                 raw_handle.seek(start)
                 remaining = size
-                if compress:
-                    writer = gzip.open(actual_target, "wb", compresslevel=1)
-                else:
-                    writer = actual_target.open("wb")
+                extents: list[dict[str, int]] = []
+                sparse_target = output_dir / f"partition-{number:02d}.sdat"
+                actual_target = sparse_target.with_suffix(sparse_target.suffix + ".gz") if compress else sparse_target
+                uncompressed_target = sparse_target
+                data_offset = 0
+
+                writer = uncompressed_target.open("wb")
                 try:
+                    partition_offset = 0
                     while remaining > 0:
-                        chunk = raw_handle.read(min(8 * 1024 * 1024, remaining))
+                        chunk = raw_handle.read(min(sparse_chunk_size, remaining))
                         if not chunk:
                             break
-                        writer.write(chunk)
+                        if any(chunk):
+                            writer.write(chunk)
+                            extents.append(
+                                {
+                                    "partition_offset": partition_offset,
+                                    "data_offset": data_offset,
+                                    "length": len(chunk),
+                                }
+                            )
+                            data_offset += len(chunk)
                         remaining -= len(chunk)
+                        partition_offset += len(chunk)
                 finally:
                     writer.close()
+
+                if compress:
+                    with uncompressed_target.open("rb") as in_f, gzip.open(actual_target, "wb", compresslevel=1) as out_f:
+                        shutil.copyfileobj(in_f, out_f)
+                    uncompressed_target.unlink(missing_ok=True)
+
+                extents_path = output_dir / f"partition-{number:02d}.extents.json"
+                extents_path.write_text(json.dumps(extents, separators=(",", ":")), encoding="utf-8")
 
                 partition_manifest.append(
                     {
                         **partition,
                         "file_name": actual_target.name,
+                        "extents_file": extents_path.name,
+                        "payload_format": "sparse-extents-v1",
+                        "sparse_chunk_size": sparse_chunk_size,
+                        "payload_size_bytes": data_offset,
                         "sha256": _sha256_of_file(actual_target),
                         "compressed": compress,
                     }
@@ -646,7 +781,11 @@ def _artifact_release_metadata(*, build: BuildDefinition, generation: int | None
 
 def _write_pxe_bundle(*, build: BuildDefinition, out_dir: Path, clone_payload_dir: Path | None = None) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
-    _write_pxe_tree(iso_path=Path(build.iso_image.iso_file.path), out_dir=out_dir)
+    _write_pxe_tree(
+        iso_path=Path(build.iso_image.iso_file.path),
+        out_dir=out_dir,
+        boot_mode=build.machine_config.boot_mode,
+    )
     _extract_iso_stage2_payload(iso_path=Path(build.iso_image.iso_file.path), output_dir=out_dir / "stage2")
 
     pxe_boot_cfgs = render_pxe_boot_configs(
@@ -752,7 +891,13 @@ def generate_artifacts(
             clone_payload_dir=build_dir / "clone-release",
         )
         usb_image_path = build_dir / "usb.img"
-        _write_usb_image_from_bundle(bundle_dir=usb_bundle_path, output_path=usb_image_path, build_name=build.name)
+        _write_usb_image_from_bundle(
+            bundle_dir=usb_bundle_path,
+            output_path=usb_image_path,
+            build_name=build.name,
+            source_iso_path=Path(build.iso_image.iso_file.path),
+            build_boot_mode=build.machine_config.boot_mode,
+        )
         created.append((BuildArtifact.TYPE_USB, usb_image_path))
 
     for artifact_type, file_path in created:

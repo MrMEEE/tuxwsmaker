@@ -55,6 +55,7 @@ def _extract_last_known_vm_ip(build: BuildDefinition) -> str:
 
 def _probe_vm_ssh_ready(build: BuildDefinition) -> tuple[bool, bool, str]:
 	vm_name = f"build-{build.id}"
+	state = dict(build.runtime_state or {})
 	try:
 		vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
 		vm_exists = vm_manager.domain_exists(vm_name)
@@ -66,14 +67,18 @@ def _probe_vm_ssh_ready(build: BuildDefinition) -> tuple[bool, bool, str]:
 	except Exception:
 		return False, False, ""
 
-	ip_address = ""
+	ip_address = str(state.get("build_ip_address") or "").strip()
+	vm_mac_address = str(state.get("vm_mac_address") or "").strip()
 	try:
-		ip_address = vm_manager.current_ipv4(
-			domain_name=vm_name,
-			network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
-		) or ""
+		if not ip_address:
+			ip_address = vm_manager.current_ipv4(
+				domain_name=vm_name,
+				network_name=BuildMachineConfig.FIXED_LIBVIRT_NETWORK,
+				mac_address=vm_mac_address,
+			) or ""
 	except Exception:
-		ip_address = ""
+		if not ip_address:
+			ip_address = ""
 	if not ip_address:
 		ip_address = _extract_last_known_vm_ip(build)
 	if not ip_address:
@@ -112,6 +117,8 @@ def _probe_vm_ssh_ready(build: BuildDefinition) -> tuple[bool, bool, str]:
 		]
 		proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=5)
 		return True, proc.returncode == 0, ip_address
+	except (subprocess.TimeoutExpired, OSError):
+		return True, False, ip_address
 	finally:
 		key_path.unlink(missing_ok=True)
 

@@ -198,6 +198,40 @@ with open(source_path, 'rb') as source_handle, open(target_path, 'r+b', bufferin
 PY
 }
 
+apply_sparse_extents_file() {
+  local payload_path="$1"
+  local extents_path="$2"
+  local target_path="$3"
+  local compressed_flag="$4"
+
+  if command -v blkdiscard >/dev/null 2>&1; then
+    blkdiscard -f "$target_path" >/dev/null 2>&1 || true
+  fi
+
+  python3 - "$payload_path" "$extents_path" "$target_path" "$compressed_flag" <<'PY'
+import gzip
+import json
+import sys
+
+payload_path, extents_path, target_path, compressed_flag = sys.argv[1:5]
+with open(extents_path, encoding="utf-8") as extents_file:
+    extents = json.load(extents_file)
+
+opener = gzip.open if compressed_flag == "1" else open
+with opener(payload_path, "rb") as payload_handle, open(target_path, "r+b", buffering=0) as target_handle:
+    for extent in extents:
+        length = int(extent.get("length") or 0)
+        if length <= 0:
+            continue
+        part_offset = int(extent.get("partition_offset") or 0)
+        chunk = payload_handle.read(length)
+        if len(chunk) != length:
+            raise RuntimeError(f"Sparse payload truncated for {payload_path}: expected {length} bytes, got {len(chunk)}")
+        target_handle.seek(part_offset)
+        target_handle.write(chunk)
+PY
+}
+
 sparse_restore_stream() {
   local target_path="$1"
   local block_size="${2:-65536}"
@@ -265,6 +299,19 @@ fetch_file "$DEPLOY_MANIFEST_URL" "$WORK_DIR/deploy.json"
 fetch_file "$CLONE_MANIFEST_URL" "$WORK_DIR/clone-manifest.json"
 status "Manifests downloaded"
 
+SOURCE_BOOT_MODE="$(python3 - "$WORK_DIR/deploy.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as f:
+  deploy = json.load(f)
+
+mode = str((deploy.get('boot') or {}).get('machine_boot_mode') or '').strip().lower()
+print(mode)
+PY
+)"
+status "Source image boot mode: ${SOURCE_BOOT_MODE:-unknown}"
+
 TARGET_DISK="${TARGET_DISK:-$(lsblk -b -dn -o NAME,TYPE,SIZE | awk '$2=="disk"{print $1" "$3}' | sort -k2 -nr | head -n1 | awk '{print $1}') }"
 TARGET_DISK="${TARGET_DISK// /}"
 if [[ -z "$TARGET_DISK" ]]; then
@@ -307,6 +354,10 @@ for part in partitions:
         opts.append(f"type={gpt_type}")
     elif table_type == "gpt" and "esp" in flags:
         opts.append("type=c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
+    elif table_type == "gpt" and ("bios_grub" in flags or "bios grub" in flags):
+      opts.append("type=21686148-6449-6e6f-744e-656564454649")
+    elif table_type != "gpt" and "boot" in flags:
+      opts.append("bootable")
 
     name = str(part.get("name") or entry.get("name") or "").strip().replace('"', "")
     if name:
@@ -316,6 +367,9 @@ for part in partitions:
     map_lines.append("|".join([
         str(number),
         str(part.get("file_name") or ""),
+      str(part.get("extents_file") or ""),
+      str(part.get("payload_format") or "raw"),
+      str(part.get("compressed") or False),
         str(entry.get("mount_point") or ""),
         str(entry.get("filesystem") or ""),
         str(entry.get("luks_enabled") or False),
@@ -348,7 +402,7 @@ fi
 : > "$WORK_DIR/part-dev.map"
 TOTAL_PARTS=$(grep -c '^[0-9]' "$WORK_DIR/parts.map" || true)
 PART_INDEX=0
-while IFS='|' read -r number file_name mount_point fs_type luks_enabled luks_name; do
+while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name; do
   [[ -z "${number:-}" ]] && continue
   PART_INDEX=$((PART_INDEX + 1))
   if [[ -z "${file_name:-}" ]]; then
@@ -363,12 +417,22 @@ while IFS='|' read -r number file_name mount_point fs_type luks_enabled luks_nam
   status "[$PART_INDEX/$TOTAL_PARTS] Restoring partition $number ($file_name) to $part_dev"
   if [[ "$image_url" == file://* ]]; then
     image_path="${image_url#file://}"
+    extents_path=""
+    if [[ -n "${extents_file:-}" ]]; then
+      extents_url="$CLONE_BASE/$extents_file"
+      extents_path="${extents_url#file://}"
+    fi
     image_size=$(stat -c%s "$image_path" 2>/dev/null || echo 0)
     if [[ "$image_size" -eq 0 ]]; then
       status "[$PART_INDEX/$TOTAL_PARTS] Partition $number is empty; skipping write"
       continue
     fi
-    if [[ "$image_path" == *.gz ]]; then
+    if [[ "${payload_format:-raw}" == "sparse-extents-v1" && -n "${extents_path:-}" ]]; then
+      status "[$PART_INDEX/$TOTAL_PARTS] Applying sparse extents for partition $number"
+      compressed_flag=0
+      [[ "${compressed:-False}" == "True" || "${compressed:-false}" == "true" ]] && compressed_flag=1
+      apply_sparse_extents_file "$image_path" "$extents_path" "$part_dev" "$compressed_flag"
+    elif [[ "$image_path" == *.gz ]]; then
       status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
       gzip -dc "$image_path" | sparse_restore_stream "$part_dev" 65536
     else
@@ -377,7 +441,16 @@ while IFS='|' read -r number file_name mount_point fs_type luks_enabled luks_nam
     fi
   else
     status "[$PART_INDEX/$TOTAL_PARTS] Streaming remote partition image for $number"
-    if [[ "$image_url" == *.gz ]]; then
+    if [[ "${payload_format:-raw}" == "sparse-extents-v1" && -n "${extents_file:-}" ]]; then
+      tmp_payload="$WORK_DIR/partition-${number}.payload"
+      tmp_extents="$WORK_DIR/partition-${number}.extents.json"
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" -o "$tmp_payload"
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$CLONE_BASE/$extents_file" -o "$tmp_extents"
+      compressed_flag=0
+      [[ "${compressed:-False}" == "True" || "${compressed:-false}" == "true" ]] && compressed_flag=1
+      apply_sparse_extents_file "$tmp_payload" "$tmp_extents" "$part_dev" "$compressed_flag"
+      rm -f "$tmp_payload" "$tmp_extents"
+    elif [[ "$image_url" == *.gz ]]; then
       curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | sparse_restore_stream "$part_dev" 65536
     else
       curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$part_dev" 65536
@@ -481,19 +554,39 @@ else
   done
 
   status "Repairing bootloader and initramfs in chroot"
-  chroot "$MOUNT_ROOT" /usr/bin/env TARGET_DEV="$TARGET_DEV" /bin/bash <<'CHROOT'
+  BOOT_MODE="bios"
+  if [[ -d /sys/firmware/efi ]]; then
+    BOOT_MODE="uefi"
+  fi
+  status "Boot mode detected: $BOOT_MODE"
+
+  if [[ -n "${SOURCE_BOOT_MODE:-}" && "$SOURCE_BOOT_MODE" != "$BOOT_MODE" ]]; then
+    status "ERROR: Source image boot mode ($SOURCE_BOOT_MODE) does not match target firmware mode ($BOOT_MODE)"
+    status "ERROR: Rebuild the source image with matching boot mode before deploy restore"
+    exit 1
+  fi
+
+  chroot "$MOUNT_ROOT" /usr/bin/env TARGET_DEV="$TARGET_DEV" BOOT_MODE="$BOOT_MODE" /bin/bash <<'CHROOT'
 set -euo pipefail
-if command -v grub2-install >/dev/null 2>&1; then
-  grub2-install "$TARGET_DEV" || true
-  if [[ -d /boot/grub2 ]]; then
-    grub2-mkconfig -o /boot/grub2/grub.cfg || true
+if [[ "${BOOT_MODE:-bios}" == "bios" ]]; then
+  if command -v grub2-install >/dev/null 2>&1 && [[ -x /usr/lib/grub/i386-pc/modinfo.sh ]]; then
+    grub2-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
+  elif command -v grub-install >/dev/null 2>&1 && [[ -d /usr/lib/grub/i386-pc ]]; then
+    grub-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
+  fi
+else
+  if command -v grub2-install >/dev/null 2>&1; then
+    grub2-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
+  elif command -v grub-install >/dev/null 2>&1; then
+    grub-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
   fi
 fi
-if command -v grub-install >/dev/null 2>&1; then
-  grub-install "$TARGET_DEV" || true
-  if command -v update-grub >/dev/null 2>&1; then
-    update-grub || true
-  fi
+
+if [[ -d /boot/grub2 ]] && command -v grub2-mkconfig >/dev/null 2>&1; then
+  grub2-mkconfig -o /boot/grub2/grub.cfg || true
+fi
+if command -v update-grub >/dev/null 2>&1; then
+  update-grub || true
 fi
 if command -v dracut >/dev/null 2>&1; then
   dracut -f --regenerate-all || true
@@ -502,8 +595,34 @@ elif command -v update-initramfs >/dev/null 2>&1; then
 fi
 CHROOT
 
+  if [[ "$BOOT_MODE" == "bios" && ! -f "$MOUNT_ROOT/tmp/tuxwsmaker-grub-install.ok" ]]; then
+    status "Chroot BIOS grub install unavailable; attempting installer-environment fallback"
+    if command -v grub2-install >/dev/null 2>&1 && [[ -d "$MOUNT_ROOT/boot/grub2" ]]; then
+      grub2-install --boot-directory="$MOUNT_ROOT/boot" "$TARGET_DEV" || true
+    elif command -v grub-install >/dev/null 2>&1 && [[ -d "$MOUNT_ROOT/boot/grub" || -d "$MOUNT_ROOT/boot/grub2" ]]; then
+      grub-install --boot-directory="$MOUNT_ROOT/boot" "$TARGET_DEV" || true
+    fi
+  elif [[ -f "$MOUNT_ROOT/tmp/tuxwsmaker-grub-install.ok" ]]; then
+    status "Bootloader install completed inside chroot"
+  fi
+  rm -f "$MOUNT_ROOT/tmp/tuxwsmaker-grub-install.ok" || true
+
+  if [[ "$BOOT_MODE" == "bios" ]]; then
+    status "Verifying BIOS bootloader on $TARGET_DEV"
+    mbr_sig=$(dd if="$TARGET_DEV" bs=1 skip=510 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [[ "$mbr_sig" != "55aa" ]]; then
+      status "ERROR: Missing MBR boot signature (expected 55aa, got ${mbr_sig:-none})"
+      exit 1
+    fi
+    if dd if="$TARGET_DEV" bs=440 count=1 2>/dev/null | cmp -s - /dev/zero; then
+      status "ERROR: MBR boot code area is empty after restore"
+      exit 1
+    fi
+    status "BIOS bootloader verification passed"
+  fi
+
   EFI_NUM=$(awk -F'|' '$3=="/boot/efi" {print $1; exit}' "$WORK_DIR/part-dev.map")
-  if [[ -n "$EFI_NUM" ]] && command -v efibootmgr >/dev/null 2>&1; then
+  if [[ -d /sys/firmware/efi && -n "$EFI_NUM" ]] && command -v efibootmgr >/dev/null 2>&1; then
     status "Refreshing UEFI boot entry"
     efi_loader="\\EFI\\BOOT\\BOOTX64.EFI"
     for cand in \
@@ -567,7 +686,9 @@ firewall --disabled
 selinux --permissive
 
 %pre --erroronfail --log=/tmp/deploy-pre.log
-exec > >(tee -a /tmp/deploy-pre.log) 2>&1
+if [ -c /dev/console ]; then
+  exec > >(tee /dev/console) 2>&1
+fi
 echo "[deploy-pre] Starting at $(date -Is)"
 export DEPLOY_MANIFEST_URL={deploy_manifest_url}
 export CLONE_MANIFEST_URL={clone_manifest_url}
@@ -579,17 +700,20 @@ cp /run/install/repo/deploy/restore.sh /tmp/restore.sh
 chmod +x /tmp/restore.sh
 bash /tmp/restore.sh
 echo "[deploy-pre] Restore script finished at $(date -Is)"
-cat <<'EOF' >/dev/tty1 2>/dev/null || true
+cat <<'EOF'
 ================================================================
 Restore complete.
 
-Press Enter to reboot so you can read the logs first.
+Press Enter to power off. Then remove install media and boot from disk.
 ================================================================
 EOF
-echo "[deploy-pre] Restore complete, press enter to reboot"
-read -r _ </dev/tty1 2>/dev/null || read -r _
+echo "[deploy-pre] Restore complete, press enter to power off"
+if ! read -r _ < /dev/console; then
+  echo "[deploy-pre] tty input unavailable; pausing 120 seconds before power off"
+  sleep 120
+fi
 sync
-reboot -f
+poweroff -f || halt -f
 %end
 """
     path.write_text(content, encoding="utf-8")

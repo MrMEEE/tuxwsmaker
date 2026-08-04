@@ -5,13 +5,14 @@ from django.test import TestCase
 from django.urls import reverse
 from django.conf import settings
 from django.core.cache import cache
+import subprocess
 import shutil
 from pathlib import Path
 from unittest.mock import patch
 
-from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
+from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig, SSHKey
 from apps.builds.services.artifacts import generate_artifacts
-from apps.builds.views import _recover_stale_build_state
+from apps.builds.views import _probe_vm_ssh_ready, _recover_stale_build_state
 from apps.workers.tasks import _execute_step, build_task_cache_key, reconcile_stale_build_states_on_startup
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionLayout
@@ -190,7 +191,7 @@ class BuildManualStepTests(TestCase):
 		initrd.write_text("i", encoding="utf-8")
 		mock_extract.return_value = (kernel, initrd)
 
-		def fake_usb_image(*, bundle_dir, output_path, build_name):
+		def fake_usb_image(*, bundle_dir, output_path, build_name, source_iso_path=None, build_boot_mode=None):
 			output_path.write_bytes(b"usb-image")
 			return output_path
 
@@ -247,3 +248,78 @@ class BuildManualStepTests(TestCase):
 		self.assertEqual(recovered_count, 1)
 		self.assertEqual(self.build.status, BuildDefinition.STATUS_FAILED)
 		self.assertEqual(self.build.runtime_state.get("active_task_id"), None)
+
+
+class BuildVmSshProbeTests(TestCase):
+	def setUp(self):
+		os_obj = OperatingSystem.objects.create(name="RHEL-PROBE", family=OperatingSystem.FAMILY_RHEL)
+		layout = PartitionLayout.objects.create(name="layout-probe")
+		cfg = BuildMachineConfig.objects.create(name="cfg-probe")
+		iso = ISOImage.objects.create(operating_system=os_obj, version="10.7", iso_file="isos/probe.iso")
+
+		self.build = BuildDefinition.objects.create(
+			name="build-probe",
+			operating_system=os_obj,
+			iso_image=iso,
+			partition_layout=layout,
+			machine_config=cfg,
+		)
+
+		key = SSHKey(
+			scope=SSHKey.SCOPE_IMAGE_BUILD,
+			build=self.build,
+			name="build",
+		)
+		key.set_keypair(private_key="-----BEGIN PRIVATE KEY-----\nprobe\n-----END PRIVATE KEY-----", public_key="ssh-rsa AAAA probe")
+		key.save()
+
+	@patch("apps.builds.views.subprocess.run", side_effect=subprocess.TimeoutExpired(cmd=["ssh"], timeout=5))
+	@patch("apps.builds.views.LibvirtVMManager")
+	def test_probe_returns_not_ready_on_ssh_timeout(self, mock_vm_manager_cls, _mock_run):
+		vm_manager = mock_vm_manager_cls.return_value
+		vm_manager.domain_exists.return_value = True
+		vm_manager.domain_is_active.return_value = True
+		vm_manager.current_ipv4.return_value = "192.168.200.100"
+
+		vm_exists, vm_ssh_ready, vm_ip = _probe_vm_ssh_ready(self.build)
+
+		self.assertTrue(vm_exists)
+		self.assertFalse(vm_ssh_ready)
+		self.assertEqual(vm_ip, "192.168.200.100")
+
+	@patch("apps.builds.views.subprocess.run", side_effect=OSError("ssh unavailable"))
+	@patch("apps.builds.views.LibvirtVMManager")
+	def test_probe_returns_not_ready_on_ssh_oserror(self, mock_vm_manager_cls, _mock_run):
+		vm_manager = mock_vm_manager_cls.return_value
+		vm_manager.domain_exists.return_value = True
+		vm_manager.domain_is_active.return_value = True
+		vm_manager.current_ipv4.return_value = "192.168.200.101"
+
+		vm_exists, vm_ssh_ready, vm_ip = _probe_vm_ssh_ready(self.build)
+
+		self.assertTrue(vm_exists)
+		self.assertFalse(vm_ssh_ready)
+		self.assertEqual(vm_ip, "192.168.200.101")
+
+	@patch("apps.builds.views.subprocess.run")
+	@patch("apps.builds.views.LibvirtVMManager")
+	def test_probe_prefers_runtime_state_ip_over_dhcp_lookup(self, mock_vm_manager_cls, mock_run):
+		self.build.runtime_state = {
+			"build_ip_address": "192.168.200.10",
+			"vm_mac_address": "52:54:00:c8:00:0b",
+		}
+		self.build.save(update_fields=["runtime_state", "updated_at"])
+
+		vm_manager = mock_vm_manager_cls.return_value
+		vm_manager.domain_exists.return_value = True
+		vm_manager.domain_is_active.return_value = True
+		vm_manager.current_ipv4.return_value = "192.168.200.100"
+
+		mock_run.return_value = subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="", stderr="")
+
+		vm_exists, vm_ssh_ready, vm_ip = _probe_vm_ssh_ready(self.build)
+
+		self.assertTrue(vm_exists)
+		self.assertTrue(vm_ssh_ready)
+		self.assertEqual(vm_ip, "192.168.200.10")
+		vm_manager.current_ipv4.assert_not_called()
