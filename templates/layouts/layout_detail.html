@@ -143,6 +143,9 @@
         </div>
       </div>
       <div class="card-body">
+        <div class="alert alert-info py-2 small">
+          Schema note: enable LUKS only on the encrypted PV container, then model root, var, log, home, and similar filesystems as LVM logical volumes using the same volume group.
+        </div>
         <div class="mb-3 disk-map-wrap">
           <div class="d-flex flex-wrap gap-2 align-items-center justify-content-between mb-2">
             <div class="d-flex align-items-center gap-3">
@@ -329,21 +332,21 @@
               <label class="form-label" id="f-type-label">Type Code (optional)</label>
               <select class="form-select mono" name="gpt_type" id="f-gpt-type"></select>
             </div>
-            <div class="col-md-6">
+            <div class="col-md-6" data-field-group="luks-name">
               <label class="form-label">LUKS Name (optional)</label>
               <input class="form-control" type="text" name="luks_name" id="f-luks-name" placeholder="cryptroot">
             </div>
 
-            <div class="col-md-6">
+            <div class="col-md-6" data-field-group="volume-group">
               <label class="form-label">Volume Group (for LV/PV)</label>
               <input class="form-control" type="text" name="volume_group" id="f-volume-group" placeholder="vg0">
             </div>
-            <div class="col-md-6">
+            <div class="col-md-6" data-field-group="logical-volume">
               <label class="form-label">Logical Volume (for LV)</label>
               <input class="form-control" type="text" name="logical_volume" id="f-logical-volume" placeholder="lv_root">
             </div>
 
-            <div class="col-md-6">
+            <div class="col-md-6" data-field-group="luks-enabled">
               <div class="form-check mt-2">
                 <input class="form-check-input" type="checkbox" name="luks_enabled" value="on" id="f-luks-enabled">
                 <label class="form-check-label" for="f-luks-enabled">Enable LUKS</label>
@@ -381,14 +384,15 @@
         entries: [
           { name: "EFI System Partition", mount_point: "/boot/efi", filesystem: "efi", size_mode: "fixed", size_mib: 1024, gpt_type: "C12A7328-F81F-11D2-BA4B-00A0C93EC93B", entry_role: "standard", is_boot: true, luks_enabled: false, luks_name: "" },
           { name: "Boot Partition", mount_point: "/boot", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: false, luks_name: "" },
-          { name: "Root Partition", mount_point: "/", filesystem: "xfs", size_mode: "fixed", size_mib: 40960, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
-          { name: "Var Partition", mount_point: "/var", filesystem: "xfs", size_mode: "fixed", size_mib: 4096, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
-          { name: "Log Partition", mount_point: "/var/log", filesystem: "xfs", size_mode: "fixed", size_mib: 4096, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
-          { name: "Audit Log Partition", mount_point: "/var/log/audit", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
-          { name: "Var Temp Partition", mount_point: "/var/tmp", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
-          { name: "Temp Partition", mount_point: "/tmp", filesystem: "xfs", size_mode: "fixed", size_mib: 5120, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" },
+          { name: "Encrypted PV", mount_point: "", filesystem: "none", size_mode: "fixed", size_mib: 88064, gpt_type: "E6D6D379-F507-44C2-A23C-238F2A3DF928", entry_role: "pv", is_boot: false, luks_enabled: true, luks_name: "cryptsys", volume_group: "cryptsys", logical_volume: "" },
+          { name: "Root LV", mount_point: "/", filesystem: "xfs", size_mode: "fixed", size_mib: 40960, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "root" },
+          { name: "Var LV", mount_point: "/var", filesystem: "xfs", size_mode: "fixed", size_mib: 4096, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "var" },
+          { name: "Log LV", mount_point: "/var/log", filesystem: "xfs", size_mode: "fixed", size_mib: 4096, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "log" },
+          { name: "Audit Log LV", mount_point: "/var/log/audit", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "audit" },
+          { name: "Var Temp LV", mount_point: "/var/tmp", filesystem: "xfs", size_mode: "fixed", size_mib: 2048, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "var_tmp" },
+          { name: "Temp LV", mount_point: "/tmp", filesystem: "xfs", size_mode: "fixed", size_mib: 5120, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "tmp" },
           { name: "Swap Partition", mount_point: "swap", filesystem: "swap", size_mode: "fixed", size_mib: 4096, gpt_type: "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F", entry_role: "standard", is_boot: false, luks_enabled: false, luks_name: "" },
-          { name: "Home Partition", mount_point: "/home", filesystem: "xfs", size_mode: "remainder", size_mib: null, gpt_type: "0FC63DAF-8483-4772-8E79-3D69D8477DE4", entry_role: "standard", is_boot: false, luks_enabled: true, luks_name: "cryptsys" }
+          { name: "Home LV", mount_point: "/home", filesystem: "xfs", size_mode: "remainder", size_mib: null, gpt_type: "", entry_role: "lv", is_boot: false, luks_enabled: false, luks_name: "", volume_group: "cryptsys", logical_volume: "home" }
         ],
       },
     };
@@ -434,6 +438,10 @@
     const fLuksEnabled = document.getElementById("f-luks-enabled");
     const fLuksName = document.getElementById("f-luks-name");
     const fIsBoot = document.getElementById("f-is-boot");
+    const fieldGroupLuksEnabled = document.querySelector('[data-field-group="luks-enabled"]');
+    const fieldGroupLuksName = document.querySelector('[data-field-group="luks-name"]');
+    const fieldGroupVolumeGroup = document.querySelector('[data-field-group="volume-group"]');
+    const fieldGroupLogicalVolume = document.querySelector('[data-field-group="logical-volume"]');
 
     let entriesState = [];
     let suppressYamlInput = false;
@@ -823,14 +831,46 @@
 
     function updateRoleUi() {
       const role = fEntryRole.value;
+      const isPv = role === "pv";
+      const isLv = role === "lv";
+
+      if (fieldGroupLuksEnabled) {
+        fieldGroupLuksEnabled.classList.toggle("d-none", !isPv);
+      }
+      if (fieldGroupLuksName) {
+        fieldGroupLuksName.classList.toggle("d-none", !isPv);
+      }
+      if (fieldGroupLogicalVolume) {
+        fieldGroupLogicalVolume.classList.toggle("d-none", !isLv);
+      }
+      if (fieldGroupVolumeGroup) {
+        fieldGroupVolumeGroup.classList.toggle("d-none", !(isPv || isLv));
+      }
+
       if (role === "pv") {
         fMount.value = "";
         populateFilesystemChoices("none");
         const preferredType = currentTableType() === "mbr" ? "0x8e" : "e6d6d379-f507-44c2-a23c-238f2a3df928";
         populateTypeChoices(preferredType);
+        fLuksEnabled.checked = true;
+      } else {
+        fLuksEnabled.checked = false;
+        fLuksName.value = "";
       }
-      if (role !== "lv") {
+
+      if (isLv) {
+        if (!fVolumeGroup.value) {
+          fVolumeGroup.value = "cryptsys";
+        }
+        if (!fLogicalVolume.value) {
+          fLogicalVolume.value = "lv_root";
+        }
+      } else {
         fLogicalVolume.value = "";
+      }
+
+      if (!isPv && !isLv) {
+        fVolumeGroup.value = "";
       }
     }
 

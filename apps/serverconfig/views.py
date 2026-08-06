@@ -110,6 +110,25 @@ class ServerConfigurationView(LoginRequiredMixin, TemplateView):
             return ServerConfigurationForm(post_data, instance=cfg)
         return ServerConfigurationForm(instance=cfg)
 
+    def _resolve_rhn_credentials(self, cfg: ServerConfiguration, request) -> tuple[str, str]:
+        posted_username = (request.POST.get("rhn_username") or "").strip()
+        posted_password = request.POST.get("rhn_password") or ""
+        username = posted_username or str(cfg.rhn_username or "").strip()
+        password = posted_password or cfg.get_rhn_password()
+        return username, password
+
+    def _persist_rhn_credentials_if_provided(self, cfg: ServerConfiguration, *, username: str, password: str) -> None:
+        normalized_username = str(username or "").strip()
+        changed = False
+        if normalized_username and cfg.rhn_username != normalized_username:
+            cfg.rhn_username = normalized_username
+            changed = True
+        if password:
+            cfg.set_rhn_password(password)
+            changed = True
+        if changed:
+            cfg.save(update_fields=["rhn_username", "rhn_password_encrypted", "updated_at"])
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         cfg = ServerConfiguration.get_solo()
@@ -176,11 +195,16 @@ class ServerConfigurationView(LoginRequiredMixin, TemplateView):
             form = self._config_form(cfg, request.POST)
             if form.is_valid():
                 form.save()
+                resolved_username, resolved_password = self._resolve_rhn_credentials(cfg, request)
+                self._persist_rhn_credentials_if_provided(
+                    cfg,
+                    username=resolved_username,
+                    password=resolved_password,
+                )
                 if action in {"create_builder_vm", "recreate_builder_vm"}:
                     run_id = uuid4().hex
                     task_id = uuid4().hex
-                    rhn_username = (request.POST.get("rhn_username") or "").strip()
-                    rhn_password = request.POST.get("rhn_password") or ""
+                    rhn_username, rhn_password = self._resolve_rhn_credentials(cfg, request)
                     use_redhat_subscription = bool(cfg.use_redhat_subscription)
                     if use_redhat_subscription and (not rhn_username or not rhn_password):
                         message = "Red Hat username and password are required to create and register the builder VM"
@@ -266,13 +290,14 @@ class ServerConfigurationView(LoginRequiredMixin, TemplateView):
             return self.render_to_response(self.get_context_data(form=form))
 
         if action in {"list_images", "list_iso_images", "list_iso_versions", "list_iso_page"}:
-            username = (request.POST.get("rhn_username") or "").strip()
-            password = request.POST.get("rhn_password") or ""
+            username, password = self._resolve_rhn_credentials(cfg, request)
             if not username or not password:
                 if wants_json:
                     return JsonResponse({"ok": False, "error": "Red Hat username and password are required for this action"}, status=400)
                 messages.error(request, "Red Hat username and password are required for this action")
                 return self.render_to_response(self.get_context_data(form=self._config_form(cfg, request.POST)))
+
+            self._persist_rhn_credentials_if_provided(cfg, username=username, password=password)
 
             client = RedHatDownloadClient(username=username, password=password)
             if action == "list_images":
@@ -446,13 +471,14 @@ class ServerConfigurationView(LoginRequiredMixin, TemplateView):
             return redirect("serverconfig:server-config")
 
         if action == "download_image":
-            username = (request.POST.get("rhn_username") or "").strip()
-            password = request.POST.get("rhn_password") or ""
+            username, password = self._resolve_rhn_credentials(cfg, request)
             if not username or not password:
                 if wants_json:
                     return JsonResponse({"ok": False, "error": "Red Hat username and password are required for this action"}, status=400)
                 messages.error(request, "Red Hat username and password are required for this action")
                 return self.render_to_response(self.get_context_data(form=self._config_form(cfg, request.POST)))
+
+            self._persist_rhn_credentials_if_provided(cfg, username=username, password=password)
 
             client = RedHatDownloadClient(username=username, password=password)
             image_url = (request.POST.get("selected_image_url") or "").strip()
@@ -497,13 +523,14 @@ class ServerConfigurationView(LoginRequiredMixin, TemplateView):
             return redirect("serverconfig:server-config")
 
         if action == "download_add_iso":
-            username = (request.POST.get("rhn_username") or "").strip()
-            password = request.POST.get("rhn_password") or ""
+            username, password = self._resolve_rhn_credentials(cfg, request)
             if not username or not password:
                 if wants_json:
                     return JsonResponse({"ok": False, "error": "Red Hat username and password are required for this action"}, status=400)
                 messages.error(request, "Red Hat username and password are required for this action")
                 return self.render_to_response(self.get_context_data(form=self._config_form(cfg, request.POST)))
+
+            self._persist_rhn_credentials_if_provided(cfg, username=username, password=password)
 
             selected_iso_url = (request.POST.get("selected_iso_url") or "").strip()
             selected_os_id = (request.POST.get("selected_iso_os_id") or "").strip()

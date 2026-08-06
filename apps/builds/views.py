@@ -21,7 +21,16 @@ from apps.realtime.events import publish_event
 from config.celery import app as celery_app
 
 from .forms import BuildDefinitionForm, BuildMachineConfigForm, UserSSHKeyForm
-from .models import BuildArtifact, BuildDefinition, BuildLogEntry, BuildMachineConfig, BuildPlaybookSelection, SSHKey
+from .models import (
+	BuildAfterburnerSelection,
+	BuildArtifact,
+	BuildDefinition,
+	BuildLogEntry,
+	BuildMachineConfig,
+	BuildPlaybookSelection,
+	BuildRepositorySelection,
+	SSHKey,
+)
 from .services.builder import BuilderVMManager
 from .services.provisioning import AnsibleProvisioner
 from .services.virtualization import LibvirtVMManager
@@ -39,6 +48,36 @@ def _persist_build_playbook_order(build: BuildDefinition, ordered_ids: list[int]
 		[
 			BuildPlaybookSelection(build=build, playbook_id=playbook_id, order=index + 1)
 			for index, playbook_id in enumerate(ordered_ids)
+		]
+	)
+
+
+def _persist_build_afterburner_order(build: BuildDefinition, ordered_ids: list[int]) -> None:
+	BuildAfterburnerSelection.objects.filter(build=build).delete()
+	if not ordered_ids:
+		return
+	BuildAfterburnerSelection.objects.bulk_create(
+		[
+			BuildAfterburnerSelection(build=build, afterburner_id=afterburner_id, order=index + 1)
+			for index, afterburner_id in enumerate(ordered_ids)
+		]
+	)
+
+
+def _persist_build_repository_order(build: BuildDefinition, ordered_rows: list[dict[str, object]]) -> None:
+	BuildRepositorySelection.objects.filter(build=build).delete()
+	if not ordered_rows:
+		return
+	BuildRepositorySelection.objects.bulk_create(
+		[
+			BuildRepositorySelection(
+				build=build,
+				repository_id=int(row["id"]),
+				order=index + 1,
+				enable_during_build=bool(row.get("during_build")),
+				enable_before_afterburner=bool(row.get("before_afterburner")),
+			)
+			for index, row in enumerate(ordered_rows)
 		]
 	)
 
@@ -294,6 +333,8 @@ class BuildCreateView(LoginRequiredMixin, CreateView):
 	def form_valid(self, form):
 		response = super().form_valid(form)
 		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_ids", []))
+		_persist_build_afterburner_order(self.object, form.cleaned_data.get("ordered_afterburner_ids", []))
+		_persist_build_repository_order(self.object, form.cleaned_data.get("ordered_repository_payload", []))
 		publish_event("builds", "created", {"build_id": self.object.id, "status": self.object.status})
 		if _is_modal_request(self.request):
 			return JsonResponse({"ok": True, "build_id": self.object.id, "message": "Build saved"})
@@ -324,6 +365,8 @@ class BuildUpdateView(LoginRequiredMixin, UpdateView):
 	def form_valid(self, form):
 		response = super().form_valid(form)
 		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_ids", []))
+		_persist_build_afterburner_order(self.object, form.cleaned_data.get("ordered_afterburner_ids", []))
+		_persist_build_repository_order(self.object, form.cleaned_data.get("ordered_repository_payload", []))
 		publish_event("builds", "updated", {"build_id": self.object.id, "status": self.object.status})
 		if _is_modal_request(self.request):
 			return JsonResponse({"ok": True, "build_id": self.object.id, "message": "Build saved"})

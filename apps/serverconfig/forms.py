@@ -24,3 +24,11 @@ class ServerConfigurationForm(forms.ModelForm):
             "enable_artifact_compression",
             "use_redhat_subscription",
         ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        instance = getattr(self, "instance", None)
+        if instance and getattr(instance, "pk", None):
+            self.initial["rhn_username"] = str(instance.rhn_username or "")
+            if instance.has_rhn_password():
+                self.fields["rhn_password"].widget.attrs["placeholder"] = "Saved password available (leave blank to reuse)"

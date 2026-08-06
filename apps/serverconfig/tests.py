@@ -22,6 +22,28 @@ class ServerConfigurationSingletonTests(TestCase):
 		self.assertEqual(refreshed.concurrent_builds, 7)
 		self.assertEqual(refreshed.name, ServerConfiguration.DEFAULT_NAME)
 
+	def test_stores_and_recovers_rhn_password(self):
+		cfg = ServerConfiguration.get_solo()
+		cfg.rhn_username = "martinjuhl"
+		cfg.set_rhn_password("super-secret")
+		cfg.save()
+
+		refreshed = ServerConfiguration.get_solo()
+		self.assertEqual(refreshed.rhn_username, "martinjuhl")
+		self.assertTrue(refreshed.has_rhn_password())
+		self.assertEqual(refreshed.get_rhn_password(), "super-secret")
+		self.assertNotEqual(refreshed.rhn_password_encrypted, "super-secret")
+
+	def test_clear_rhn_password(self):
+		cfg = ServerConfiguration.get_solo()
+		cfg.set_rhn_password("to-be-cleared")
+		cfg.clear_rhn_password()
+		cfg.save()
+
+		refreshed = ServerConfiguration.get_solo()
+		self.assertFalse(refreshed.has_rhn_password())
+		self.assertEqual(refreshed.get_rhn_password(), "")
+
 
 class RedHatParserTests(TestCase):
 		def test_rejects_generic_download_link_without_qcow2_artifact_url(self):

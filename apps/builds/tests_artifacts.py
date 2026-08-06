@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from django.test import TestCase
 
+from apps.afterburners.models import AfterburnerItem, AfterburnerProfile, AfterburnerScriptInput
 from apps.builds.models import BuildDefinition, BuildMachineConfig
 from apps.builds.services.artifacts import (
     ArtifactExportError,
@@ -14,8 +15,10 @@ from apps.builds.services.artifacts import (
     generate_artifacts,
     _write_usb_image_from_bundle,
 )
+from apps.builds.services.kickstart import render_deploy_restore_script
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
+from apps.repositories.models import PackageRepository
 
 
 class ArtifactGenerationTests(TestCase):
@@ -34,6 +37,297 @@ class ArtifactGenerationTests(TestCase):
             output_pxe=True,
             output_usb_img=False,
         )
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_afterburner_script_renders_ordered_profiles(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        first_profile = AfterburnerProfile.objects.create(name="20-hostname")
+        second_profile = AfterburnerProfile.objects.create(name="10-custom")
+
+        AfterburnerItem.objects.create(
+            profile=first_profile,
+            order=1,
+            name="set hostname",
+            item_type=AfterburnerItem.TYPE_HOSTNAME,
+            config={"default_hostname": "lab-node"},
+        )
+        custom_item = AfterburnerItem.objects.create(
+            profile=second_profile,
+            order=1,
+            name="custom script",
+            item_type=AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+            config={"script_body": "echo custom"},
+        )
+        AfterburnerScriptInput.objects.create(
+            item=custom_item,
+            order=1,
+            key="ENVIRONMENT",
+            label="Environment",
+            input_type=AfterburnerScriptInput.TYPE_SELECT,
+            select_options=["dev", "prod"],
+        )
+        AfterburnerScriptInput.objects.create(
+            item=custom_item,
+            order=2,
+            key="RETRIES",
+            label="Retries",
+            input_type=AfterburnerScriptInput.TYPE_INT,
+            required=True,
+        )
+
+        self.build.afterburner_selections.create(afterburner=second_profile, order=1)
+        self.build.afterburner_selections.create(afterburner=first_profile, order=2)
+
+        root = Path("/tmp/tuxwsmaker-test-afterburner-render")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
+
+        first_idx = script.index("--- Profile: 10-custom ---")
+        second_idx = script.index("--- Profile: 20-hostname ---")
+        self.assertLess(first_idx, second_idx)
+        self.assertIn('case "${ENVIRONMENT}" in', script)
+        self.assertIn("dev) ;;", script)
+        self.assertIn("prod) ;;", script)
+        self.assertIn("ENVIRONMENT must be one of: dev, prod", script)
+        self.assertIn('RETRIES must be an integer', script)
+        self.assertIn('RETRIES is required', script)
+        self.assertIn('env ENVIRONMENT="${ENVIRONMENT:-}" RETRIES="${RETRIES:-}" bash /tmp/tuxws-afterburner-custom.sh', script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_afterburner_script_includes_luks_autodetect_flow(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        profile = AfterburnerProfile.objects.create(name="30-luks")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="rotate luks",
+            item_type=AfterburnerItem.TYPE_LUKS_ROTATE,
+            config={"autodetect": True, "device": "/dev/sda3"},
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        root = Path("/tmp/tuxwsmaker-test-afterburner-luks")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
+        self.assertIn("discover_luks_devices", script)
+        self.assertIn("rotate_luks_container", script)
+        self.assertIn("LUKS_TARGETS", script)
+        self.assertIn("cryptsetup isLuks", script)
+        self.assertIn("for LUKS_DEV in \"${LUKS_TARGETS[@]}\"", script)
+        self.assertIn("Current LUKS password for", script)
+        self.assertIn("Confirm new LUKS password for", script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_afterburner_script_includes_wait_for_enter_prompt(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        profile = AfterburnerProfile.objects.create(name="40-wait")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="wait",
+            item_type=AfterburnerItem.TYPE_WAIT_FOR_ENTER,
+            config={"message": "Press Enter to continue"},
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        root = Path("/tmp/tuxwsmaker-test-afterburner-wait")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
+        self.assertIn("wait for enter", script)
+        self.assertIn("Press Enter to continue", script)
+        self.assertIn("read -r _ < /dev/console || true", script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_afterburner_script_includes_bootloader_password_prompt(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        profile = AfterburnerProfile.objects.create(name="50-grub")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="set grub password",
+            item_type=AfterburnerItem.TYPE_BOOTLOADER_PASSWORD,
+            config={"grub_user": "admin"},
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        root = Path("/tmp/tuxwsmaker-test-afterburner-grub")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
+        self.assertIn('prompt_text GRUB_USER "GRUB superuser"', script)
+        self.assertIn('GRUB_MKPASSWD_BIN', script)
+        self.assertIn('grub2-mkpasswd-pbkdf2', script)
+        self.assertIn('password_pbkdf2 $GRUB_USER $GRUB_PW_HASH', script)
+        self.assertIn('chmod 600 "$GRUB_USER_CFG"', script)
+
+    def test_deploy_restore_script_includes_temporary_repository_hooks_before_afterburner(self):
+        repo = PackageRepository.objects.create(
+            name="repo-a",
+            family=PackageRepository.FAMILY_RPM,
+            enabled=True,
+            base_url="https://repo.example.invalid/rpm",
+            rpm_repoid="repo-a",
+        )
+        self.build.repository_selections.create(
+            repository=repo,
+            order=1,
+            enable_during_build=False,
+            enable_before_afterburner=True,
+        )
+
+        root = Path("/tmp/tuxwsmaker-test-restore-repos")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        path = render_deploy_restore_script(output_dir=root, os_family=self.build.operating_system.family, build=self.build)
+        script = path.read_text(encoding="utf-8")
+
+        self.assertIn("Activating temporary repositories for deploy/afterburner", script)
+        self.assertIn("tuxwsmaker-repo-", script)
+        self.assertIn("Cleaning up temporary repositories for deploy/afterburner", script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_afterburner_script_includes_tpm_integration_prompt(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        profile = AfterburnerProfile.objects.create(name="60-tpm")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="tpm",
+            item_type=AfterburnerItem.TYPE_TPM_INTEGRATION,
+            config={
+                "device": "/dev/sda3",
+                "hash": "sha256",
+                "pcr_bank": "sha256",
+                "key": "ecc",
+                "pcr_ids": ["7"],
+            },
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        root = Path("/tmp/tuxwsmaker-test-afterburner-tpm")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
+        self.assertIn('TPM2_POLICY=', script)
+        self.assertIn('{"hash":"sha256","key":"ecc","pcr_bank":"sha256","pcr_ids":"7"}', script)
+        self.assertIn('clevis luks bind -y -k - -d "$container_dev" tpm2 "$TPM2_POLICY"', script)
+        self.assertIn('clevis luks list -d "$container_dev"', script)
+        self.assertIn('cryptsetup luksRemoveKey "$container_dev" -', script)
+        self.assertIn('run_chroot dracut -q -f --regenerate-all', script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_afterburner_script_omits_pcr_ids_when_none_selected(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        profile = AfterburnerProfile.objects.create(name="61-tpm-no-pcr")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="tpm",
+            item_type=AfterburnerItem.TYPE_TPM_INTEGRATION,
+            config={
+                "device": "/dev/sda3",
+                "hash": "sha256",
+                "pcr_bank": "sha256",
+                "key": "ecc",
+                "pcr_ids": [],
+            },
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        root = Path("/tmp/tuxwsmaker-test-afterburner-tpm-no-pcr")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
+        self.assertIn('{"hash":"sha256","key":"ecc","pcr_bank":"sha256"}', script)
+        self.assertNotIn('"pcr_ids":', script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
     @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
@@ -102,7 +396,7 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("exec > >(tee /dev/console) 2>&1", deploy_kickstart)
         self.assertNotIn('DEPLOY_TTY="/dev/tty6"', deploy_kickstart)
         self.assertNotIn("chvt 6", deploy_kickstart)
-        self.assertIn("read -r _ < /dev/console", deploy_kickstart)
+        self.assertNotIn("read -r _ < /dev/console", deploy_kickstart)
         self.assertIn("bash /tmp/restore.sh", deploy_kickstart)
         self.assertNotIn("%packages", deploy_kickstart)
         self.assertIn("Missing local restore script", deploy_kickstart)
@@ -113,6 +407,7 @@ class ArtifactGenerationTests(TestCase):
         self.assertTrue((pxe_dir / "efi" / "shimx64.efi").exists())
         self.assertIn("signed UEFI chain assets", pxe_readme)
         self.assertNotIn("__PXE_REPO_URL__", pxe_readme)
+        self.assertTrue((pxe_dir / "deploy" / "afterburner.sh").exists())
         self.assertTrue((pxe_dir / "clone-release" / "manifest.json").exists())
         self.assertTrue((pxe_dir / "clone-release" / "partition-01.img").exists())
 
@@ -214,6 +509,7 @@ class ArtifactGenerationTests(TestCase):
         self.assertTrue((usb_dir / "clone-release" / "manifest.json").exists())
         self.assertTrue((usb_dir / "clone-release" / "partition-01.img").exists())
         self.assertTrue((usb_dir / "deploy" / "restore.sh").exists())
+        self.assertTrue((usb_dir / "deploy" / "afterburner.sh").exists())
         usb_grub = (usb_dir / "boot" / "grub" / "grub.cfg").read_text(encoding="utf-8")
         self.assertTrue(usb_img.exists())
 
@@ -317,6 +613,27 @@ class ArtifactGenerationTests(TestCase):
         self.assertEqual(manifest["partitions"][0]["payload_format"], "sparse-extents-v1")
         self.assertIn("extents_file", manifest["partitions"][0])
         self.assertIn("payload_size_bytes", manifest["partitions"][0])
+
+    def test_render_deploy_restore_script_handles_encrypted_pv_and_lv_mounts(self):
+        root = Path("/tmp/tuxwsmaker-test-restore-script-lvm")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        render_deploy_restore_script(output_dir=root / "deploy", os_family=OperatingSystem.FAMILY_RHEL)
+        script = (root / "deploy" / "restore.sh").read_text(encoding="utf-8")
+
+        self.assertIn('[[ "$entry_role" == "pv" && "$luks_enabled" == "True" ]]', script)
+        self.assertIn('cryptsetup open "$part_dev" "$map_name"', script)
+        self.assertIn('ROOT_DEV="/dev/${volume_group}/${logical_volume}"', script)
+        self.assertIn('source_dev="/dev/${volume_group}/${logical_volume}"', script)
+        self.assertIn('str(entry.get("size_mode") or "fixed")', script)
+        self.assertIn('DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"', script)
+        self.assertIn('cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -', script)
+        self.assertIn('restore_target="/dev/mapper/$map_name"', script)
+        self.assertIn('[[ "$entry_role" == "lv" && "$size_mode" == "remainder" ]]', script)
+        self.assertIn('lvextend -l +100%FREE "$lv_path"', script)
+        self.assertIn('case "$fs_type" in', script)
+        self.assertIn('xfs_growfs "$grow_target"', script)
 
     @patch("apps.builds.services.artifacts._run_checked")
     @patch("apps.builds.services.artifacts.shutil.which")

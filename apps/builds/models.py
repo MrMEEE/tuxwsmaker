@@ -59,9 +59,18 @@ class BuildDefinition(models.Model):
 		(RUN_MODE_AUTO, "Automatic"),
 		(RUN_MODE_MANUAL, "Manual"),
 	]
+	RHSM_AUTH_NONE = "none"
+	RHSM_AUTH_USERPASS = "userpass"
+	RHSM_AUTH_ACTIVATION_KEY = "activation_key"
+	RHSM_AUTH_CHOICES = [
+		(RHSM_AUTH_NONE, "None"),
+		(RHSM_AUTH_USERPASS, "Red Hat username/password"),
+		(RHSM_AUTH_ACTIVATION_KEY, "Activation key + org ID"),
+	]
 	STEP_PENDING = "pending"
 	STEP_VM_SHELL = "vm_shell"
 	STEP_INSTALL_OS = "install_os"
+	STEP_INSTALL_PACKAGES = "install_packages"
 	STEP_RUN_PLAYBOOKS = "run_playbooks"
 	STEP_SHUTDOWN = "shutdown"
 	STEP_DUMP_PARTITIONS = "dump_partitions"
@@ -71,6 +80,7 @@ class BuildDefinition(models.Model):
 		(STEP_PENDING, "Pending"),
 		(STEP_VM_SHELL, "Create VM"),
 		(STEP_INSTALL_OS, "Install OS"),
+		(STEP_INSTALL_PACKAGES, "Install Packages"),
 		(STEP_RUN_PLAYBOOKS, "Run Playbooks"),
 		(STEP_SHUTDOWN, "Shutdown"),
 		(STEP_DUMP_PARTITIONS, "Dump Partitions"),
@@ -80,6 +90,7 @@ class BuildDefinition(models.Model):
 	STEP_SEQUENCE = [
 		STEP_VM_SHELL,
 		STEP_INSTALL_OS,
+		STEP_INSTALL_PACKAGES,
 		STEP_RUN_PLAYBOOKS,
 		STEP_SHUTDOWN,
 		STEP_DUMP_PARTITIONS,
@@ -93,15 +104,27 @@ class BuildDefinition(models.Model):
 	partition_layout = models.ForeignKey("layouts.PartitionLayout", on_delete=models.PROTECT)
 	machine_config = models.ForeignKey(BuildMachineConfig, on_delete=models.PROTECT)
 	package_lists = models.ManyToManyField("packages.PackageList", blank=True)
+	rhsm_repositories = models.ManyToManyField("repositories.RedHatRepositoryCatalog", blank=True)
 	playbooks = models.ManyToManyField(
 		"playbooks.Playbook",
 		blank=True,
 		through="BuildPlaybookSelection",
 		related_name="build_definitions",
 	)
+	afterburners = models.ManyToManyField(
+		"afterburners.AfterburnerProfile",
+		blank=True,
+		through="BuildAfterburnerSelection",
+		related_name="build_definitions",
+	)
 	playbook_repo = models.CharField(max_length=255, blank=True)
 	playbook_branch = models.CharField(max_length=120, default="main")
 	playbook_path = models.CharField(max_length=255, blank=True)
+	rhsm_auth_mode = models.CharField(max_length=24, choices=RHSM_AUTH_CHOICES, default=RHSM_AUTH_NONE)
+	rhsm_username = models.CharField(max_length=120, blank=True)
+	rhsm_password_encrypted = models.TextField(blank=True)
+	rhsm_org_id = models.CharField(max_length=120, blank=True)
+	rhsm_activation_key_encrypted = models.TextField(blank=True)
 	output_pxe = models.BooleanField(default=True)
 	output_usb_img = models.BooleanField(default=True)
 	status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
@@ -143,6 +166,40 @@ class BuildDefinition(models.Model):
 
 	def ordered_playbook_selections(self):
 		return self.playbook_selections.select_related("playbook", "playbook__repository").order_by("order")
+
+	def ordered_repository_selections(self):
+		return self.repository_selections.select_related("repository").order_by("order")
+
+	def ordered_afterburner_selections(self):
+		return self.afterburner_selections.select_related("afterburner").order_by("order")
+
+	def set_rhsm_password(self, secret: str) -> None:
+		self.rhsm_password_encrypted = _fernet_from_secret().encrypt(secret.encode("utf-8")).decode("utf-8")
+
+	def get_rhsm_password(self) -> str:
+		if not self.rhsm_password_encrypted:
+			return ""
+		try:
+			return _fernet_from_secret().decrypt(self.rhsm_password_encrypted.encode("utf-8")).decode("utf-8")
+		except InvalidToken:
+			return ""
+
+	def has_rhsm_password(self) -> bool:
+		return bool(self.rhsm_password_encrypted)
+
+	def set_rhsm_activation_key(self, secret: str) -> None:
+		self.rhsm_activation_key_encrypted = _fernet_from_secret().encrypt(secret.encode("utf-8")).decode("utf-8")
+
+	def get_rhsm_activation_key(self) -> str:
+		if not self.rhsm_activation_key_encrypted:
+			return ""
+		try:
+			return _fernet_from_secret().decrypt(self.rhsm_activation_key_encrypted.encode("utf-8")).decode("utf-8")
+		except InvalidToken:
+			return ""
+
+	def has_rhsm_activation_key(self) -> bool:
+		return bool(self.rhsm_activation_key_encrypted)
 
 	def next_manual_step(self) -> str:
 		last_completed = str((self.runtime_state or {}).get("last_completed_step") or self.STEP_PENDING)
@@ -230,6 +287,56 @@ class BuildPlaybookSelection(models.Model):
 
 	def __str__(self) -> str:
 		return f"{self.build.name}:{self.order}:{self.playbook.path}"
+
+
+class BuildAfterburnerSelection(models.Model):
+	build = models.ForeignKey(
+		BuildDefinition,
+		on_delete=models.CASCADE,
+		related_name="afterburner_selections",
+	)
+	afterburner = models.ForeignKey(
+		"afterburners.AfterburnerProfile",
+		on_delete=models.CASCADE,
+		related_name="build_selections",
+	)
+	order = models.PositiveIntegerField(default=1)
+
+	class Meta:
+		ordering = ["order", "id"]
+		unique_together = (
+			("build", "afterburner"),
+			("build", "order"),
+		)
+
+	def __str__(self) -> str:
+		return f"{self.build.name}:{self.order}:{self.afterburner.name}"
+
+
+class BuildRepositorySelection(models.Model):
+	build = models.ForeignKey(
+		BuildDefinition,
+		on_delete=models.CASCADE,
+		related_name="repository_selections",
+	)
+	repository = models.ForeignKey(
+		"repositories.PackageRepository",
+		on_delete=models.CASCADE,
+		related_name="build_selections",
+	)
+	order = models.PositiveIntegerField(default=1)
+	enable_during_build = models.BooleanField(default=False)
+	enable_before_afterburner = models.BooleanField(default=False)
+
+	class Meta:
+		ordering = ["order", "id"]
+		unique_together = (
+			("build", "repository"),
+			("build", "order"),
+		)
+
+	def __str__(self) -> str:
+		return f"{self.build.name}:{self.order}:{self.repository.name}"
 
 
 def _fernet_from_secret() -> Fernet:

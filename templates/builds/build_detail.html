@@ -70,6 +70,42 @@
             <div class="small text-muted mt-1">Legacy fallback: {{ build.playbook_path }} ({{ build.playbook_branch }})</div>
             {% endif %}
           </dd>
+            <dt class="col-sm-5">Ordered Afterburners</dt>
+            <dd class="col-sm-7">
+              <ol class="mb-0 ps-3">
+                {% for sel in build.ordered_afterburner_selections %}
+                  <li><span class="small">{{ sel.afterburner.name }}</span></li>
+                {% empty %}
+                  <li class="text-muted">none</li>
+                {% endfor %}
+              </ol>
+            </dd>
+            <dt class="col-sm-5">Repositories</dt>
+            <dd class="col-sm-7">
+              <ol class="mb-0 ps-3">
+                {% for sel in build.ordered_repository_selections %}
+                  <li>
+                    <span class="small">{{ sel.repository.name }}</span>
+                    {% if sel.enable_during_build %}<span class="badge text-bg-light border">during build</span>{% endif %}
+                    {% if sel.enable_before_afterburner %}<span class="badge text-bg-light border">before afterburner</span>{% endif %}
+                  </li>
+                {% empty %}
+                  <li class="text-muted">none</li>
+                {% endfor %}
+              </ol>
+            </dd>
+          <dt class="col-sm-5">RHSM Auth Mode</dt>
+          <dd class="col-sm-7">{{ build.get_rhsm_auth_mode_display }}</dd>
+          <dt class="col-sm-5">RHSM Repositories</dt>
+          <dd class="col-sm-7">
+            <ol class="mb-0 ps-3">
+              {% for repo in build.rhsm_repositories.all %}
+                <li><span class="small">RHEL {{ repo.rhel_major }} / {{ repo.architecture }}: {{ repo.repo_id }}{% if repo.name %} - {{ repo.name }}{% endif %}</span></li>
+              {% empty %}
+                <li class="text-muted">none</li>
+              {% endfor %}
+            </ol>
+          </dd>
           <dt class="col-sm-5">Outputs</dt>
           <dd class="col-sm-7">
             {% if build.output_pxe %}<span class="badge text-bg-info">PXE</span>{% endif %}

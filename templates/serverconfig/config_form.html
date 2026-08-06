@@ -11,7 +11,7 @@
       {% csrf_token %}
       <input type="hidden" name="action" value="save">
       <input type="hidden" name="selected_builder_image_path" id="selected_builder_image_path_hidden" value="{{ config.builder_base_image_path|default:'' }}">
-      <input type="hidden" name="rhn_username" id="builder_rhn_username">
+      <input type="hidden" name="rhn_username" id="builder_rhn_username" value="{{ form.rhn_username.value|default:'' }}">
       <input type="hidden" name="rhn_password" id="builder_rhn_password">
       <input type="hidden" name="use_redhat_subscription" id="use_redhat_subscription_hidden" value="{% if form.use_redhat_subscription.value %}on{% endif %}">
       <div class="row g-3">
@@ -36,7 +36,12 @@
       <input type="hidden" name="action" id="rhn_action" value="list_images">
       <div class="row g-3 align-items-end">
         <div class="col-md-4">{{ form.rhn_username.label_tag }} {{ form.rhn_username }}</div>
-        <div class="col-md-4">{{ form.rhn_password.label_tag }} {{ form.rhn_password }}</div>
+        <div class="col-md-4">
+          {{ form.rhn_password.label_tag }} {{ form.rhn_password }}
+          {% if form.instance and form.instance.has_rhn_password %}
+            <div class="form-text text-success">Saved password available.</div>
+          {% endif %}
+        </div>
         <div class="col-md-4">
           <label class="form-label" for="selected_image_url">Available RHEL images</label>
           <select class="form-select" name="selected_image_url" id="selected_image_url">
@@ -269,6 +274,15 @@
       }
     }
 
+    function syncBuilderCredentialFields() {
+      if (builderRhnUserInput && rhnUserInput) {
+        builderRhnUserInput.value = rhnUserInput.value || "";
+      }
+      if (builderRhnPasswordInput && rhnPasswordInput) {
+        builderRhnPasswordInput.value = rhnPasswordInput.value || "";
+      }
+    }
+
     function syncRedHatSubscriptionSelection() {
       if (!useRedHatSubscriptionHidden || !useRedHatSubscriptionVisible) return;
       useRedHatSubscriptionHidden.value = useRedHatSubscriptionVisible.checked ? "on" : "";
@@ -284,8 +298,17 @@
     }
 
     syncBuilderImageSelection();
+    syncBuilderCredentialFields();
     syncRedHatSubscriptionSelection();
     syncBuilderButtonLabel();
+
+    if (configForm) {
+      configForm.addEventListener("submit", function () {
+        syncBuilderImageSelection();
+        syncBuilderCredentialFields();
+        syncRedHatSubscriptionSelection();
+      });
+    }
 
     if (Array.isArray(builderProgressHistory) && builderProgressHistory.length > 0) {
       builderProgressHistory.forEach(function (entry) {
@@ -311,6 +334,15 @@
       });
     }
 
+    if (rhnUserInput) {
+      rhnUserInput.addEventListener("input", syncBuilderCredentialFields);
+      rhnUserInput.addEventListener("change", syncBuilderCredentialFields);
+    }
+    if (rhnPasswordInput) {
+      rhnPasswordInput.addEventListener("input", syncBuilderCredentialFields);
+      rhnPasswordInput.addEventListener("change", syncBuilderCredentialFields);
+    }
+
     if (useRedHatSubscriptionVisible) {
       useRedHatSubscriptionVisible.addEventListener("change", function () {
         syncRedHatSubscriptionSelection();
@@ -329,6 +361,7 @@
         if (builderRhnPasswordInput && rhnPasswordInput) {
           builderRhnPasswordInput.value = rhnPasswordInput.value || "";
         }
+        syncBuilderCredentialFields();
         syncRedHatSubscriptionSelection();
         const actionInput = configForm.querySelector('input[name="action"]');
         if (actionInput) {

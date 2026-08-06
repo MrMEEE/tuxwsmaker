@@ -5,6 +5,7 @@ from textwrap import dedent
 
 from apps.catalog.models import OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
+from apps.repositories.services import render_repository_activation_snippet, render_repository_cleanup_snippet
 
 
 def calculate_layout_disk_size_gib(layout: PartitionLayout) -> int:
@@ -24,50 +25,74 @@ def calculate_layout_disk_size_gib(layout: PartitionLayout) -> int:
 
 
 def _render_partition_command(entry: PartitionEntry) -> str:
-    size_bits = []
-    if entry.size_mode == PartitionEntry.SIZE_FIXED and entry.size_mib:
-        size_bits.append(f"--size={entry.size_mib}")
-    elif entry.size_mode == PartitionEntry.SIZE_REMAINDER:
-        size_bits.append("--grow")
+  size_bits = []
+  if entry.size_mode == PartitionEntry.SIZE_FIXED and entry.size_mib:
+    size_bits.append(f"--size={entry.size_mib}")
+  elif entry.size_mode == PartitionEntry.SIZE_REMAINDER:
+    size_bits.extend(["--size=1", "--grow"])
 
-    if entry.gpt_type:
-        size_bits.append(f"--type={entry.gpt_type}")
-    if entry.is_boot:
-        size_bits.append("--asprimary")
+  # Guard against legacy/invalid records that have no explicit size mode payload.
+  # Kickstart requires a base sizing flag; --grow alone is not accepted for logvol.
+  if not size_bits:
+    size_bits.extend(["--size=1", "--grow"])
 
-    if entry.entry_role == PartitionEntry.ROLE_PV:
-        return f"part pv.{entry.order:02d} {' '.join(size_bits)}".strip()
+  if entry.gpt_type:
+    size_bits.append(f"--type={entry.gpt_type}")
+  if entry.is_boot:
+    size_bits.append("--asprimary")
 
-    if entry.entry_role == PartitionEntry.ROLE_LV:
-        base = [
-            f"logvol {entry.mount_point or '/'}",
-            f"--vgname={entry.volume_group}",
-            f"--name={entry.logical_volume}",
-        ]
-        base.extend(size_bits)
-        if entry.filesystem != "none":
-            base.append(f"--fstype={entry.filesystem}")
-        return " ".join(base).strip()
+  if entry.entry_role == PartitionEntry.ROLE_PV:
+    return f"part pv.{entry.order:02d} {' '.join(size_bits)}".strip()
 
-    mount_point = entry.mount_point.strip() or "/"
-    if entry.filesystem == "swap" or mount_point == "swap":
-        mount_point = "swap"
-    line = [f"part {mount_point}"]
-    line.extend(size_bits)
-    if entry.filesystem and entry.filesystem != "none" and mount_point != "swap":
-        line.append(f"--fstype={entry.filesystem}")
-    return " ".join(line).strip()
+  if entry.entry_role == PartitionEntry.ROLE_LV:
+    base = [
+      f"logvol {entry.mount_point or '/'}",
+      f"--vgname={entry.volume_group}",
+      f"--name={entry.logical_volume}",
+    ]
+    base.extend(size_bits)
+    if entry.filesystem != "none":
+      base.append(f"--fstype={entry.filesystem}")
+    return " ".join(base).strip()
+
+  mount_point = entry.mount_point.strip() or "/"
+  if entry.filesystem == "swap" or mount_point == "swap":
+    mount_point = "swap"
+  line = [f"part {mount_point}"]
+  line.extend(size_bits)
+  if entry.filesystem and entry.filesystem != "none" and mount_point != "swap":
+    line.append(f"--fstype={entry.filesystem}")
+  return " ".join(line).strip()
 
 
 def _render_partition_section(layout: PartitionLayout) -> str:
-    entries = list(layout.entries.order_by("order"))
-    if not entries:
-        return "autopart --type=lvm"
+  entries = list(layout.entries.order_by("order"))
+  if not entries:
+    return "autopart --type=lvm"
 
-    lines = ["clearpart --all --initlabel"]
-    for entry in entries:
-        lines.append(_render_partition_command(entry))
-    return "\n".join(lines)
+  lines = ["clearpart --all --initlabel"]
+  non_lv_entries = [entry for entry in entries if entry.entry_role != PartitionEntry.ROLE_LV]
+  lv_entries = [entry for entry in entries if entry.entry_role == PartitionEntry.ROLE_LV]
+
+  for entry in non_lv_entries:
+    lines.append(_render_partition_command(entry))
+
+  vg_to_pvs: dict[str, list[str]] = {}
+  for entry in non_lv_entries:
+    if entry.entry_role != PartitionEntry.ROLE_PV:
+      continue
+    vg_name = str(entry.volume_group or "").strip()
+    if not vg_name:
+      continue
+    vg_to_pvs.setdefault(vg_name, []).append(f"pv.{entry.order:02d}")
+
+  for vg_name, pv_names in vg_to_pvs.items():
+    lines.append(f"volgroup {vg_name} {' '.join(pv_names)}")
+
+  for entry in lv_entries:
+    lines.append(_render_partition_command(entry))
+
+  return "\n".join(lines)
 
 
 def render_kickstart_file(*, output_dir: Path, vm_name: str, ssh_public_key: str, partition_layout: PartitionLayout) -> Path:
@@ -146,13 +171,30 @@ def render_pxe_boot_configs(
     }
 
 
-def render_deploy_restore_script(*, output_dir: Path, os_family: str) -> Path:
+def render_deploy_restore_script(*, output_dir: Path, os_family: str, build=None) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "restore.sh"
 
     finish_step = "status 'RHEL-family finish adapter: restore path complete'"
     if os_family == OperatingSystem.FAMILY_DEBIAN:
         finish_step = "status 'Debian-family finish adapter: restore path complete'"
+
+    repo_setup = ""
+    repo_cleanup = ""
+    if build is not None:
+      selections = [sel for sel in build.ordered_repository_selections() if sel.enable_before_afterburner]
+      repo_setup = render_repository_activation_snippet(
+        selections=selections,
+        os_family=os_family,
+        root_expression='"$MOUNT_ROOT"',
+        phase_label="deploy/afterburner",
+      )
+      repo_cleanup = render_repository_cleanup_snippet(
+        selections=selections,
+        os_family=os_family,
+        root_expression='"$MOUNT_ROOT"',
+        phase_label="deploy/afterburner",
+      )
 
     content = dedent(
         """#!/usr/bin/env bash
@@ -164,6 +206,7 @@ CLONE_MANIFEST_URL="${CLONE_MANIFEST_URL:-file:///run/install/repo/clone-release
 WORK_DIR="/tmp/tuxwsmaker-deploy"
 MOUNT_ROOT="/mnt/sysimage"
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
+DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"
 
 mkdir -p "$DEPLOY_ROOT" "$WORK_DIR"
 
@@ -341,11 +384,23 @@ if not partitions:
 sector = 512
 sfdisk_lines = [f"label: {table_type}", "unit: sectors"]
 map_lines = []
-for part in partitions:
+starts = [max(0, int(p.get("start_byte") or 0) // sector) for p in partitions]
+sizes = [max(1, int(p.get("size_bytes") or 0) // sector) for p in partitions]
+default_total = max((s + z) for s, z in zip(starts, sizes))
+disk_total = max(default_total, int((clone.get("disk_size_bytes") or 0) // sector))
+for idx, part in enumerate(partitions):
     number = int(part["number"])
-    start_sector = max(0, int(part.get("start_byte") or 0) // sector)
-    size_sector = max(1, int(part.get("size_bytes") or 0) // sector)
+  start_sector = starts[idx]
+  size_sector = sizes[idx]
     entry = layout_by_order.get(number, {})
+  size_mode = str(entry.get("size_mode") or "fixed").strip().lower()
+
+  if size_mode == "remainder":
+    next_start = starts[idx + 1] if idx + 1 < len(starts) else disk_total
+    available = max(1, next_start - start_sector)
+    if available < size_sector:
+      raise SystemExit(f"Target disk too small for remainder partition {number}")
+    size_sector = available
 
     opts = [f"start={start_sector}", f"size={size_sector}"]
     gpt_type = str(entry.get("gpt_type") or "").strip()
@@ -374,6 +429,10 @@ for part in partitions:
         str(entry.get("filesystem") or ""),
         str(entry.get("luks_enabled") or False),
         str(entry.get("luks_name") or ""),
+      str(entry.get("entry_role") or ""),
+      str(entry.get("volume_group") or ""),
+      str(entry.get("logical_volume") or ""),
+      str(entry.get("size_mode") or "fixed"),
     ]))
 
 with open(sfdisk_path, "w", encoding="utf-8") as f:
@@ -402,7 +461,7 @@ fi
 : > "$WORK_DIR/part-dev.map"
 TOTAL_PARTS=$(grep -c '^[0-9]' "$WORK_DIR/parts.map" || true)
 PART_INDEX=0
-while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name; do
+while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ -z "${number:-}" ]] && continue
   PART_INDEX=$((PART_INDEX + 1))
   if [[ -z "${file_name:-}" ]]; then
@@ -412,9 +471,25 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
 
   part_dev=$(raw_part "$TARGET_DISK" "$number")
   image_url="$CLONE_BASE/$file_name"
-  echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name" >> "$WORK_DIR/part-dev.map"
+  echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name|$entry_role|$volume_group|$logical_volume|$size_mode" >> "$WORK_DIR/part-dev.map"
 
-  status "[$PART_INDEX/$TOTAL_PARTS] Restoring partition $number ($file_name) to $part_dev"
+  restore_target="$part_dev"
+  if [[ "$luks_enabled" == "True" ]]; then
+    map_name="${luks_name:-luks-${number}}"
+    if ! cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
+      if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
+        echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot bootstrap LUKS for $part_dev" >&2
+        exit 1
+      fi
+      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
+    fi
+    if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
+      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
+    fi
+    restore_target="/dev/mapper/$map_name"
+  fi
+
+  status "[$PART_INDEX/$TOTAL_PARTS] Restoring partition $number ($file_name) to $restore_target"
   if [[ "$image_url" == file://* ]]; then
     image_path="${image_url#file://}"
     extents_path=""
@@ -431,13 +506,13 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
       status "[$PART_INDEX/$TOTAL_PARTS] Applying sparse extents for partition $number"
       compressed_flag=0
       [[ "${compressed:-False}" == "True" || "${compressed:-false}" == "true" ]] && compressed_flag=1
-      apply_sparse_extents_file "$image_path" "$extents_path" "$part_dev" "$compressed_flag"
+      apply_sparse_extents_file "$image_path" "$extents_path" "$restore_target" "$compressed_flag"
     elif [[ "$image_path" == *.gz ]]; then
       status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
-      gzip -dc "$image_path" | sparse_restore_stream "$part_dev" 65536
+      gzip -dc "$image_path" | sparse_restore_stream "$restore_target" 65536
     else
       status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
-      write_sparse_blocks "$image_path" "$part_dev" 65536
+      write_sparse_blocks "$image_path" "$restore_target" 65536
     fi
   else
     status "[$PART_INDEX/$TOTAL_PARTS] Streaming remote partition image for $number"
@@ -448,12 +523,12 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
       curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$CLONE_BASE/$extents_file" -o "$tmp_extents"
       compressed_flag=0
       [[ "${compressed:-False}" == "True" || "${compressed:-false}" == "true" ]] && compressed_flag=1
-      apply_sparse_extents_file "$tmp_payload" "$tmp_extents" "$part_dev" "$compressed_flag"
+      apply_sparse_extents_file "$tmp_payload" "$tmp_extents" "$restore_target" "$compressed_flag"
       rm -f "$tmp_payload" "$tmp_extents"
     elif [[ "$image_url" == *.gz ]]; then
-      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | sparse_restore_stream "$part_dev" 65536
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | sparse_restore_stream "$restore_target" 65536
     else
-      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$part_dev" 65536
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$restore_target" 65536
     fi
   fi
   status "[$PART_INDEX/$TOTAL_PARTS] Partition $number restore completed"
@@ -466,13 +541,44 @@ if command -v vgchange >/dev/null 2>&1; then
   vgchange -ay >/dev/null 2>&1 || true
 fi
 
+while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
+  [[ -z "${number:-}" ]] && continue
+  [[ "$entry_role" == "pv" && "$luks_enabled" == "True" ]] || continue
+  map_name="${luks_name:-luks-${number}}"
+  if cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
+    if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
+      cryptsetup open "$part_dev" "$map_name"
+    fi
+  fi
+done < "$WORK_DIR/part-dev.map"
+
+if command -v vgscan >/dev/null 2>&1; then
+  vgscan --mknodes >/dev/null 2>&1 || true
+fi
+if command -v vgchange >/dev/null 2>&1; then
+  vgchange -ay >/dev/null 2>&1 || true
+fi
+
+while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
+  [[ "$entry_role" == "lv" && "$size_mode" == "remainder" ]] || continue
+  [[ -n "${volume_group:-}" && -n "${logical_volume:-}" ]] || continue
+  lv_path="/dev/${volume_group}/${logical_volume}"
+  if command -v lvdisplay >/dev/null 2>&1 && lvdisplay "$lv_path" >/dev/null 2>&1; then
+    lvextend -l +100%FREE "$lv_path" >/dev/null 2>&1 || true
+  fi
+done < "$WORK_DIR/part-dev.map"
+
 status "Mounting restored filesystems"
 : > "$WORK_DIR/mounted.paths"
 ROOT_DEV=""
-while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ -z "${number:-}" ]] && continue
   if [[ "$mount_point" == "/" ]]; then
-    ROOT_DEV="$part_dev"
+    if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
+      ROOT_DEV="/dev/${volume_group}/${logical_volume}"
+    else
+      ROOT_DEV="$part_dev"
+    fi
     break
   fi
 done < "$WORK_DIR/part-dev.map"
@@ -484,17 +590,50 @@ else
   mount "$ROOT_DEV" "$MOUNT_ROOT"
   echo "$MOUNT_ROOT" >> "$WORK_DIR/mounted.paths"
 
-  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
     [[ -z "${number:-}" ]] && continue
     [[ -z "${mount_point:-}" ]] && continue
     [[ "$mount_point" == "/" || "$mount_point" == "swap" ]] && continue
+    if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
+      source_dev="/dev/${volume_group}/${logical_volume}"
+    else
+      source_dev="$part_dev"
+    fi
+    [[ "$entry_role" == "pv" ]] && continue
     target="$MOUNT_ROOT$mount_point"
     mkdir -p "$target"
-    if mount "$part_dev" "$target"; then
+    if mount "$source_dev" "$target"; then
       echo "$target" >> "$WORK_DIR/mounted.paths"
     else
-      status "Could not mount $part_dev on $target (continuing)"
+      status "Could not mount $source_dev on $target (continuing)"
     fi
+  done < "$WORK_DIR/part-dev.map"
+
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
+    [[ "$size_mode" == "remainder" ]] || continue
+    [[ -n "${mount_point:-}" && "$mount_point" != "swap" ]] || continue
+    if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
+      source_dev="/dev/${volume_group}/${logical_volume}"
+    else
+      source_dev="$part_dev"
+    fi
+
+    grow_target="$MOUNT_ROOT"
+    if [[ "$mount_point" != "/" ]]; then
+      grow_target="$MOUNT_ROOT$mount_point"
+    fi
+
+    case "$fs_type" in
+      xfs)
+        command -v xfs_growfs >/dev/null 2>&1 && xfs_growfs "$grow_target" >/dev/null 2>&1 || true
+        ;;
+      ext2|ext3|ext4)
+        command -v resize2fs >/dev/null 2>&1 && resize2fs "$source_dev" >/dev/null 2>&1 || true
+        ;;
+      btrfs)
+        command -v btrfs >/dev/null 2>&1 && btrfs filesystem resize max "$grow_target" >/dev/null 2>&1 || true
+        ;;
+    esac
   done < "$WORK_DIR/part-dev.map"
 
   status "Rebuilding /etc/fstab"
@@ -520,7 +659,7 @@ else
     printf "%-32s %-16s %-7s %-22s 0 0\\n" "$devref" "$fs_mp" "$fstype" "$opts" >> "$MOUNT_ROOT/etc/fstab"
   done < "$WORK_DIR/mounted.paths"
 
-  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
     [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]] || continue
     swap_uuid=$(blkid -s UUID -o value "$part_dev" 2>/dev/null || true)
     if [[ -n "$swap_uuid" ]]; then
@@ -532,7 +671,7 @@ else
 
   status "Rebuilding /etc/crypttab"
   : > "$MOUNT_ROOT/etc/crypttab"
-  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name; do
+  while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
     [[ "$luks_enabled" == "True" ]] || continue
     if cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
       luks_uuid=$(cryptsetup luksUUID "$part_dev" 2>/dev/null || true)
@@ -644,10 +783,19 @@ CHROOT
 
   AFTERBURNER="/run/install/repo/deploy/afterburner.sh"
   if [[ -f "$AFTERBURNER" ]]; then
-    status "Running afterburner inside restored system"
-    cp "$AFTERBURNER" "$MOUNT_ROOT/root/afterburner.sh"
-    chmod +x "$MOUNT_ROOT/root/afterburner.sh"
-    chroot "$MOUNT_ROOT" /bin/bash /root/afterburner.sh || true
+__REPO_SETUP__
+    status "Running afterburner in restore context"
+    chmod +x "$AFTERBURNER"
+    set +e
+    MOUNT_ROOT="$MOUNT_ROOT" TARGET_DEV="$TARGET_DEV" WORK_DIR="$WORK_DIR" bash "$AFTERBURNER"
+    afterburner_exit=$?
+    set -e
+__REPO_CLEANUP__
+    if [[ $afterburner_exit -ne 0 ]]; then
+      status "Afterburner failed"
+      exit $afterburner_exit
+    fi
+    status "Afterburner completed"
   else
     status "No afterburner script found at /run/install/repo/deploy/afterburner.sh; skipping"
   fi
@@ -659,6 +807,8 @@ __FINISH_STEP__
     ).lstrip()
 
     content = content.replace("__FINISH_STEP__", finish_step)
+    content = content.replace("__REPO_SETUP__", repo_setup.rstrip() + ("\n" if repo_setup else ""))
+    content = content.replace("__REPO_CLEANUP__", repo_cleanup.rstrip() + ("\n" if repo_cleanup else ""))
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path
@@ -704,14 +854,10 @@ cat <<'EOF'
 ================================================================
 Restore complete.
 
-Press Enter to power off. Then remove install media and boot from disk.
+Powering off. Remove install media and boot from disk.
 ================================================================
 EOF
-echo "[deploy-pre] Restore complete, press enter to power off"
-if ! read -r _ < /dev/console; then
-  echo "[deploy-pre] tty input unavailable; pausing 120 seconds before power off"
-  sleep 120
-fi
+echo "[deploy-pre] Restore complete, powering off"
 sync
 poweroff -f || halt -f
 %end

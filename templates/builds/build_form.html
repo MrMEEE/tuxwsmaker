@@ -27,6 +27,29 @@
             {{ form.package_lists }}
           </div>
         </div>
+        <div class="col-12">
+          <hr class="my-2">
+          <div class="d-flex justify-content-between align-items-center">
+            <h6 class="mb-2">Red Hat Subscription (Install Packages step)</h6>
+            <div class="d-flex align-items-center gap-2">
+              <span id="rhsm-sync-scope" class="badge text-bg-light border">Sync scope: default</span>
+              <button class="btn btn-sm btn-outline-secondary" type="button" id="sync-rhsm-repos-btn">Sync RH Repositories now</button>
+            </div>
+          </div>
+          <p class="text-muted small mb-2">Optional. Needed when packages depend on subscription-only RHEL repositories.</p>
+        </div>
+        <div class="col-md-4">{{ form.rhsm_auth_mode.label_tag }} {{ form.rhsm_auth_mode }}</div>
+        <div class="col-md-4">{{ form.rhsm_username.label_tag }} {{ form.rhsm_username }}</div>
+        <div class="col-md-4">{{ form.rhsm_password.label_tag }} {{ form.rhsm_password }}</div>
+        <div class="col-md-4">{{ form.rhsm_org_id.label_tag }} {{ form.rhsm_org_id }}</div>
+        <div class="col-md-4">{{ form.rhsm_activation_key.label_tag }} {{ form.rhsm_activation_key }}</div>
+        <div class="col-12">
+          {{ form.rhsm_repositories.label_tag }}
+          <div class="border rounded p-2" style="max-height: 220px; overflow-y: auto;">
+            {{ form.rhsm_repositories }}
+          </div>
+          <div id="rhsm-sync-status" class="alert d-none mt-2 mb-0" role="status"></div>
+        </div>
         <div class="col-md-6">
           <div class="form-check">{{ form.output_pxe }} {{ form.output_pxe.label_tag }}</div>
           <div class="form-check">{{ form.output_usb_img }} {{ form.output_usb_img.label_tag }}</div>
@@ -34,10 +57,40 @@
       </div>
 
       <hr>
+      <h6>Repositories</h6>
+      <p class="text-muted small mb-2">Attach package repositories and decide whether each one is active during build, before afterburner, or both.</p>
+      {{ form.repository_order_json }}
+      <div class="row g-3 mb-3">
+        <div class="col-md-5">
+          <label class="form-label">Available Repositories</label>
+          <select id="available-repositories" class="form-select" size="8">
+            {% for repo in form.available_repositories %}
+              <option value="{{ repo.id }}" data-label="{{ repo.name }}" data-family="{{ repo.get_family_display }}">{{ repo.name }} ({{ repo.get_family_display }})</option>
+            {% empty %}
+              <option disabled>No repositories yet. Create them under Repositories.</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm btn-outline-primary mt-2" type="button" id="add-repository-btn">Attach Repository</button>
+        </div>
+        <div class="col-md-7">
+          <label class="form-label">Selected Repositories</label>
+          <div class="border rounded p-2">
+            <table class="table table-sm align-middle mb-0">
+              <thead>
+                <tr><th>Repository</th><th>During Build</th><th>Before Afterburner</th><th class="text-end">Actions</th></tr>
+              </thead>
+              <tbody id="selected-repositories-body">
+                <tr id="selected-repositories-empty"><td colspan="4" class="text-muted">No repositories attached.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <hr>
       <h6>Playbooks (Run Order)</h6>
       <p class="text-muted small mb-2">Select one or more discovered playbooks, then set the exact run order for this build.</p>
       {{ form.playbook_order_json }}
-
       <div class="row g-3">
         <div class="col-md-5">
           <label class="form-label">Available Playbooks</label>
@@ -62,6 +115,34 @@
         </div>
       </div>
 
+      <hr>
+      <h6>Afterburners (Run Order)</h6>
+      <p class="text-muted small mb-2">Attach one or more afterburner profiles and define the order they run during restore.</p>
+      {{ form.afterburner_order_json }}
+      <div class="row g-3">
+        <div class="col-md-5">
+          <label class="form-label">Available Afterburners</label>
+          <input id="available-afterburners-filter" class="form-control form-control-sm mb-2" type="text" placeholder="Filter afterburners...">
+          <select id="available-afterburners" class="form-select" size="10">
+            {% for profile in form.available_afterburners %}
+              <option value="{{ profile.id }}" data-label="{{ profile.name }}">{{ profile.name }}</option>
+            {% empty %}
+              <option disabled>No afterburners yet. Create them under Afterburners.</option>
+            {% endfor %}
+          </select>
+          <button class="btn btn-sm btn-outline-primary mt-2" type="button" id="add-afterburner-btn">Add to Order</button>
+        </div>
+        <div class="col-md-7">
+          <label class="form-label">Selected Order</label>
+          <select id="selected-afterburners" class="form-select" size="10"></select>
+          <div class="mt-2 d-flex gap-2">
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="move-afterburner-up-btn">Up</button>
+            <button class="btn btn-sm btn-outline-secondary" type="button" id="move-afterburner-down-btn">Down</button>
+            <button class="btn btn-sm btn-outline-danger" type="button" id="remove-afterburner-btn">Remove</button>
+          </div>
+        </div>
+      </div>
+
       <div class="d-flex gap-2">
         <button class="btn btn-primary" type="submit">Save</button>
         <a class="btn btn-outline-secondary" href="{% url 'builds:build-list' %}">Cancel</a>
@@ -74,23 +155,428 @@
 {% block extra_js %}
 {{ form.machine_boot_modes|json_script:"machine-boot-modes-map" }}
 {{ form.layout_meta|json_script:"layout-meta-map" }}
+{{ form.iso_major_map|json_script:"iso-major-map" }}
+{{ form.rhsm_repo_meta|json_script:"rhsm-repo-meta-map" }}
 <script>
   (function () {
-    const available = document.getElementById("available-playbooks");
-    const availableFilter = document.getElementById("available-playbooks-filter");
-    const selected = document.getElementById("selected-playbooks");
-    const orderField = document.getElementById("id_playbook_order_json");
+    const playbookAvailable = document.getElementById("available-playbooks");
+    const playbookAvailableFilter = document.getElementById("available-playbooks-filter");
+    const playbookSelected = document.getElementById("selected-playbooks");
+    const playbookOrderField = document.getElementById("id_playbook_order_json");
+    const afterburnerAvailable = document.getElementById("available-afterburners");
+    const afterburnerAvailableFilter = document.getElementById("available-afterburners-filter");
+    const afterburnerSelected = document.getElementById("selected-afterburners");
+    const afterburnerOrderField = document.getElementById("id_afterburner_order_json");
+    const repositoryAvailable = document.getElementById("available-repositories");
+    const repositoryBody = document.getElementById("selected-repositories-body");
+    const repositoryEmpty = document.getElementById("selected-repositories-empty");
+    const repositoryOrderField = document.getElementById("id_repository_order_json");
     const machineConfigField = document.getElementById("id_machine_config");
     const partitionLayoutField = document.getElementById("id_partition_layout");
+    const osField = document.getElementById("id_operating_system");
+    const isoField = document.getElementById("id_iso_image");
+    const rhsmRepoField = document.getElementById("id_rhsm_repositories");
+    const syncRhsmReposBtn = document.getElementById("sync-rhsm-repos-btn");
     const compatibilityBanner = document.getElementById("boot-layout-compatibility");
-
     const machineBootModes = JSON.parse(document.getElementById("machine-boot-modes-map").textContent || "{}");
     const layoutMeta = JSON.parse(document.getElementById("layout-meta-map").textContent || "{}");
+    const isoMajorMap = JSON.parse(document.getElementById("iso-major-map").textContent || "{}");
+    const rhsmRepoMetaMap = JSON.parse(document.getElementById("rhsm-repo-meta-map").textContent || "{}");
 
-    const addBtn = document.getElementById("add-playbook-btn");
-    const removeBtn = document.getElementById("remove-playbook-btn");
-    const upBtn = document.getElementById("move-up-btn");
-    const downBtn = document.getElementById("move-down-btn");
+    function getCookie(name) {
+      const value = `; ${document.cookie}`;
+      const parts = value.split(`; ${name}=`);
+      if (parts.length === 2) {
+        return parts.pop().split(";").shift();
+      }
+      return "";
+    }
+
+    function makeRhsmRepoLabel(item) {
+      const major = item && item.rhel_major ? `RHEL ${item.rhel_major}` : "RHEL";
+      const arch = item && item.architecture ? item.architecture : "x86_64";
+      const repoId = item && item.repo_id ? item.repo_id : "";
+      const name = item && item.name ? item.name : repoId;
+      return `${major} ${arch}: ${name || repoId}`.trim();
+    }
+
+    function mergeRhsmCatalog(catalog) {
+      if (!rhsmRepoField || !Array.isArray(catalog)) {
+        return;
+      }
+      const existing = new Map(Array.from(rhsmRepoField.options).map((opt) => [String(opt.value), opt]));
+      catalog.forEach((item) => {
+        if (!item || !item.id) {
+          return;
+        }
+        const id = String(item.id);
+        const label = makeRhsmRepoLabel(item);
+        const option = existing.get(id) || document.createElement("option");
+        option.value = id;
+        option.textContent = label;
+        option.dataset.family = "RHEL";
+        option.dataset.label = item.name || item.repo_id || label;
+        option.dataset.rhelMajor = String(item.rhel_major || "");
+        if (!existing.has(id)) {
+          rhsmRepoField.appendChild(option);
+        }
+        rhsmRepoMetaMap[id] = {
+          rhel_major: Number(item.rhel_major || 0),
+          architecture: String(item.architecture || "x86_64"),
+        };
+      });
+      filterRhsmRepositories();
+    }
+
+    function syncRhsmRepositories() {
+      if (!syncRhsmReposBtn) {
+        return;
+      }
+      const statusBox = document.getElementById("rhsm-sync-status");
+      const osText = (osField && osField.options[osField.selectedIndex] ? osField.options[osField.selectedIndex].text : "").toLowerCase();
+      const isRhel = osText.includes("rhel") || osText.includes("red hat") || osText.includes("fedora");
+      const isoId = isoField ? isoField.value : "";
+      const isoMajor = isRhel && isoId ? Number(isoMajorMap[String(isoId)] || 0) : 0;
+      const body = new URLSearchParams();
+      if (isoMajor > 0) {
+        body.set("rhel_major", String(isoMajor));
+      }
+
+      if (statusBox) {
+        statusBox.classList.remove("d-none", "alert-danger", "alert-warning", "alert-success");
+        statusBox.classList.add("alert-info");
+        statusBox.textContent = isoMajor > 0
+          ? `Syncing RH repositories for RHEL ${isoMajor}...`
+          : "Syncing RH repositories...";
+      }
+      syncRhsmReposBtn.disabled = true;
+      const oldLabel = syncRhsmReposBtn.textContent;
+      syncRhsmReposBtn.textContent = "Syncing...";
+      fetch("{% url 'repositories:rhsm-sync' %}", {
+        method: "POST",
+        headers: {
+          "X-CSRFToken": getCookie("csrftoken"),
+          "X-Requested-With": "XMLHttpRequest",
+          "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+        body: body.toString(),
+      }).then((resp) => {
+        if (!resp.ok) {
+          throw new Error("Sync failed");
+        }
+        return resp.json();
+      }).then((payload) => {
+        const result = payload && payload.result ? payload.result : {};
+        const errors = result.errors || {};
+        const warnings = result.warnings || {};
+        const hasErrors = Object.keys(errors).length > 0;
+        const hasWarnings = Object.keys(warnings).length > 0;
+        if (statusBox) {
+          statusBox.classList.remove("alert-info", "alert-danger", "alert-warning", "alert-success");
+          if (hasErrors) {
+            statusBox.classList.add("alert-danger");
+            statusBox.textContent = `RHSM sync failed for some versions: ${JSON.stringify(errors)}`;
+            return;
+          }
+          if (hasWarnings) {
+            statusBox.classList.add("alert-warning");
+            statusBox.textContent = `RHSM sync completed with warnings: ${JSON.stringify(warnings)}`;
+          } else {
+            statusBox.classList.add("alert-success");
+            statusBox.textContent = "RHSM repository catalog synchronized.";
+          }
+        }
+        mergeRhsmCatalog(result.catalog || []);
+      }).catch(() => {
+        if (statusBox) {
+          statusBox.classList.remove("d-none", "alert-info", "alert-warning", "alert-success");
+          statusBox.classList.add("alert-danger");
+          statusBox.textContent = "Failed to sync RH repositories.";
+        }
+      }).finally(() => {
+        syncRhsmReposBtn.disabled = false;
+        syncRhsmReposBtn.textContent = oldLabel;
+      });
+    }
+
+    function updateRhsmSyncScopeLabel() {
+      const scopeLabel = document.getElementById("rhsm-sync-scope");
+      if (!scopeLabel || !osField || !isoField) {
+        return;
+      }
+      const osText = (osField.options[osField.selectedIndex]?.text || "").toLowerCase();
+      const isRhel = osText.includes("rhel") || osText.includes("red hat") || osText.includes("fedora");
+      const isoId = isoField.value;
+      const isoMajor = isoId ? Number(isoMajorMap[String(isoId)] || 0) : 0;
+      scopeLabel.textContent = (isRhel && isoMajor > 0)
+        ? `Sync scope: RHEL ${isoMajor}`
+        : "Sync scope: default";
+    }
+
+    function filterRhsmRepositories() {
+      if (!rhsmRepoField || !osField || !isoField) {
+        return;
+      }
+      const osText = (osField.options[osField.selectedIndex]?.text || "").toLowerCase();
+      const isRhel = osText.includes("rhel") || osText.includes("red hat") || osText.includes("fedora");
+      const isoId = isoField.value;
+      const isoMajor = isoId ? Number(isoMajorMap[String(isoId)]) : null;
+
+      Array.from(rhsmRepoField.options).forEach((opt) => {
+        const meta = rhsmRepoMetaMap[String(opt.value)] || {};
+        const repoMajor = Number(meta.rhel_major || 0);
+        const keep = isRhel && isoMajor && repoMajor === isoMajor;
+        opt.hidden = !keep;
+        if (!keep) {
+          opt.selected = false;
+        }
+      });
+    }
+
+    function setupOrderedSelector(opts) {
+      const available = opts.available;
+      const availableFilter = opts.availableFilter;
+      const selected = opts.selected;
+      const orderField = opts.orderField;
+      const addBtn = opts.addBtn;
+      const removeBtn = opts.removeBtn;
+      const upBtn = opts.upBtn;
+      const downBtn = opts.downBtn;
+
+      function containsId(id) {
+        return Array.from(selected.options).some((opt) => opt.value === id);
+      }
+
+      function syncHiddenField() {
+        const payload = Array.from(selected.options).map((opt) => ({ id: Number(opt.value), label: opt.text }));
+        orderField.value = JSON.stringify(payload);
+      }
+
+      function addOption(id, label) {
+        if (containsId(id)) {
+          return;
+        }
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.text = label;
+        selected.appendChild(opt);
+        syncHiddenField();
+      }
+
+      function filterAvailable() {
+        const q = (availableFilter.value || "").trim().toLowerCase();
+        Array.from(available.options).forEach((opt) => {
+          const hay = (opt.dataset.label || opt.text || "").toLowerCase();
+          opt.hidden = q !== "" && !hay.includes(q);
+        });
+      }
+
+      function removeSelected() {
+        if (selected.selectedIndex < 0) {
+          return;
+        }
+        selected.remove(selected.selectedIndex);
+        syncHiddenField();
+      }
+
+      function moveSelected(direction) {
+        const idx = selected.selectedIndex;
+        if (idx < 0) {
+          return;
+        }
+        const target = idx + direction;
+        if (target < 0 || target >= selected.options.length) {
+          return;
+        }
+        const option = selected.options[idx];
+        const clone = option.cloneNode(true);
+        selected.remove(idx);
+        selected.add(clone, selected.options[target]);
+        selected.selectedIndex = target;
+        syncHiddenField();
+      }
+
+      addBtn.addEventListener("click", function () {
+        const opt = available.options[available.selectedIndex];
+        if (!opt || !opt.value) {
+          return;
+        }
+        addOption(opt.value, opt.dataset.label || opt.text);
+      });
+
+      removeBtn.addEventListener("click", removeSelected);
+      upBtn.addEventListener("click", function () { moveSelected(-1); });
+      downBtn.addEventListener("click", function () { moveSelected(1); });
+      availableFilter.addEventListener("input", filterAvailable);
+
+      if (orderField.value) {
+        try {
+          const initial = JSON.parse(orderField.value);
+          if (Array.isArray(initial)) {
+            initial.forEach((item) => {
+              if (item && item.id) {
+                addOption(String(item.id), item.label || String(item.id));
+              }
+            });
+          }
+        } catch (_) {
+          orderField.value = "";
+        }
+      }
+      syncHiddenField();
+      filterAvailable();
+    }
+
+    function setupRepositorySelector() {
+      if (!repositoryAvailable || !repositoryBody || !repositoryOrderField) {
+        return;
+      }
+      const addBtn = document.getElementById("add-repository-btn");
+      if (!addBtn) {
+        return;
+      }
+      const state = [];
+
+      function syncHiddenField() {
+        repositoryOrderField.value = JSON.stringify(state.map((item) => ({
+          id: Number(item.id),
+          label: item.label,
+          during_build: !!item.during_build,
+          before_afterburner: !!item.before_afterburner,
+        })));
+      }
+
+      function refresh() {
+        repositoryBody.querySelectorAll("tr[data-repository-row]").forEach((row) => row.remove());
+        if (repositoryEmpty) {
+          repositoryEmpty.classList.toggle("d-none", state.length > 0);
+        }
+        state.forEach((item, idx) => {
+          const row = document.createElement("tr");
+          row.dataset.repositoryRow = String(item.id);
+
+          const nameCell = document.createElement("td");
+          const familyBadge = item.family ? ` <span class="badge text-bg-light border">${item.family}</span>` : "";
+          nameCell.innerHTML = `${item.label}${familyBadge}`;
+
+          const buildCell = document.createElement("td");
+          const buildCheckbox = document.createElement("input");
+          buildCheckbox.type = "checkbox";
+          buildCheckbox.className = "form-check-input";
+          buildCheckbox.checked = !!item.during_build;
+          buildCheckbox.addEventListener("change", function () {
+            item.during_build = buildCheckbox.checked;
+            syncHiddenField();
+          });
+          buildCell.appendChild(buildCheckbox);
+
+          const afterburnerCell = document.createElement("td");
+          const afterburnerCheckbox = document.createElement("input");
+          afterburnerCheckbox.type = "checkbox";
+          afterburnerCheckbox.className = "form-check-input";
+          afterburnerCheckbox.checked = !!item.before_afterburner;
+          afterburnerCheckbox.addEventListener("change", function () {
+            item.before_afterburner = afterburnerCheckbox.checked;
+            syncHiddenField();
+          });
+          afterburnerCell.appendChild(afterburnerCheckbox);
+
+          const actionsCell = document.createElement("td");
+          actionsCell.className = "text-end";
+          const controls = document.createElement("div");
+          controls.className = "d-inline-flex gap-2";
+          const upBtn = document.createElement("button");
+          upBtn.type = "button";
+          upBtn.className = "btn btn-sm btn-outline-secondary";
+          upBtn.textContent = "Up";
+          upBtn.disabled = idx === 0;
+          upBtn.addEventListener("click", function () {
+            if (idx === 0) {
+              return;
+            }
+            const temp = state[idx - 1];
+            state[idx - 1] = state[idx];
+            state[idx] = temp;
+            refresh();
+          });
+          const downBtn = document.createElement("button");
+          downBtn.type = "button";
+          downBtn.className = "btn btn-sm btn-outline-secondary";
+          downBtn.textContent = "Down";
+          downBtn.disabled = idx === state.length - 1;
+          downBtn.addEventListener("click", function () {
+            if (idx >= state.length - 1) {
+              return;
+            }
+            const temp = state[idx + 1];
+            state[idx + 1] = state[idx];
+            state[idx] = temp;
+            refresh();
+          });
+          const removeBtn = document.createElement("button");
+          removeBtn.type = "button";
+          removeBtn.className = "btn btn-sm btn-outline-danger";
+          removeBtn.textContent = "Remove";
+          removeBtn.addEventListener("click", function () {
+            state.splice(idx, 1);
+            refresh();
+          });
+          controls.appendChild(upBtn);
+          controls.appendChild(downBtn);
+          controls.appendChild(removeBtn);
+          actionsCell.appendChild(controls);
+
+          row.appendChild(nameCell);
+          row.appendChild(buildCell);
+          row.appendChild(afterburnerCell);
+          row.appendChild(actionsCell);
+          repositoryBody.appendChild(row);
+        });
+        syncHiddenField();
+      }
+
+      addBtn.addEventListener("click", function () {
+        const opt = repositoryAvailable.options[repositoryAvailable.selectedIndex];
+        if (!opt || !opt.value) {
+          return;
+        }
+        if (state.some((item) => item.id === Number(opt.value))) {
+          return;
+        }
+        state.push({
+          id: Number(opt.value),
+          label: opt.dataset.label || opt.text,
+          family: opt.dataset.family || "",
+          during_build: true,
+          before_afterburner: false,
+        });
+        refresh();
+      });
+
+      if (repositoryOrderField.value) {
+        try {
+          const initial = JSON.parse(repositoryOrderField.value);
+          if (Array.isArray(initial)) {
+            initial.forEach((item) => {
+              if (!item || !item.id) {
+                return;
+              }
+              const matching = Array.from(repositoryAvailable.options).find((opt) => Number(opt.value) === Number(item.id));
+              state.push({
+                id: Number(item.id),
+                label: item.label || (matching ? (matching.dataset.label || matching.text) : String(item.id)),
+                family: matching ? (matching.dataset.family || "") : "",
+                during_build: !!item.during_build,
+                before_afterburner: !!item.before_afterburner,
+              });
+            });
+          }
+        } catch (_) {
+          repositoryOrderField.value = "";
+        }
+      }
+      refresh();
+    }
 
     function showCompatibility(message, level) {
       if (!compatibilityBanner) {
@@ -111,14 +597,12 @@
         compatibilityBanner.classList.add("d-none");
         return;
       }
-
       const bootMode = machineBootModes[machineId];
       const meta = layoutMeta[layoutId];
       if (!bootMode || !meta) {
         compatibilityBanner.classList.add("d-none");
         return;
       }
-
       if (bootMode === "uefi" && meta.table_type !== "gpt") {
         showCompatibility("Invalid combination: UEFI machine config requires a GPT partition table.", "danger");
         return;
@@ -131,103 +615,51 @@
         showCompatibility("Invalid combination: BIOS machine config requires an MBR partition table.", "danger");
         return;
       }
-
       const modeLabel = bootMode.toUpperCase();
       const tableLabel = String(meta.table_type || "").toUpperCase();
       showCompatibility(`Compatible: ${modeLabel} machine config with ${tableLabel} partition layout.`, "success");
     }
 
-    function containsId(id) {
-      return Array.from(selected.options).some((opt) => opt.value === id);
-    }
-
-    function syncHiddenField() {
-      const payload = Array.from(selected.options).map((opt) => ({
-        id: Number(opt.value),
-        label: opt.text,
-      }));
-      orderField.value = JSON.stringify(payload);
-    }
-
-    function addOption(id, label) {
-      if (containsId(id)) {
-        return;
-      }
-      const opt = document.createElement("option");
-      opt.value = id;
-      opt.text = label;
-      selected.appendChild(opt);
-      syncHiddenField();
-    }
-
-    function filterAvailable() {
-      const q = (availableFilter.value || "").trim().toLowerCase();
-      Array.from(available.options).forEach((opt) => {
-        const hay = (opt.dataset.label || opt.text || "").toLowerCase();
-        opt.hidden = q !== "" && !hay.includes(q);
-      });
-    }
-
-    function removeSelected() {
-      if (selected.selectedIndex < 0) {
-        return;
-      }
-      selected.remove(selected.selectedIndex);
-      syncHiddenField();
-    }
-
-    function moveSelected(direction) {
-      const idx = selected.selectedIndex;
-      if (idx < 0) {
-        return;
-      }
-      const target = idx + direction;
-      if (target < 0 || target >= selected.options.length) {
-        return;
-      }
-      const option = selected.options[idx];
-      const clone = option.cloneNode(true);
-      selected.remove(idx);
-      selected.add(clone, selected.options[target]);
-      selected.selectedIndex = target;
-      syncHiddenField();
-    }
-
-    addBtn.addEventListener("click", function () {
-      const opt = available.options[available.selectedIndex];
-      if (!opt || !opt.value) {
-        return;
-      }
-      addOption(opt.value, opt.dataset.label || opt.text);
+    setupRepositorySelector();
+    setupOrderedSelector({
+      available: playbookAvailable,
+      availableFilter: playbookAvailableFilter,
+      selected: playbookSelected,
+      orderField: playbookOrderField,
+      addBtn: document.getElementById("add-playbook-btn"),
+      removeBtn: document.getElementById("remove-playbook-btn"),
+      upBtn: document.getElementById("move-up-btn"),
+      downBtn: document.getElementById("move-down-btn"),
     });
-
-    removeBtn.addEventListener("click", removeSelected);
-    upBtn.addEventListener("click", function () { moveSelected(-1); });
-    downBtn.addEventListener("click", function () { moveSelected(1); });
-    availableFilter.addEventListener("input", filterAvailable);
+    setupOrderedSelector({
+      available: afterburnerAvailable,
+      availableFilter: afterburnerAvailableFilter,
+      selected: afterburnerSelected,
+      orderField: afterburnerOrderField,
+      addBtn: document.getElementById("add-afterburner-btn"),
+      removeBtn: document.getElementById("remove-afterburner-btn"),
+      upBtn: document.getElementById("move-afterburner-up-btn"),
+      downBtn: document.getElementById("move-afterburner-down-btn"),
+    });
     if (machineConfigField) {
       machineConfigField.addEventListener("change", evaluateCompatibility);
     }
     if (partitionLayoutField) {
       partitionLayoutField.addEventListener("change", evaluateCompatibility);
     }
-
-    if (orderField.value) {
-      try {
-        const initial = JSON.parse(orderField.value);
-        if (Array.isArray(initial)) {
-          initial.forEach((item) => {
-            if (item && item.id) {
-              addOption(String(item.id), item.label || String(item.id));
-            }
-          });
-        }
-      } catch (_) {
-        orderField.value = "";
-      }
+    if (syncRhsmReposBtn) {
+      syncRhsmReposBtn.addEventListener("click", syncRhsmRepositories);
     }
-    syncHiddenField();
-    filterAvailable();
+    if (osField) {
+      osField.addEventListener("change", filterRhsmRepositories);
+      osField.addEventListener("change", updateRhsmSyncScopeLabel);
+    }
+    if (isoField) {
+      isoField.addEventListener("change", filterRhsmRepositories);
+      isoField.addEventListener("change", updateRhsmSyncScopeLabel);
+    }
+    updateRhsmSyncScopeLabel();
+    filterRhsmRepositories();
     evaluateCompatibility();
   })();
 </script>

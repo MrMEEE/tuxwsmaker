@@ -1,3 +1,8 @@
+import base64
+import hashlib
+
+from cryptography.fernet import Fernet, InvalidToken
+from django.conf import settings
 from django.db import models
 
 from apps.builds.models import SSHKey
@@ -12,6 +17,8 @@ class ServerConfiguration(models.Model):
 	artifact_retention_days = models.PositiveIntegerField(default=30)
 	enable_artifact_compression = models.BooleanField(default=True)
 	use_redhat_subscription = models.BooleanField(default=True)
+	rhn_username = models.CharField(max_length=120, blank=True)
+	rhn_password_encrypted = models.TextField(blank=True)
 	builder_base_image_path = models.CharField(max_length=500, blank=True)
 	builder_image_label = models.CharField(max_length=255, blank=True)
 	builder_image_source_url = models.CharField(max_length=500, blank=True)
@@ -69,6 +76,23 @@ class ServerConfiguration(models.Model):
 		key = SSHKey.objects.filter(scope=SSHKey.SCOPE_BUILDER, build=None, owner=None, name="builder-vm").first()
 		return bool(key and key.has_keypair())
 
+	def set_rhn_password(self, secret: str) -> None:
+		self.rhn_password_encrypted = _fernet_from_secret().encrypt(secret.encode("utf-8")).decode("utf-8")
+
+	def get_rhn_password(self) -> str:
+		if not self.rhn_password_encrypted:
+			return ""
+		try:
+			return _fernet_from_secret().decrypt(self.rhn_password_encrypted.encode("utf-8")).decode("utf-8")
+		except InvalidToken:
+			return ""
+
+	def clear_rhn_password(self) -> None:
+		self.rhn_password_encrypted = ""
+
+	def has_rhn_password(self) -> bool:
+		return bool(self.rhn_password_encrypted)
+
 	@classmethod
 	def get_concurrency_limit(cls) -> int:
 		cfg = cls.get_effective()
@@ -101,5 +125,10 @@ class BuilderProgressEvent(models.Model):
 
 	def __str__(self) -> str:
 		return f"{self.stage}: {self.message[:80]}"
+
+
+def _fernet_from_secret() -> Fernet:
+	digest = hashlib.sha256(settings.SECRET_KEY.encode("utf-8")).digest()
+	return Fernet(base64.urlsafe_b64encode(digest))
 
 # Create your models here.

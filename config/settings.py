@@ -69,6 +69,8 @@ INSTALLED_APPS = [
     "apps.layouts",
     "apps.packages",
     "apps.playbooks",
+    "apps.repositories",
+    "apps.afterburners",
     "apps.builds",
     "apps.serverconfig",
     "apps.api",
@@ -227,6 +229,23 @@ CELERY_BROKER_URL = REDIS_URL
 CELERY_RESULT_BACKEND = REDIS_URL
 CELERY_TASK_TRACK_STARTED = True
 CELERY_TASK_TIME_LIMIT = 60 * 60
+RHSM_DISCOVERY_RHEL_VERSIONS = [
+    int(v)
+    for v in env.list("RHSM_DISCOVERY_RHEL_VERSIONS", default=["8", "9", "10"])
+    if str(v).strip()
+]
+RHSM_DISCOVERY_ARCH = env("RHSM_DISCOVERY_ARCH", default="x86_64")
+RHSM_DISCOVERY_USERNAME = env("RHSM_DISCOVERY_USERNAME", default="")
+RHSM_DISCOVERY_PASSWORD = env("RHSM_DISCOVERY_PASSWORD", default="")
+RHSM_DISCOVERY_ORG_ID = env("RHSM_DISCOVERY_ORG_ID", default="")
+RHSM_DISCOVERY_ACTIVATION_KEY = env("RHSM_DISCOVERY_ACTIVATION_KEY", default="")
+RHSM_REPO_SYNC_INTERVAL_SECONDS = env.int("RHSM_REPO_SYNC_INTERVAL_SECONDS", default=60 * 60)
+CELERY_BEAT_SCHEDULE = {
+    "sync-rhsm-repository-catalog": {
+        "task": "repositories.sync_rhsm_repository_catalog",
+        "schedule": RHSM_REPO_SYNC_INTERVAL_SECONDS,
+    },
+}
 
 CSRF_TRUSTED_ORIGINS = [v for v in env.list("CSRF_TRUSTED_ORIGINS", default=[]) if v]
 

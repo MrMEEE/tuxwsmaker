@@ -27,6 +27,8 @@ from apps.builds.services.provisioning import AnsibleProvisioner, ProvisioningEr
 from apps.builds.services.ssh_keys import SSHKeyError, generate_build_ssh_keypair
 from apps.builds.services.virtualization import LibvirtVMManager, VMDefinition, VirtualizationError
 from apps.playbooks.services import PlaybookSyncError, checkout_repository, checkout_repository_url
+from apps.packages.models import PackageList
+from apps.repositories.services import render_repository_activation_snippet, render_repository_cleanup_snippet
 from apps.realtime.events import publish_event
 from apps.serverconfig.models import ServerConfiguration
 from config.celery import app as celery_app
@@ -602,6 +604,259 @@ def _run_selected_playbooks(
         )
 
 
+def _collect_selected_packages_for_build(build: BuildDefinition) -> tuple[list[str], list[str]]:
+    os_family = str(build.operating_system.family or "").strip().lower()
+    allowed_families = {PackageList.DISTRO_ALL}
+    if os_family == "rhel":
+        allowed_families.add(PackageList.DISTRO_RHEL)
+    elif os_family == "debian":
+        allowed_families.add(PackageList.DISTRO_DEBIAN)
+
+    package_names: list[str] = []
+    seen: set[str] = set()
+    skipped_lists: list[str] = []
+    selected_lists = build.package_lists.prefetch_related("items").order_by("name")
+    for package_list in selected_lists:
+        if package_list.distro_family not in allowed_families:
+            skipped_lists.append(package_list.name)
+            continue
+        for item in package_list.items.all():
+            pkg = str(item.package_name or "").strip()
+            if not pkg or pkg in seen:
+                continue
+            seen.add(pkg)
+            package_names.append(pkg)
+    return package_names, skipped_lists
+
+
+def _rhsm_selected_repo_ids(build: BuildDefinition) -> list[str]:
+    return [
+        str(repo.repo_id or "").strip()
+        for repo in build.rhsm_repositories.all().order_by("rhel_major", "repo_id")
+        if str(repo.repo_id or "").strip()
+    ]
+
+
+def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
+    vm_name = str(_runtime_state(build).get("vm_name") or _vm_name(build))
+    vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
+    if not vm_manager.domain_exists(vm_name) or not vm_manager.domain_is_active(vm_name):
+        raise ProvisioningError(f"Build VM {vm_name} is not running")
+
+    ip_address = _resolve_ip_for_existing_vm(build)
+    key_pair = _materialize_build_keypair(build)
+    try:
+        ssh_user = str(_runtime_state(build).get("build_ssh_user") or getattr(settings, "BUILD_VM_SSH_USER", "root"))
+        provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
+        _append_build_log(build=build, stage="ssh", message=f"Waiting for SSH access on {ssh_user}@{ip_address}")
+        provisioner.wait_for_ssh(
+            host=ip_address,
+            user=ssh_user,
+            private_key_path=str(key_pair.private_key_path),
+            timeout_seconds=180,
+        )
+        _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
+
+        os_family = str(build.operating_system.family or "").strip().lower()
+        rhsm_repo_ids = _rhsm_selected_repo_ids(build)
+        rhsm_registered = False
+        try:
+            if rhsm_repo_ids:
+                if os_family != "rhel":
+                    raise ProvisioningError("RHSM repositories can only be used on RHEL builds")
+                _append_build_log(build=build, stage="rhsm", message="Preparing RHSM registration for package installation")
+                registration_mode = str(build.rhsm_auth_mode or BuildDefinition.RHSM_AUTH_NONE).strip()
+                if registration_mode == BuildDefinition.RHSM_AUTH_USERPASS:
+                    username = str(build.rhsm_username or "").strip()
+                    password = str(build.get_rhsm_password() or "").strip()
+                    if not username or not password:
+                        raise ProvisioningError("RHSM username/password mode requires both username and password")
+                    register_command = (
+                        "if ! command -v subscription-manager >/dev/null 2>&1; then "
+                        "echo 'subscription-manager is not available on guest' >&2; exit 1; fi; "
+                        f"subscription-manager register --force --username {shlex.quote(username)} --password {shlex.quote(password)}"
+                    )
+                elif registration_mode == BuildDefinition.RHSM_AUTH_ACTIVATION_KEY:
+                    org_id = str(build.rhsm_org_id or "").strip()
+                    activation_key = str(build.get_rhsm_activation_key() or "").strip()
+                    if not org_id or not activation_key:
+                        raise ProvisioningError("RHSM activation-key mode requires both org ID and activation key")
+                    register_command = (
+                        "if ! command -v subscription-manager >/dev/null 2>&1; then "
+                        "echo 'subscription-manager is not available on guest' >&2; exit 1; fi; "
+                        f"subscription-manager register --force --org {shlex.quote(org_id)} --activationkey {shlex.quote(activation_key)}"
+                    )
+                else:
+                    raise ProvisioningError("RHSM authentication mode must be configured when RHSM repositories are selected")
+
+                _run_remote_checked(
+                    provisioner=provisioner,
+                    host=ip_address,
+                    user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                    command=register_command,
+                    timeout_seconds=300,
+                )
+                rhsm_registered = True
+                _append_build_log(build=build, stage="rhsm", message="RHSM registration completed")
+
+                enable_command = "subscription-manager repos " + " ".join(
+                    f"--enable={shlex.quote(repo_id)}" for repo_id in rhsm_repo_ids
+                )
+                _run_remote_checked(
+                    provisioner=provisioner,
+                    host=ip_address,
+                    user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                    command=enable_command,
+                    timeout_seconds=300,
+                )
+                _append_build_log(
+                    build=build,
+                    stage="rhsm",
+                    message=f"Enabled RHSM repositories: {', '.join(rhsm_repo_ids)}",
+                )
+
+            package_names, skipped_lists = _collect_selected_packages_for_build(build)
+            if skipped_lists:
+                _append_build_log(
+                    build=build,
+                    stage="packages",
+                    message=f"Skipping incompatible package lists for {build.operating_system.family}: {', '.join(skipped_lists)}",
+                )
+            if not package_names:
+                _append_build_log(build=build, stage="packages", message="No package list entries selected for installation")
+                _save_runtime_state(build, build_ip_address=ip_address)
+                return {"ip": ip_address, "packages_installed": "0"}
+
+            quoted_packages = " ".join(shlex.quote(pkg) for pkg in package_names)
+            if os_family == "debian":
+                install_command = (
+                    "if ! command -v apt-get >/dev/null 2>&1; then "
+                    "echo 'apt-get is not available on guest' >&2; exit 1; fi; "
+                    "export DEBIAN_FRONTEND=noninteractive; "
+                    "apt-get update -y; "
+                    f"apt-get install -y --no-install-recommends {quoted_packages}"
+                )
+            else:
+                install_command = (
+                    "PKG_MGR=''; "
+                    "if command -v dnf >/dev/null 2>&1; then PKG_MGR='dnf'; "
+                    "elif command -v yum >/dev/null 2>&1; then PKG_MGR='yum'; fi; "
+                    "if [[ -z \"$PKG_MGR\" ]]; then echo 'dnf/yum is not available on guest' >&2; exit 1; fi; "
+                    "$PKG_MGR -y --setopt=skip_if_unavailable=True makecache || true; "
+                    f"$PKG_MGR -y --setopt=skip_if_unavailable=True install {quoted_packages}"
+                )
+
+            _append_build_log(build=build, stage="packages", message=f"Installing {len(package_names)} package(s) from selected package lists")
+            _run_build_phase_repositories(
+                build=build,
+                provisioner=provisioner,
+                ip_address=ip_address,
+                ssh_user=ssh_user,
+                private_key_path=str(key_pair.private_key_path),
+            )
+            try:
+                _run_remote_checked(
+                    provisioner=provisioner,
+                    host=ip_address,
+                    user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                    command=install_command,
+                    timeout_seconds=1200,
+                )
+            finally:
+                _cleanup_build_phase_repositories(
+                    build=build,
+                    provisioner=provisioner,
+                    ip_address=ip_address,
+                    ssh_user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                )
+            _append_build_log(build=build, stage="packages", message="Package installation completed")
+            _save_runtime_state(build, build_ip_address=ip_address)
+            return {"ip": ip_address, "packages_installed": str(len(package_names))}
+        finally:
+            if rhsm_repo_ids:
+                _run_remote_checked(
+                    provisioner=provisioner,
+                    host=ip_address,
+                    user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                    command="subscription-manager repos " + " ".join(
+                        f"--disable={shlex.quote(repo_id)}" for repo_id in rhsm_repo_ids
+                    ) + " || true",
+                    timeout_seconds=180,
+                )
+            if rhsm_registered:
+                _run_remote_checked(
+                    provisioner=provisioner,
+                    host=ip_address,
+                    user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                    command="subscription-manager unregister >/dev/null 2>&1 || true; subscription-manager clean >/dev/null 2>&1 || true",
+                    timeout_seconds=120,
+                )
+    finally:
+        key_pair.cleanup_private()
+
+
+def _run_build_phase_repositories(
+    *,
+    build: BuildDefinition,
+    provisioner: AnsibleProvisioner,
+    ip_address: str,
+    ssh_user: str,
+    private_key_path: str,
+) -> None:
+    selections = [sel for sel in build.ordered_repository_selections() if sel.enable_during_build]
+    snippet = render_repository_activation_snippet(
+        selections=selections,
+        os_family=build.operating_system.family,
+        root_expression='""',
+        phase_label="build",
+    )
+    if not snippet:
+        return
+    _append_build_log(build=build, stage="repositories", message="Activating temporary repositories for build phase")
+    _run_remote_checked(
+        provisioner=provisioner,
+        host=ip_address,
+        user=ssh_user,
+        private_key_path=private_key_path,
+        command=snippet,
+        timeout_seconds=300,
+    )
+
+
+def _cleanup_build_phase_repositories(
+    *,
+    build: BuildDefinition,
+    provisioner: AnsibleProvisioner,
+    ip_address: str,
+    ssh_user: str,
+    private_key_path: str,
+) -> None:
+    selections = [sel for sel in build.ordered_repository_selections() if sel.enable_during_build]
+    snippet = render_repository_cleanup_snippet(
+        selections=selections,
+        os_family=build.operating_system.family,
+        root_expression='""',
+        phase_label="build",
+    )
+    if not snippet:
+        return
+    _append_build_log(build=build, stage="repositories", message="Cleaning up temporary repositories after build phase")
+    _run_remote_checked(
+        provisioner=provisioner,
+        host=ip_address,
+        user=ssh_user,
+        private_key_path=private_key_path,
+        command=snippet,
+        timeout_seconds=300,
+    )
+
+
 def _step_create_vm_shell(build: BuildDefinition) -> dict[str, str]:
     timeout_seconds = _build_timeout_seconds(build)
     effective_boot_mode = _resolve_effective_boot_mode(build=build)
@@ -837,6 +1092,54 @@ def _step_install_os(build: BuildDefinition) -> dict[str, str]:
     _append_build_log(build=build, stage="network", message=f"Watching builder dnsmasq for MAC {vm_mac_address}")
     key_pair = _materialize_build_keypair(build)
     try:
+        kickstart_dir = _artifact_root() / "kickstarts"
+        refreshed_kickstart_path = render_kickstart_file(
+            output_dir=kickstart_dir,
+            vm_name=vm_name,
+            ssh_public_key=key_pair.public_key,
+            partition_layout=build.partition_layout,
+        )
+        remote_kickstart_path = f"/var/www/html/kickstarts/{kickstart_name}"
+        _run_remote_checked(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            command="mkdir -p /var/www/html/kickstarts",
+            timeout_seconds=timeout_seconds,
+        )
+        builder_provisioner.upload_file(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            local_path=refreshed_kickstart_path,
+            remote_path=remote_kickstart_path,
+            timeout_seconds=timeout_seconds,
+        )
+        _run_remote_checked(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            command=(
+                f"restorecon -v {remote_kickstart_path} >/dev/null 2>&1 "
+                f"|| chcon -t httpd_sys_content_t {remote_kickstart_path} >/dev/null 2>&1 || true"
+            ),
+            timeout_seconds=timeout_seconds,
+        )
+        _append_build_log(build=build, stage="kickstart", message=f"Refreshed kickstart file {kickstart_name}")
+        logvol_lines = [
+            line.strip()
+            for line in refreshed_kickstart_path.read_text(encoding="utf-8").splitlines()
+            if line.lstrip().startswith("logvol ")
+        ]
+        if logvol_lines:
+            _append_build_log(
+                build=build,
+                stage="kickstart",
+                message=f"Kickstart logvol lines: {' | '.join(logvol_lines)}",
+            )
+
         ip_address = builder_provisioner.wait_for_guest_boot_progress(
             host=builder_ip,
             user=builder_ssh_user,
@@ -875,13 +1178,29 @@ def _step_run_playbooks(build: BuildDefinition) -> dict[str, str]:
             timeout_seconds=180,
         )
         _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
-        _run_selected_playbooks(
+        _run_build_phase_repositories(
             build=build,
             provisioner=provisioner,
             ip_address=ip_address,
             ssh_user=ssh_user,
             private_key_path=str(key_pair.private_key_path),
         )
+        try:
+            _run_selected_playbooks(
+                build=build,
+                provisioner=provisioner,
+                ip_address=ip_address,
+                ssh_user=ssh_user,
+                private_key_path=str(key_pair.private_key_path),
+            )
+        finally:
+            _cleanup_build_phase_repositories(
+                build=build,
+                provisioner=provisioner,
+                ip_address=ip_address,
+                ssh_user=ssh_user,
+                private_key_path=str(key_pair.private_key_path),
+            )
         _save_runtime_state(build, build_ip_address=ip_address)
         return {"ip": ip_address}
     finally:
@@ -958,6 +1277,8 @@ def _execute_step(build: BuildDefinition, step: str) -> dict[str, str]:
         return _step_create_vm_shell(build)
     if step == BuildDefinition.STEP_INSTALL_OS:
         return _step_install_os(build)
+    if step == BuildDefinition.STEP_INSTALL_PACKAGES:
+        return _step_install_packages(build)
     if step == BuildDefinition.STEP_RUN_PLAYBOOKS:
         return _step_run_playbooks(build)
     if step == BuildDefinition.STEP_SHUTDOWN:
@@ -1079,13 +1400,29 @@ def rerun_build_playbooks(self, build_id: int, ip_address: str = "") -> dict[str
                 timeout_seconds=180,
             )
             _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
-            _run_selected_playbooks(
+            _run_build_phase_repositories(
                 build=build,
                 provisioner=provisioner,
                 ip_address=effective_ip,
                 ssh_user=ssh_user,
                 private_key_path=str(key_pair.private_key_path),
             )
+            try:
+                _run_selected_playbooks(
+                    build=build,
+                    provisioner=provisioner,
+                    ip_address=effective_ip,
+                    ssh_user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                )
+            finally:
+                _cleanup_build_phase_repositories(
+                    build=build,
+                    provisioner=provisioner,
+                    ip_address=effective_ip,
+                    ssh_user=ssh_user,
+                    private_key_path=str(key_pair.private_key_path),
+                )
             _append_build_log(build=build, stage="playbooks", message="Playbook re-run completed successfully")
             _save_runtime_state(build, build_ip_address=effective_ip)
             return {"status": "ok", "ip": effective_ip, "vm": vm_name}

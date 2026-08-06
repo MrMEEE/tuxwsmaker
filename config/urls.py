@@ -12,6 +12,8 @@ urlpatterns = [
     path("partitions/", include("apps.layouts.urls")),
     path("packages/", include("apps.packages.urls")),
     path("playbooks/", include("apps.playbooks.urls")),
+    path("repositories/", include("apps.repositories.urls")),
+    path("afterburners/", include("apps.afterburners.urls")),
     path("builds/", include("apps.builds.urls")),
     path("configuration/", include("apps.serverconfig.urls")),
     path("api/", include("apps.api.urls")),

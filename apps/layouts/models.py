@@ -85,9 +85,18 @@ class PartitionEntry(models.Model):
 			raise ValidationError("size_mib is required for fixed-size partitions")
 		if self.size_mode == self.SIZE_REMAINDER and self.size_mib:
 			raise ValidationError("size_mib must be empty when using remainder mode")
-		if self.luks_enabled and not self.luks_name:
-			raise ValidationError("luks_name is required when LUKS is enabled")
+		if self.luks_enabled:
+			if self.entry_role != self.ROLE_PV:
+				raise ValidationError("LUKS can only be enabled on the encrypted PV container")
+			if self.filesystem != "none":
+				raise ValidationError("Encrypted PV containers must use filesystem 'none'")
+			if self.mount_point:
+				raise ValidationError("Encrypted PV containers must not have a mount_point")
+			if not self.luks_name:
+				raise ValidationError("luks_name is required when LUKS is enabled")
 		if self.entry_role == self.ROLE_LV:
+			if self.luks_enabled:
+				raise ValidationError("LVM logical volumes must not be marked LUKS-enabled")
 			if not self.volume_group:
 				raise ValidationError("volume_group is required for LVM logical volumes")
 			if not self.logical_volume:

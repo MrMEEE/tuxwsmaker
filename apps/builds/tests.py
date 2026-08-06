@@ -12,10 +12,11 @@ from unittest.mock import patch
 
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig, SSHKey
 from apps.builds.services.artifacts import generate_artifacts
+from apps.builds.services.kickstart import render_kickstart_file
 from apps.builds.views import _probe_vm_ssh_ready, _recover_stale_build_state
 from apps.workers.tasks import _execute_step, build_task_cache_key, reconcile_stale_build_states_on_startup
 from apps.catalog.models import ISOImage, OperatingSystem
-from apps.layouts.models import PartitionLayout
+from apps.layouts.models import PartitionEntry, PartitionLayout
 from apps.serverconfig.models import ServerConfiguration
 
 
@@ -151,6 +152,13 @@ class BuildManualStepTests(TestCase):
 		self.build.runtime_state = {"last_completed_step": BuildDefinition.STEP_VM_SHELL}
 		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_INSTALL_OS)
 		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_INSTALL_OS))
+		self.assertFalse(self.build.can_run_manual_step(BuildDefinition.STEP_INSTALL_PACKAGES))
+		self.assertFalse(self.build.can_run_manual_step(BuildDefinition.STEP_RUN_PLAYBOOKS))
+
+		self.build.current_step = BuildDefinition.STEP_INSTALL_OS
+		self.build.runtime_state = {"last_completed_step": BuildDefinition.STEP_INSTALL_OS}
+		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_INSTALL_PACKAGES)
+		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_INSTALL_PACKAGES))
 		self.assertFalse(self.build.can_run_manual_step(BuildDefinition.STEP_RUN_PLAYBOOKS))
 
 	def test_cleanup_step_is_available_after_release(self):
@@ -323,3 +331,44 @@ class BuildVmSshProbeTests(TestCase):
 		self.assertTrue(vm_ssh_ready)
 		self.assertEqual(vm_ip, "192.168.200.10")
 		vm_manager.current_ipv4.assert_not_called()
+
+
+class KickstartRenderingTests(TestCase):
+	def test_render_kickstart_includes_grow_for_lv_missing_size(self):
+		layout = PartitionLayout.objects.create(name="layout-kickstart-lv-size")
+		PartitionEntry.objects.create(
+			layout=layout,
+			order=1,
+			name="pv0",
+			entry_role=PartitionEntry.ROLE_PV,
+			filesystem="none",
+			size_mode=PartitionEntry.SIZE_FIXED,
+			size_mib=8192,
+			volume_group="vg0",
+		)
+		# Intentionally skip size_mib to emulate legacy rows that bypassed full_clean.
+		PartitionEntry.objects.create(
+			layout=layout,
+			order=2,
+			name="lvroot",
+			entry_role=PartitionEntry.ROLE_LV,
+			mount_point="/",
+			filesystem="xfs",
+			size_mode=PartitionEntry.SIZE_FIXED,
+			size_mib=None,
+			volume_group="vg0",
+			logical_volume="root",
+		)
+
+		out_dir = Path("/tmp/tuxwsmaker-test-kickstart-lv-size")
+		shutil.rmtree(out_dir, ignore_errors=True)
+		path = render_kickstart_file(
+			output_dir=out_dir,
+			vm_name="vm-lv-size",
+			ssh_public_key="ssh-ed25519 AAAA test",
+			partition_layout=layout,
+		)
+		content = path.read_text(encoding="utf-8")
+
+		self.assertIn("volgroup vg0 pv.01", content)
+		self.assertIn("logvol / --vgname=vg0 --name=root --size=1 --grow --fstype=xfs", content)

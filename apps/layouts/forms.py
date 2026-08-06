@@ -51,8 +51,17 @@ class PartitionEntryForm(forms.ModelForm):
             raise forms.ValidationError("Fixed-size entries require size_mib")
         if size_mode == PartitionEntry.SIZE_REMAINDER and size_mib:
             raise forms.ValidationError("Remainder entries must not set size_mib")
-        if luks_enabled and not luks_name:
-            raise forms.ValidationError("LUKS-enabled entries require luks_name")
+        if luks_enabled:
+            if entry_role != PartitionEntry.ROLE_PV:
+                raise forms.ValidationError("LUKS can only be enabled on the encrypted PV container")
+            if filesystem != "none":
+                raise forms.ValidationError("Encrypted PV containers must use filesystem 'none'")
+            if mount_point:
+                raise forms.ValidationError("Encrypted PV containers must not have mount_point")
+            if not luks_name:
+                raise forms.ValidationError("LUKS-enabled entries require luks_name")
+        if entry_role == PartitionEntry.ROLE_LV and luks_enabled:
+            raise forms.ValidationError("LVM logical volumes must not be marked LUKS-enabled")
         if entry_role == PartitionEntry.ROLE_LV and not volume_group:
             raise forms.ValidationError("LVM logical volumes require volume_group")
         if entry_role == PartitionEntry.ROLE_LV and not logical_volume:
