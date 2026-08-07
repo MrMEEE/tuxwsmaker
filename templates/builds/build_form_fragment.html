@@ -30,15 +30,36 @@
       </div>
       <p class="text-muted small mb-2">Optional. Needed when packages depend on subscription-only RHEL repositories.</p>
     </div>
-    <div class="col-md-4">{{ form.rhsm_auth_mode.label_tag }} {{ form.rhsm_auth_mode }}</div>
-    <div class="col-md-4">{{ form.rhsm_username.label_tag }} {{ form.rhsm_username }}</div>
-    <div class="col-md-4">{{ form.rhsm_password.label_tag }} {{ form.rhsm_password }}</div>
-    <div class="col-md-4">{{ form.rhsm_org_id.label_tag }} {{ form.rhsm_org_id }}</div>
-    <div class="col-md-4">{{ form.rhsm_activation_key.label_tag }} {{ form.rhsm_activation_key }}</div>
+    <div class="col-md-4" id="rhsm-auth-mode-wrap">{{ form.rhsm_auth_mode.label_tag }} {{ form.rhsm_auth_mode }}</div>
+    <div class="col-md-4" id="rhsm-username-wrap">{{ form.rhsm_username.label_tag }} {{ form.rhsm_username }}</div>
+    <div class="col-md-4" id="rhsm-password-wrap">{{ form.rhsm_password.label_tag }} {{ form.rhsm_password }}</div>
+    <div class="col-md-4" id="rhsm-org-wrap">{{ form.rhsm_org_id.label_tag }} {{ form.rhsm_org_id }}</div>
+    <div class="col-md-4" id="rhsm-activation-wrap">{{ form.rhsm_activation_key.label_tag }} {{ form.rhsm_activation_key }}</div>
+    <div class="col-12 d-none" id="rhsm-config-hint-wrap">
+      <div class="form-text">Using credentials from Configuration.</div>
+    </div>
     <div class="col-12">
-      {{ form.rhsm_repositories.label_tag }}
-      <div class="border rounded p-2" style="max-height: 220px; overflow-y: auto;">
-        {{ form.rhsm_repositories }}
+      <h6 class="mb-2">RHSM Repositories</h6>
+      {{ form.rhsm_repository_order_json }}
+      <div class="row g-3 mb-2">
+        <div class="col-md-5">
+          <label class="form-label" for="id_rhsm_repositories">Available RHSM Repositories</label>
+          {{ form.rhsm_repositories }}
+          <button class="btn btn-sm btn-outline-primary mt-2" type="button" id="add-rhsm-repository-btn">Attach RHSM Repository</button>
+        </div>
+        <div class="col-md-7">
+          <label class="form-label">Selected RHSM Repositories</label>
+          <div class="border rounded p-2">
+            <table class="table table-sm align-middle mb-0">
+              <thead>
+                <tr><th>Repository</th><th>During Build</th><th>In Afterburner</th><th class="text-end">Actions</th></tr>
+              </thead>
+              <tbody id="selected-rhsm-repositories-body">
+                <tr id="selected-rhsm-repositories-empty"><td colspan="4" class="text-muted">No RHSM repositories attached.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </div>
       <div id="rhsm-sync-status" class="alert d-none mt-2 mb-0" role="status"></div>
     </div>
@@ -171,7 +192,15 @@
     const partitionLayoutField = document.getElementById("id_partition_layout");
     const osField = document.getElementById("id_operating_system");
     const isoField = document.getElementById("id_iso_image");
+    const rhsmAuthModeField = document.getElementById("id_rhsm_auth_mode");
+    const rhsmUsernameField = document.getElementById("id_rhsm_username");
+    const rhsmPasswordField = document.getElementById("id_rhsm_password");
+    const rhsmOrgField = document.getElementById("id_rhsm_org_id");
+    const rhsmActivationField = document.getElementById("id_rhsm_activation_key");
     const rhsmRepoField = document.getElementById("id_rhsm_repositories");
+    const rhsmRepositoryBody = document.getElementById("selected-rhsm-repositories-body");
+    const rhsmRepositoryEmpty = document.getElementById("selected-rhsm-repositories-empty");
+    const rhsmRepositoryOrderField = document.getElementById("id_rhsm_repository_order_json");
     const syncRhsmReposBtn = document.getElementById("sync-rhsm-repos-btn");
     const compatibilityBanner = document.getElementById("boot-layout-compatibility");
 
@@ -179,6 +208,31 @@
     const layoutMeta = JSON.parse(document.getElementById("layout-meta-map").textContent || "{}");
     const isoMajorMap = JSON.parse(document.getElementById("iso-major-map").textContent || "{}");
     const rhsmRepoMetaMap = JSON.parse(document.getElementById("rhsm-repo-meta-map").textContent || "{}");
+
+    function setFieldVisible(wrapperId, field, visible) {
+      const wrapper = document.getElementById(wrapperId);
+      if (wrapper) {
+        wrapper.classList.toggle("d-none", !visible);
+      }
+      if (field) {
+        field.disabled = !visible;
+      }
+    }
+
+    function updateRhsmCredentialVisibility() {
+      const mode = rhsmAuthModeField ? String(rhsmAuthModeField.value || "none") : "none";
+      const isUserPass = mode === "userpass";
+      const isActivationKey = mode === "activation_key";
+      const isConfigCreds = mode === "config_credentials";
+      setFieldVisible("rhsm-username-wrap", rhsmUsernameField, isUserPass);
+      setFieldVisible("rhsm-password-wrap", rhsmPasswordField, isUserPass);
+      setFieldVisible("rhsm-org-wrap", rhsmOrgField, isActivationKey);
+      setFieldVisible("rhsm-activation-wrap", rhsmActivationField, isActivationKey);
+      const hint = document.getElementById("rhsm-config-hint-wrap");
+      if (hint) {
+        hint.classList.toggle("d-none", !isConfigCreds);
+      }
+    }
 
     function getCookie(name) {
       const value = `; ${document.cookie}`;
@@ -582,6 +636,156 @@
       refresh();
     }
 
+    function setupRhsmRepositorySelector() {
+      if (!rhsmRepoField || !rhsmRepositoryBody || !rhsmRepositoryOrderField) {
+        return;
+      }
+      const addBtn = document.getElementById("add-rhsm-repository-btn");
+      if (!addBtn) {
+        return;
+      }
+      const state = [];
+
+      function syncHiddenField() {
+        rhsmRepositoryOrderField.value = JSON.stringify(state.map((item) => ({
+          id: Number(item.id),
+          label: item.label,
+          during_build: !!item.during_build,
+          before_afterburner: !!item.before_afterburner,
+        })));
+      }
+
+      function refresh() {
+        rhsmRepositoryBody.querySelectorAll("tr[data-rhsm-repository-row]").forEach((row) => row.remove());
+        if (rhsmRepositoryEmpty) {
+          rhsmRepositoryEmpty.classList.toggle("d-none", state.length > 0);
+        }
+        state.forEach((item, idx) => {
+          const row = document.createElement("tr");
+          row.dataset.rhsmRepositoryRow = String(item.id);
+
+          const nameCell = document.createElement("td");
+          nameCell.textContent = item.label;
+
+          const buildCell = document.createElement("td");
+          const buildCheckbox = document.createElement("input");
+          buildCheckbox.type = "checkbox";
+          buildCheckbox.className = "form-check-input";
+          buildCheckbox.checked = !!item.during_build;
+          buildCheckbox.addEventListener("change", function () {
+            item.during_build = buildCheckbox.checked;
+            syncHiddenField();
+          });
+          buildCell.appendChild(buildCheckbox);
+
+          const afterburnerCell = document.createElement("td");
+          const afterburnerCheckbox = document.createElement("input");
+          afterburnerCheckbox.type = "checkbox";
+          afterburnerCheckbox.className = "form-check-input";
+          afterburnerCheckbox.checked = !!item.before_afterburner;
+          afterburnerCheckbox.addEventListener("change", function () {
+            item.before_afterburner = afterburnerCheckbox.checked;
+            syncHiddenField();
+          });
+          afterburnerCell.appendChild(afterburnerCheckbox);
+
+          const actionsCell = document.createElement("td");
+          actionsCell.className = "text-end";
+          const controls = document.createElement("div");
+          controls.className = "d-inline-flex gap-2";
+          const upBtn = document.createElement("button");
+          upBtn.type = "button";
+          upBtn.className = "btn btn-sm btn-outline-secondary";
+          upBtn.textContent = "Up";
+          upBtn.disabled = idx === 0;
+          upBtn.addEventListener("click", function () {
+            if (idx === 0) {
+              return;
+            }
+            const temp = state[idx - 1];
+            state[idx - 1] = state[idx];
+            state[idx] = temp;
+            refresh();
+          });
+          const downBtn = document.createElement("button");
+          downBtn.type = "button";
+          downBtn.className = "btn btn-sm btn-outline-secondary";
+          downBtn.textContent = "Down";
+          downBtn.disabled = idx === state.length - 1;
+          downBtn.addEventListener("click", function () {
+            if (idx >= state.length - 1) {
+              return;
+            }
+            const temp = state[idx + 1];
+            state[idx + 1] = state[idx];
+            state[idx] = temp;
+            refresh();
+          });
+          const removeBtn = document.createElement("button");
+          removeBtn.type = "button";
+          removeBtn.className = "btn btn-sm btn-outline-danger";
+          removeBtn.textContent = "Remove";
+          removeBtn.addEventListener("click", function () {
+            state.splice(idx, 1);
+            refresh();
+          });
+          controls.appendChild(upBtn);
+          controls.appendChild(downBtn);
+          controls.appendChild(removeBtn);
+          actionsCell.appendChild(controls);
+
+          row.appendChild(nameCell);
+          row.appendChild(buildCell);
+          row.appendChild(afterburnerCell);
+          row.appendChild(actionsCell);
+          rhsmRepositoryBody.appendChild(row);
+        });
+        syncHiddenField();
+      }
+
+      function addCurrentRhsmOption() {
+        const option = rhsmRepoField.options[rhsmRepoField.selectedIndex];
+        if (!option || !option.value || option.hidden) {
+          return;
+        }
+        const repoId = Number(option.value);
+        if (state.some((item) => item.id === repoId)) {
+          return;
+        }
+        state.push({
+          id: repoId,
+          label: option.dataset.label || option.text || String(repoId),
+          during_build: true,
+          before_afterburner: false,
+        });
+        refresh();
+      }
+
+      if (rhsmRepositoryOrderField.value) {
+        try {
+          const initial = JSON.parse(rhsmRepositoryOrderField.value);
+          if (Array.isArray(initial)) {
+            initial.forEach((item) => {
+              if (!item || !item.id) {
+                return;
+              }
+              state.push({
+                id: Number(item.id),
+                label: String(item.label || item.id),
+                during_build: !!item.during_build,
+                before_afterburner: !!item.before_afterburner,
+              });
+            });
+          }
+        } catch (_) {
+          rhsmRepositoryOrderField.value = "";
+        }
+      }
+
+      addBtn.addEventListener("click", addCurrentRhsmOption);
+      refresh();
+    }
+
     if (!playbookAvailable || !playbookAvailableFilter || !playbookSelected || !playbookOrderField) {
       return;
     }
@@ -632,6 +836,7 @@
     }
 
     setupRepositorySelector();
+    setupRhsmRepositorySelector();
     setupOrderedSelector({
       available: playbookAvailable,
       availableFilter: playbookAvailableFilter,
@@ -662,6 +867,9 @@
     if (syncRhsmReposBtn) {
       syncRhsmReposBtn.addEventListener("click", syncRhsmRepositories);
     }
+    if (rhsmAuthModeField) {
+      rhsmAuthModeField.addEventListener("change", updateRhsmCredentialVisibility);
+    }
     if (osField) {
       osField.addEventListener("change", filterRhsmRepositories);
       osField.addEventListener("change", updateRhsmSyncScopeLabel);
@@ -673,6 +881,8 @@
     updateRhsmSyncScopeLabel();
 
     filterRhsmRepositories();
+
+    updateRhsmCredentialVisibility();
 
     evaluateCompatibility();
   })();

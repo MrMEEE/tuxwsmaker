@@ -29,6 +29,7 @@ from .models import (
 	BuildMachineConfig,
 	BuildPlaybookSelection,
 	BuildRepositorySelection,
+	BuildRhsmRepositorySelection,
 	SSHKey,
 )
 from .services.builder import BuilderVMManager
@@ -80,6 +81,26 @@ def _persist_build_repository_order(build: BuildDefinition, ordered_rows: list[d
 			for index, row in enumerate(ordered_rows)
 		]
 	)
+
+
+def _persist_build_rhsm_repository_order(build: BuildDefinition, ordered_rows: list[dict[str, object]]) -> None:
+	BuildRhsmRepositorySelection.objects.filter(build=build).delete()
+	if not ordered_rows:
+		build.rhsm_repositories.clear()
+		return
+	BuildRhsmRepositorySelection.objects.bulk_create(
+		[
+			BuildRhsmRepositorySelection(
+				build=build,
+				repository_id=int(row["id"]),
+				order=index + 1,
+				enable_during_build=bool(row.get("during_build")),
+				enable_before_afterburner=bool(row.get("before_afterburner")),
+			)
+			for index, row in enumerate(ordered_rows)
+		]
+	)
+	build.rhsm_repositories.set([int(row["id"]) for row in ordered_rows])
 
 
 def _extract_last_known_vm_ip(build: BuildDefinition) -> str:
@@ -335,6 +356,7 @@ class BuildCreateView(LoginRequiredMixin, CreateView):
 		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_ids", []))
 		_persist_build_afterburner_order(self.object, form.cleaned_data.get("ordered_afterburner_ids", []))
 		_persist_build_repository_order(self.object, form.cleaned_data.get("ordered_repository_payload", []))
+		_persist_build_rhsm_repository_order(self.object, form.cleaned_data.get("ordered_rhsm_repository_payload", []))
 		publish_event("builds", "created", {"build_id": self.object.id, "status": self.object.status})
 		if _is_modal_request(self.request):
 			return JsonResponse({"ok": True, "build_id": self.object.id, "message": "Build saved"})
@@ -367,6 +389,7 @@ class BuildUpdateView(LoginRequiredMixin, UpdateView):
 		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_ids", []))
 		_persist_build_afterburner_order(self.object, form.cleaned_data.get("ordered_afterburner_ids", []))
 		_persist_build_repository_order(self.object, form.cleaned_data.get("ordered_repository_payload", []))
+		_persist_build_rhsm_repository_order(self.object, form.cleaned_data.get("ordered_rhsm_repository_payload", []))
 		publish_event("builds", "updated", {"build_id": self.object.id, "status": self.object.status})
 		if _is_modal_request(self.request):
 			return JsonResponse({"ok": True, "build_id": self.object.id, "message": "Build saved"})

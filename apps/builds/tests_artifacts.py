@@ -18,7 +18,7 @@ from apps.builds.services.artifacts import (
 from apps.builds.services.kickstart import render_deploy_restore_script
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
-from apps.repositories.models import PackageRepository
+from apps.repositories.models import PackageRepository, RedHatRepositoryCatalog
 
 
 class ArtifactGenerationTests(TestCase):
@@ -249,6 +249,76 @@ class ArtifactGenerationTests(TestCase):
     @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
     @patch("apps.builds.services.artifacts._export_usb_image")
     @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_pxe_bundle_persists_rhsm_repo_ids_for_afterburner_restore(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
+        profile = AfterburnerProfile.objects.create(name="70-rhsm")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="rh registration",
+            item_type=AfterburnerItem.TYPE_REDHAT_REGISTRATION,
+            config={
+                "username": "rh-user",
+                "password": "rh-pass",
+                "repo_ids": "",
+            },
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        rhsm_repo_a = RedHatRepositoryCatalog.objects.create(
+            rhel_major=10,
+            architecture="x86_64",
+            repo_id="rhel-10-for-x86_64-baseos-rpms",
+            name="BaseOS",
+        )
+        rhsm_repo_b = RedHatRepositoryCatalog.objects.create(
+            rhel_major=10,
+            architecture="x86_64",
+            repo_id="rhel-10-for-x86_64-appstream-rpms",
+            name="AppStream",
+        )
+        self.build.rhsm_repository_selections.create(
+            repository=rhsm_repo_a,
+            order=1,
+            enable_during_build=False,
+            enable_before_afterburner=True,
+        )
+        self.build.rhsm_repository_selections.create(
+            repository=rhsm_repo_b,
+            order=2,
+            enable_during_build=False,
+            enable_before_afterburner=True,
+        )
+
+        root = Path("/tmp/tuxwsmaker-test-rhsm-repo-payload")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
+
+        deploy_root = root / f"build-{self.build.id}" / "pxe" / "deploy"
+        repo_file = deploy_root / "rhsm-repositories.txt"
+        self.assertTrue(repo_file.exists())
+        self.assertEqual(
+            repo_file.read_text(encoding="utf-8"),
+            "rhel-10-for-x86_64-baseos-rpms\nrhel-10-for-x86_64-appstream-rpms\n",
+        )
+
+        script = (deploy_root / "afterburner.sh").read_text(encoding="utf-8")
+        self.assertIn("RHSM_REPO_FILE=/run/install/repo/deploy/rhsm-repositories.txt", script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._export_usb_image")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
     def test_pxe_afterburner_script_includes_tpm_integration_prompt(self, mock_extract, _mock_usb, _mock_iso_tree, mock_uefi):
         profile = AfterburnerProfile.objects.create(name="60-tpm")
         AfterburnerItem.objects.create(
@@ -378,7 +448,7 @@ class ArtifactGenerationTests(TestCase):
         self.assertEqual(manifest["deploy_manifest"], "deploy.json")
         self.assertEqual(manifest["os_family"], OperatingSystem.FAMILY_RHEL)
         self.assertIn("RHEL-family finish adapter", restore_script)
-        self.assertIn("sfdisk --wipe always --wipe-partitions always", restore_script)
+        self.assertIn("sfdisk --force --wipe always --wipe-partitions always", restore_script)
         self.assertIn("Restoring partition", restore_script)
         self.assertIn("status()", restore_script)
         self.assertIn("[$PART_INDEX/$TOTAL_PARTS]", restore_script)
@@ -393,10 +463,10 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("DEPLOY_MANIFEST_URL=file:///run/install/repo/deploy.json", deploy_kickstart)
         self.assertIn("%pre --erroronfail", deploy_kickstart)
         self.assertIn("%pre --erroronfail --log=/tmp/deploy-pre.log", deploy_kickstart)
-        self.assertIn("exec > >(tee /dev/console) 2>&1", deploy_kickstart)
+        self.assertIn('exec < "$PRE_INPUT_TTY" > "$PRE_INPUT_TTY" 2>&1', deploy_kickstart)
         self.assertNotIn('DEPLOY_TTY="/dev/tty6"', deploy_kickstart)
         self.assertNotIn("chvt 6", deploy_kickstart)
-        self.assertNotIn("read -r _ < /dev/console", deploy_kickstart)
+        self.assertIn("read -r -t 900 _ || true", deploy_kickstart)
         self.assertIn("bash /tmp/restore.sh", deploy_kickstart)
         self.assertNotIn("%packages", deploy_kickstart)
         self.assertIn("Missing local restore script", deploy_kickstart)
@@ -622,10 +692,11 @@ class ArtifactGenerationTests(TestCase):
         render_deploy_restore_script(output_dir=root / "deploy", os_family=OperatingSystem.FAMILY_RHEL)
         script = (root / "deploy" / "restore.sh").read_text(encoding="utf-8")
 
-        self.assertIn('[[ "$entry_role" == "pv" && "$luks_enabled" == "True" ]]', script)
-        self.assertIn('cryptsetup open "$part_dev" "$map_name"', script)
-        self.assertIn('ROOT_DEV="/dev/${volume_group}/${logical_volume}"', script)
-        self.assertIn('source_dev="/dev/${volume_group}/${logical_volume}"', script)
+        self.assertIn('[[ "$luks_enabled" == "True" ]]', script)
+        self.assertIn('printf \'%s\' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -', script)
+        self.assertIn('ROOT_DEV="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"', script)
+        self.assertIn('source_dev="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"', script)
+        self.assertIn('resolve_lv_path() {', script)
         self.assertIn('str(entry.get("size_mode") or "fixed")', script)
         self.assertIn('DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"', script)
         self.assertIn('cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -', script)

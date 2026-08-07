@@ -56,6 +56,10 @@
             font-size: 0.875rem;
             padding: 0.25rem 0.5rem;
         }
+
+        .modal-dialog.modal-wide {
+            max-width: min(96vw, 1700px);
+        }
     </style>
 
     {% block extra_css %}{% endblock %}
@@ -351,7 +355,7 @@
         </script>
 
         <div class="modal fade" id="app-modal" tabindex="-1" aria-hidden="true">
-            <div class="modal-dialog modal-xl modal-dialog-scrollable">
+            <div class="modal-dialog modal-xl modal-dialog-scrollable" id="app-modal-dialog">
                 <div class="modal-content">
                     <div class="modal-header">
                         <h5 class="modal-title" id="app-modal-title">Dialog</h5>
@@ -475,9 +479,10 @@
                 }
 
                 const modalEl = document.getElementById("app-modal");
+                const modalDialogEl = document.getElementById("app-modal-dialog");
                 const modalTitleEl = document.getElementById("app-modal-title");
                 const modalBodyEl = document.getElementById("app-modal-body");
-                if (!modalEl || !modalBodyEl) {
+                if (!modalEl || !modalDialogEl || !modalBodyEl) {
                     return;
                 }
 
@@ -553,8 +558,20 @@
                     });
                 }
 
-                async function openModal(url, title) {
+                function applyModalSize(size) {
+                    modalDialogEl.classList.remove("modal-wide", "modal-lg", "modal-xl");
+                    if (size === "wide") {
+                        modalDialogEl.classList.add("modal-wide");
+                    } else if (size === "lg") {
+                        modalDialogEl.classList.add("modal-lg");
+                    } else {
+                        modalDialogEl.classList.add("modal-xl");
+                    }
+                }
+
+                async function openModal(url, title, size) {
                     modalTitleEl.textContent = title || "Dialog";
+                    applyModalSize(size || "xl");
                     setModalContent('<div class="text-muted">Loading...</div>');
                     modal.show();
                     try {
@@ -581,7 +598,11 @@
                         return;
                     }
                     event.preventDefault();
-                    openModal(link.getAttribute("href"), link.getAttribute("data-modal-title") || link.textContent.trim() || "Dialog");
+                    openModal(
+                        link.getAttribute("href"),
+                        link.getAttribute("data-modal-title") || link.textContent.trim() || "Dialog",
+                        link.getAttribute("data-modal-size") || "xl"
+                    );
                 });
             })();
         </script>

@@ -1,0 +1,57 @@
+{% extends 'base.html' %}
+
+{% block title %}Repository | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">{% if form.instance.pk %}Edit{% else %}New{% endif %} Repository</h5></div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {% if form.non_field_errors %}
+      <div class="alert alert-danger">{{ form.non_field_errors }}</div>
+      {% endif %}
+      <div class="row g-3">
+        <div class="col-md-6">{{ form.name.label_tag }} {{ form.name }}</div>
+        <div class="col-md-3">{{ form.family.label_tag }} {{ form.family }}</div>
+        <div class="col-md-3"><div class="form-check mt-4">{{ form.enabled }} {{ form.enabled.label_tag }}</div></div>
+        <div class="col-12">{{ form.base_url.label_tag }} {{ form.base_url }}</div>
+        <div class="col-md-4">{{ form.auth_type.label_tag }} {{ form.auth_type }}</div>
+        <div class="col-md-4">{{ form.username.label_tag }} {{ form.username }}</div>
+        <div class="col-md-4">{{ form.secret.label_tag }} {{ form.secret }}</div>
+        <div class="col-md-4">{{ form.signing_mode.label_tag }} {{ form.signing_mode }}</div>
+        <div class="col-md-8">{{ form.gpg_key_url.label_tag }} {{ form.gpg_key_url }}</div>
+        <div class="col-12">{{ form.gpg_key_inline.label_tag }} {{ form.gpg_key_inline }}</div>
+        <div class="repo-family-section row g-3 d-none" data-repo-family="deb">
+          <div class="col-md-6">{{ form.deb_suite.label_tag }} {{ form.deb_suite }}</div>
+          <div class="col-md-6">{{ form.deb_components.label_tag }} {{ form.deb_components }}</div>
+        </div>
+        <div class="repo-family-section row g-3 d-none" data-repo-family="rpm">
+          <div class="col-md-6">{{ form.rpm_repoid.label_tag }} {{ form.rpm_repoid }}</div>
+        </div>
+      </div>
+      <div class="d-flex gap-2 mt-3">
+        <button class="btn btn-primary" type="submit">Save</button>
+        <a class="btn btn-outline-secondary" href="{% url 'repositories:repo-list' %}">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const familyField = document.getElementById('id_family');
+    if (!familyField) {
+      return;
+    }
+    const sections = document.querySelectorAll('.repo-family-section');
+    function updateSections() {
+      sections.forEach((section) => {
+        section.classList.toggle('d-none', section.dataset.repoFamily !== familyField.value);
+      });
+    }
+    familyField.addEventListener('change', updateSections);
+    updateSections();
+  })();
+</script>
+{% endblock %}

@@ -11,7 +11,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from apps.afterburners.services import render_afterburner_script
+from apps.afterburners.services import RHSM_REPO_IDS_FILENAME, render_afterburner_script
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
 from apps.builds.services.kickstart import (
     render_deploy_kickstart_file,
@@ -29,6 +29,19 @@ DEPLOY_MANIFEST_VERSION = 1
 
 def _write_default_afterburner_script(*, build: BuildDefinition, output_dir: Path) -> Path:
     return render_afterburner_script(build=build, output_dir=output_dir)
+
+
+def _write_rhsm_repo_ids_file(*, build: BuildDefinition, output_dir: Path) -> Path | None:
+    rows = [
+        str(sel.repository.repo_id or "").strip()
+        for sel in build.ordered_rhsm_repository_selections()
+        if sel.enable_before_afterburner and str(sel.repository.repo_id or "").strip()
+    ]
+    if not rows:
+        return None
+    path = output_dir / RHSM_REPO_IDS_FILENAME
+    path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return path
 
 
 def _write_usb_image_from_bundle(
@@ -732,6 +745,7 @@ def _write_usb_bundle(*, build: BuildDefinition, out_dir: Path, clone_payload_di
     deploy_dir = out_dir / "deploy"
     deploy_dir.mkdir(parents=True, exist_ok=True)
     render_deploy_restore_script(output_dir=deploy_dir, os_family=build.operating_system.family, build=build)
+    _write_rhsm_repo_ids_file(build=build, output_dir=deploy_dir)
     _write_default_afterburner_script(build=build, output_dir=deploy_dir)
     render_deploy_kickstart_file(
         output_dir=deploy_dir,
@@ -808,6 +822,7 @@ def _write_pxe_bundle(*, build: BuildDefinition, out_dir: Path, clone_payload_di
     deploy_dir = out_dir / "deploy"
     deploy_dir.mkdir(parents=True, exist_ok=True)
     render_deploy_restore_script(output_dir=deploy_dir, os_family=build.operating_system.family, build=build)
+    _write_rhsm_repo_ids_file(build=build, output_dir=deploy_dir)
     _write_default_afterburner_script(build=build, output_dir=deploy_dir)
     render_deploy_kickstart_file(
         output_dir=deploy_dir,

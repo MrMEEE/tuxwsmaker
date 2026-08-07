@@ -1,0 +1,38 @@
+{% extends 'base.html' %}
+
+{% block title %}Repositories | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">Repositories</h4>
+  <a class="btn btn-primary" href="{% url 'repositories:repo-create' %}">New Repository</a>
+</div>
+
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-striped mb-0 align-middle">
+      <thead>
+        <tr><th>Name</th><th>Family</th><th>Base URL</th><th>Enabled</th><th class="text-end">Actions</th></tr>
+      </thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td><a href="{% url 'repositories:repo-detail' item.pk %}">{{ item.name }}</a></td>
+          <td>{{ item.get_family_display }}</td>
+          <td><code>{{ item.base_url }}</code></td>
+          <td>{% if item.enabled %}Yes{% else %}No{% endif %}</td>
+          <td class="text-end">
+            <div class="d-inline-flex gap-2">
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'repositories:repo-edit' item.pk %}">Edit</a>
+              <form method="post" action="{% url 'repositories:repo-delete' item.pk %}">{% csrf_token %}<button class="btn btn-sm btn-outline-danger" type="submit">Delete</button></form>
+            </div>
+          </td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="5" class="text-center text-muted py-4">No repositories configured yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

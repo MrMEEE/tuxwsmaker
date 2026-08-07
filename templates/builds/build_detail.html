@@ -25,7 +25,7 @@
     </div>
   </div>
   <div class="d-flex gap-2">
-    <a class="btn btn-outline-secondary" href="{% url 'builds:build-edit' build.pk %}" data-modal="1" data-modal-title="Edit Build">Edit</a>
+    <a class="btn btn-outline-secondary" href="{% url 'builds:build-edit' build.pk %}" data-modal="1" data-modal-title="Edit Build" data-modal-size="wide">Edit</a>
     {% if show_full_build %}
     <form method="post" action="{% url 'builds:build-queue' build.pk %}" data-confirm-message="Run the full build from VM creation through release export?" data-confirm-title="Run Full Build" data-confirm-accept="Run Full Build" data-confirm-class="btn-primary">
       {% csrf_token %}
@@ -94,13 +94,17 @@
                 {% endfor %}
               </ol>
             </dd>
-          <dt class="col-sm-5">RHSM Auth Mode</dt>
+          <dt class="col-sm-5">RHSM auth mode:</dt>
           <dd class="col-sm-7">{{ build.get_rhsm_auth_mode_display }}</dd>
           <dt class="col-sm-5">RHSM Repositories</dt>
           <dd class="col-sm-7">
             <ol class="mb-0 ps-3">
-              {% for repo in build.rhsm_repositories.all %}
-                <li><span class="small">RHEL {{ repo.rhel_major }} / {{ repo.architecture }}: {{ repo.repo_id }}{% if repo.name %} - {{ repo.name }}{% endif %}</span></li>
+              {% for sel in build.ordered_rhsm_repository_selections %}
+                <li>
+                  <span class="small">RHEL {{ sel.repository.rhel_major }} / {{ sel.repository.architecture }}: {{ sel.repository.repo_id }}{% if sel.repository.name %} - {{ sel.repository.name }}{% endif %}</span>
+                  {% if sel.enable_during_build %}<span class="badge text-bg-light border">during build</span>{% endif %}
+                  {% if sel.enable_before_afterburner %}<span class="badge text-bg-light border">before afterburner</span>{% endif %}
+                </li>
               {% empty %}
                 <li class="text-muted">none</li>
               {% endfor %}

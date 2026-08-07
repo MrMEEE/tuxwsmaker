@@ -60,10 +60,12 @@ class BuildDefinition(models.Model):
 		(RUN_MODE_MANUAL, "Manual"),
 	]
 	RHSM_AUTH_NONE = "none"
+	RHSM_AUTH_CONFIG = "config_credentials"
 	RHSM_AUTH_USERPASS = "userpass"
 	RHSM_AUTH_ACTIVATION_KEY = "activation_key"
 	RHSM_AUTH_CHOICES = [
 		(RHSM_AUTH_NONE, "None"),
+		(RHSM_AUTH_CONFIG, "Use configuration credentials"),
 		(RHSM_AUTH_USERPASS, "Red Hat username/password"),
 		(RHSM_AUTH_ACTIVATION_KEY, "Activation key + org ID"),
 	]
@@ -169,6 +171,9 @@ class BuildDefinition(models.Model):
 
 	def ordered_repository_selections(self):
 		return self.repository_selections.select_related("repository").order_by("order")
+
+	def ordered_rhsm_repository_selections(self):
+		return self.rhsm_repository_selections.select_related("repository").order_by("order")
 
 	def ordered_afterburner_selections(self):
 		return self.afterburner_selections.select_related("afterburner").order_by("order")
@@ -337,6 +342,32 @@ class BuildRepositorySelection(models.Model):
 
 	def __str__(self) -> str:
 		return f"{self.build.name}:{self.order}:{self.repository.name}"
+
+
+class BuildRhsmRepositorySelection(models.Model):
+	build = models.ForeignKey(
+		BuildDefinition,
+		on_delete=models.CASCADE,
+		related_name="rhsm_repository_selections",
+	)
+	repository = models.ForeignKey(
+		"repositories.RedHatRepositoryCatalog",
+		on_delete=models.CASCADE,
+		related_name="build_selections",
+	)
+	order = models.PositiveIntegerField(default=1)
+	enable_during_build = models.BooleanField(default=False)
+	enable_before_afterburner = models.BooleanField(default=False)
+
+	class Meta:
+		ordering = ["order", "id"]
+		unique_together = (
+			("build", "repository"),
+			("build", "order"),
+		)
+
+	def __str__(self) -> str:
+		return f"{self.build.name}:{self.order}:{self.repository.repo_id}"
 
 
 def _fernet_from_secret() -> Fernet:

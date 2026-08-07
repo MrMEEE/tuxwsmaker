@@ -1,0 +1,46 @@
+{% extends 'base.html' %}
+
+{% block title %}Afterburners | TuxWSMaker{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h4 class="mb-0">Afterburners</h4>
+  <a class="btn btn-primary" href="{% url 'afterburners:profile-create' %}">New Afterburner</a>
+</div>
+
+<div class="card">
+  <div class="card-body p-0">
+    <table class="table table-striped mb-0 align-middle">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Description</th>
+          <th>Updated</th>
+          <th class="text-end">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in items %}
+        <tr>
+          <td><a href="{% url 'afterburners:profile-detail' item.pk %}">{{ item.name }}</a></td>
+          <td class="text-muted small">{{ item.description|default:'-' }}</td>
+          <td class="small">{{ item.updated_at }}</td>
+          <td class="text-end">
+            <div class="d-inline-flex gap-2">
+              <a class="btn btn-sm btn-outline-primary" href="{% url 'afterburners:profile-detail' item.pk %}">Open</a>
+              <a class="btn btn-sm btn-outline-secondary" href="{% url 'afterburners:profile-edit' item.pk %}">Edit</a>
+              <form method="post" action="{% url 'afterburners:profile-delete' item.pk %}" data-confirm-message="Delete this afterburner profile?" data-confirm-title="Delete Afterburner" data-confirm-accept="Delete" data-confirm-class="btn-danger">
+                {% csrf_token %}
+                <button class="btn btn-sm btn-outline-danger" type="submit">Delete</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="4" class="text-center text-muted py-4">No afterburners created yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

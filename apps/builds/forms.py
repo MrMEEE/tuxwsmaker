@@ -15,8 +15,9 @@ from apps.builds.models import BuildDefinition, SSHKey
 from apps.layouts.models import PartitionLayout
 from apps.playbooks.models import Playbook
 from apps.repositories.models import PackageRepository, RedHatRepositoryCatalog
+from apps.serverconfig.models import ServerConfiguration
 
-from .models import BuildMachineConfig, BuildPlaybookSelection, BuildRepositorySelection
+from .models import BuildMachineConfig, BuildPlaybookSelection, BuildRepositorySelection, BuildRhsmRepositorySelection
 
 
 class BuildMachineConfigForm(forms.ModelForm):
@@ -101,6 +102,7 @@ class BuildDefinitionForm(forms.ModelForm):
     playbook_order_json = forms.CharField(required=False, widget=forms.HiddenInput())
     afterburner_order_json = forms.CharField(required=False, widget=forms.HiddenInput())
     repository_order_json = forms.CharField(required=False, widget=forms.HiddenInput())
+    rhsm_repository_order_json = forms.CharField(required=False, widget=forms.HiddenInput())
     rhsm_password = forms.CharField(
         required=False,
         label="Red Hat password",
@@ -147,6 +149,7 @@ class BuildDefinitionForm(forms.ModelForm):
         rhsm_repo_qs = RedHatRepositoryCatalog.objects.order_by("rhel_major", "repo_id")
         self.fields["rhsm_repositories"].queryset = rhsm_repo_qs
         self.fields["rhsm_auth_mode"].required = False
+        self.fields["rhsm_auth_mode"].label = "RHSM auth mode"
         self.fields["rhsm_username"].required = False
         self.fields["rhsm_org_id"].required = False
 
@@ -220,6 +223,33 @@ class BuildDefinitionForm(forms.ModelForm):
             ]
             self.initial["repository_order_json"] = json.dumps(repository_payload)
 
+            ordered_rhsm_repositories = list(
+                BuildRhsmRepositorySelection.objects.filter(build=self.instance)
+                .select_related("repository")
+                .order_by("order")
+            )
+            if ordered_rhsm_repositories:
+                rhsm_repository_payload = [
+                    {
+                        "id": sel.repository_id,
+                        "label": f"RHEL {sel.repository.rhel_major} {sel.repository.architecture}: {sel.repository.repo_id}",
+                        "during_build": sel.enable_during_build,
+                        "before_afterburner": sel.enable_before_afterburner,
+                    }
+                    for sel in ordered_rhsm_repositories
+                ]
+            else:
+                rhsm_repository_payload = [
+                    {
+                        "id": repo.id,
+                        "label": f"RHEL {repo.rhel_major} {repo.architecture}: {repo.repo_id}",
+                        "during_build": True,
+                        "before_afterburner": False,
+                    }
+                    for repo in self.instance.rhsm_repositories.order_by("rhel_major", "repo_id")
+                ]
+            self.initial["rhsm_repository_order_json"] = json.dumps(rhsm_repository_payload)
+
     def clean(self):
         cleaned = super().clean()
         os_obj = cleaned.get("operating_system")
@@ -242,7 +272,58 @@ class BuildDefinitionForm(forms.ModelForm):
             if match:
                 iso_major = int(match.group(1))
 
-        has_rhsm_repos = bool(rhsm_repos is not None and rhsm_repos.exists())
+        rhsm_repository_json = (cleaned.get("rhsm_repository_order_json") or "").strip()
+        cleaned["ordered_rhsm_repository_payload"] = []
+        has_rhsm_repos = False
+        rhsm_repo_objects: list[RedHatRepositoryCatalog] = []
+
+        if rhsm_repository_json:
+            try:
+                rhsm_payload = json.loads(rhsm_repository_json)
+            except json.JSONDecodeError as exc:
+                raise forms.ValidationError(f"Invalid RHSM repository ordering payload: {exc}")
+            if not isinstance(rhsm_payload, list):
+                raise forms.ValidationError("RHSM repository ordering payload must be a list")
+
+            rows: list[dict[str, object]] = []
+            ids: list[int] = []
+            for item in rhsm_payload:
+                if not isinstance(item, dict) or "id" not in item:
+                    raise forms.ValidationError("RHSM repository ordering payload is malformed")
+                try:
+                    repo_id = int(item["id"])
+                except (TypeError, ValueError):
+                    raise forms.ValidationError("RHSM repository ordering payload contains invalid IDs")
+                during_build = bool(item.get("during_build"))
+                before_afterburner = bool(item.get("before_afterburner"))
+                if not during_build and not before_afterburner:
+                    raise forms.ValidationError("Each attached RHSM repository must be enabled for at least one phase")
+                rows.append(
+                    {
+                        "id": repo_id,
+                        "during_build": during_build,
+                        "before_afterburner": before_afterburner,
+                    }
+                )
+                ids.append(repo_id)
+
+            if len(ids) != len(set(ids)):
+                raise forms.ValidationError("RHSM repository ordering payload contains duplicate repositories")
+
+            rhsm_repo_qs = RedHatRepositoryCatalog.objects.filter(id__in=ids)
+            existing = set(rhsm_repo_qs.values_list("id", flat=True))
+            missing = [str(v) for v in ids if v not in existing]
+            if missing:
+                raise forms.ValidationError(f"Unknown RHSM repository IDs in ordering payload: {', '.join(missing)}")
+
+            by_id = {repo.id: repo for repo in rhsm_repo_qs}
+            rhsm_repo_objects = [by_id[item_id] for item_id in ids if item_id in by_id]
+            cleaned["ordered_rhsm_repository_payload"] = rows
+            has_rhsm_repos = bool(rows)
+        elif rhsm_repos is not None:
+            rhsm_repo_objects = list(rhsm_repos)
+            has_rhsm_repos = bool(rhsm_repo_objects)
+
         if os_family != "rhel":
             if rhsm_auth_mode != BuildDefinition.RHSM_AUTH_NONE:
                 self.add_error("rhsm_auth_mode", "RHSM authentication is only available for RHEL builds")
@@ -254,12 +335,12 @@ class BuildDefinitionForm(forms.ModelForm):
         if os_family == "rhel" and has_rhsm_repos and iso_major is not None:
             mismatched = [
                 repo.repo_id
-                for repo in rhsm_repos
+                for repo in rhsm_repo_objects
                 if int(repo.rhel_major) != int(iso_major)
             ]
             if mismatched:
                 self.add_error(
-                    "rhsm_repositories",
+                    "rhsm_repository_order_json",
                     f"Selected RHSM repositories must match ISO major version {iso_major}: {', '.join(mismatched)}",
                 )
 
@@ -268,6 +349,13 @@ class BuildDefinitionForm(forms.ModelForm):
                 self.add_error("rhsm_username", "Username is required for RHSM username/password mode")
             if not rhsm_password and not self.instance.has_rhsm_password():
                 self.add_error("rhsm_password", "Password is required for RHSM username/password mode")
+        elif rhsm_auth_mode == BuildDefinition.RHSM_AUTH_CONFIG and has_rhsm_repos:
+            cfg = ServerConfiguration.get_solo()
+            if not str(cfg.rhn_username or "").strip() or not str(cfg.get_rhn_password() or "").strip():
+                self.add_error(
+                    "rhsm_auth_mode",
+                    "Server configuration RHSM credentials are required for this auth mode",
+                )
         elif rhsm_auth_mode == BuildDefinition.RHSM_AUTH_ACTIVATION_KEY:
             if not rhsm_org_id:
                 self.add_error("rhsm_org_id", "Org ID is required for RHSM activation-key mode")

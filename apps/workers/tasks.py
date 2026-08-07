@@ -15,11 +15,9 @@ from django.db import transaction
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildLogEntry, BuildMachineConfig, SSHKey
 from apps.builds.services.artifacts import (
     ArtifactExportError,
-    _sha256_of_file,
     dump_clone_partitions,
     generate_artifacts,
     prepare_iso_pxe_assets,
-    save_clone_release,
 )
 from apps.builds.services.builder import BuilderVMManager
 from apps.builds.services.kickstart import calculate_layout_disk_size_gib, render_kickstart_file, render_pxe_boot_configs
@@ -629,12 +627,95 @@ def _collect_selected_packages_for_build(build: BuildDefinition) -> tuple[list[s
     return package_names, skipped_lists
 
 
-def _rhsm_selected_repo_ids(build: BuildDefinition) -> list[str]:
+def _rhsm_selected_repo_ids(build: BuildDefinition, *, phase: str = "during_build") -> list[str]:
+    selections = list(build.ordered_rhsm_repository_selections())
+    if phase == "before_afterburner":
+        filtered = [sel for sel in selections if sel.enable_before_afterburner]
+    else:
+        filtered = [sel for sel in selections if sel.enable_during_build]
+
+    repo_ids = [
+        str(sel.repository.repo_id or "").strip()
+        for sel in filtered
+        if str(sel.repository.repo_id or "").strip()
+    ]
+    if repo_ids:
+        return repo_ids
+
+    # Backward-compatible fallback for legacy builds that still use direct M2M only.
     return [
         str(repo.repo_id or "").strip()
         for repo in build.rhsm_repositories.all().order_by("rhel_major", "repo_id")
         if str(repo.repo_id or "").strip()
     ]
+
+
+def _build_phase_selected_rpm_repo_ids(build: BuildDefinition) -> list[str]:
+    repo_ids: list[str] = []
+    seen: set[str] = set()
+    for sel in build.ordered_repository_selections():
+        if not sel.enable_during_build:
+            continue
+        repo = sel.repository
+        if not repo.enabled or repo.family != "rpm":
+            continue
+        repo_id = str(repo.effective_rpm_repoid() or "").strip()
+        if not repo_id or repo_id in seen:
+            continue
+        seen.add(repo_id)
+        repo_ids.append(repo_id)
+    return repo_ids
+
+
+def _validate_and_scope_rpm_repositories(
+    *,
+    provisioner: AnsibleProvisioner,
+    ip_address: str,
+    ssh_user: str,
+    private_key_path: str,
+    allowed_repo_ids: list[str],
+) -> None:
+    if not allowed_repo_ids:
+        return
+
+    quoted_allowed = " ".join(shlex.quote(repo_id) for repo_id in allowed_repo_ids)
+    command = (
+        "PKG_MGR=''; "
+        "if command -v dnf >/dev/null 2>&1; then PKG_MGR='dnf'; "
+        "elif command -v yum >/dev/null 2>&1; then PKG_MGR='yum'; fi; "
+        "if [[ -z \"$PKG_MGR\" ]]; then echo 'dnf/yum is not available on guest' >&2; exit 1; fi; "
+        "declare -a ALLOWED_REPOS=(" + quoted_allowed + "); "
+        "declare -A ALLOWED_SET=(); "
+        "for repo_id in \"${ALLOWED_REPOS[@]}\"; do ALLOWED_SET[$repo_id]=1; done; "
+        "for repo_id in \"${ALLOWED_REPOS[@]}\"; do "
+        "  if ! $PKG_MGR -q repolist --all \"$repo_id\" >/dev/null 2>&1; then "
+        "    echo \"Required repository '$repo_id' is not configured on guest\" >&2; "
+        "    exit 1; "
+        "  fi; "
+        "done; "
+        "enabled_ids=$($PKG_MGR -q repolist --enabled 2>/dev/null | awk 'BEGIN {body=0} $1==\"repo\" && $2==\"id\" {body=1; next} body && NF>=1 {print $1}'); "
+        "unexpected=''; "
+        "if [[ -n \"${enabled_ids:-}\" ]]; then "
+        "  while IFS= read -r repo_id; do "
+        "    [[ -n \"$repo_id\" ]] || continue; "
+        "    if [[ -z \"${ALLOWED_SET[$repo_id]:-}\" ]]; then "
+        "      unexpected=\"${unexpected}${unexpected:+, }$repo_id\"; "
+        "    fi; "
+        "  done <<< \"$enabled_ids\"; "
+        "fi; "
+        "if [[ -n \"$unexpected\" ]]; then "
+        "  echo \"Unexpected enabled repositories detected: $unexpected\" >&2; "
+        "  exit 1; "
+        "fi"
+    )
+    _run_remote_checked(
+        provisioner=provisioner,
+        host=ip_address,
+        user=ssh_user,
+        private_key_path=private_key_path,
+        command=command,
+        timeout_seconds=300,
+    )
 
 
 def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
@@ -658,7 +739,9 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
         _append_build_log(build=build, stage="ssh", message="Build VM SSH login is ready")
 
         os_family = str(build.operating_system.family or "").strip().lower()
-        rhsm_repo_ids = _rhsm_selected_repo_ids(build)
+        rhsm_repo_ids = _rhsm_selected_repo_ids(build, phase="during_build")
+        custom_repo_ids = _build_phase_selected_rpm_repo_ids(build) if os_family == "rhel" else []
+        allowed_repo_ids = list(dict.fromkeys(custom_repo_ids + rhsm_repo_ids)) if os_family == "rhel" else []
         rhsm_registered = False
         try:
             if rhsm_repo_ids:
@@ -666,7 +749,18 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                     raise ProvisioningError("RHSM repositories can only be used on RHEL builds")
                 _append_build_log(build=build, stage="rhsm", message="Preparing RHSM registration for package installation")
                 registration_mode = str(build.rhsm_auth_mode or BuildDefinition.RHSM_AUTH_NONE).strip()
-                if registration_mode == BuildDefinition.RHSM_AUTH_USERPASS:
+                if registration_mode == BuildDefinition.RHSM_AUTH_CONFIG:
+                    cfg = ServerConfiguration.get_solo()
+                    username = str(cfg.rhn_username or "").strip()
+                    password = str(cfg.get_rhn_password() or "").strip()
+                    if not username or not password:
+                        raise ProvisioningError("Server configuration RHSM credentials are required for configuration-credentials mode")
+                    register_command = (
+                        "if ! command -v subscription-manager >/dev/null 2>&1; then "
+                        "echo 'subscription-manager is not available on guest' >&2; exit 1; fi; "
+                        f"subscription-manager register --force --username {shlex.quote(username)} --password {shlex.quote(password)}"
+                    )
+                elif registration_mode == BuildDefinition.RHSM_AUTH_USERPASS:
                     username = str(build.rhsm_username or "").strip()
                     password = str(build.get_rhsm_password() or "").strip()
                     if not username or not password:
@@ -739,13 +833,20 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                     f"apt-get install -y --no-install-recommends {quoted_packages}"
                 )
             else:
+                if os_family == "rhel" and not allowed_repo_ids:
+                    raise ProvisioningError(
+                        "Install Packages requires at least one enabled repository in build repositories or RHSM repositories"
+                    )
+                repo_scope = "--disablerepo='*' " + " ".join(
+                    f"--enablerepo={shlex.quote(repo_id)}" for repo_id in allowed_repo_ids
+                )
                 install_command = (
                     "PKG_MGR=''; "
                     "if command -v dnf >/dev/null 2>&1; then PKG_MGR='dnf'; "
                     "elif command -v yum >/dev/null 2>&1; then PKG_MGR='yum'; fi; "
                     "if [[ -z \"$PKG_MGR\" ]]; then echo 'dnf/yum is not available on guest' >&2; exit 1; fi; "
-                    "$PKG_MGR -y --setopt=skip_if_unavailable=True makecache || true; "
-                    f"$PKG_MGR -y --setopt=skip_if_unavailable=True install {quoted_packages}"
+                    f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True makecache || true; "
+                    f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True install {quoted_packages}"
                 )
 
             _append_build_log(build=build, stage="packages", message=f"Installing {len(package_names)} package(s) from selected package lists")
@@ -757,6 +858,19 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                 private_key_path=str(key_pair.private_key_path),
             )
             try:
+                if os_family == "rhel":
+                    _append_build_log(
+                        build=build,
+                        stage="repositories",
+                        message=f"Validating repository scope for Install Packages: {', '.join(allowed_repo_ids) if allowed_repo_ids else 'none'}",
+                    )
+                    _validate_and_scope_rpm_repositories(
+                        provisioner=provisioner,
+                        ip_address=ip_address,
+                        ssh_user=ssh_user,
+                        private_key_path=str(key_pair.private_key_path),
+                        allowed_repo_ids=allowed_repo_ids,
+                    )
                 _run_remote_checked(
                     provisioner=provisioner,
                     host=ip_address,
@@ -1236,8 +1350,7 @@ def _step_dump_partitions(build: BuildDefinition) -> dict[str, str]:
 def _step_save_release(build: BuildDefinition) -> dict[str, str]:
     artifact_root = _artifact_root()
     build_dir = artifact_root / f"build-{build.id}"
-    dump_dir = Path(_require_runtime_value(build, "partition_dump_dir"))
-    release_path = build_dir / "clone-release.tar.gz"
+    _require_runtime_value(build, "partition_dump_dir")
     build.artifacts.all().delete()
     _append_build_log(build=build, stage="artifacts", message="Generating build artifacts")
     generate_artifacts(
@@ -1246,14 +1359,7 @@ def _step_save_release(build: BuildDefinition) -> dict[str, str]:
         qcow2_disk_path=Path(_require_runtime_value(build, "disk_path")),
         compress=ServerConfiguration.compression_enabled(),
     )
-    save_clone_release(dump_dir=dump_dir, output_path=release_path)
-    BuildArtifact.objects.create(
-        build=build,
-        artifact_type=BuildArtifact.TYPE_CLONE,
-        file_path=str(release_path),
-        sha256=_sha256_of_file(release_path),
-        compressed=True,
-    )
+    _append_build_log(build=build, stage="artifacts", message="Skipping standalone clone-release.tar.gz; publishing PXE/USB artifacts only")
 
     # Space cleanup: keep published artifacts, remove intermediate staging trees and stale legacy outputs.
     shutil.rmtree(build_dir / "pxe", ignore_errors=True)
@@ -1267,9 +1373,9 @@ def _step_save_release(build: BuildDefinition) -> dict[str, str]:
         if stale_path.exists():
             stale_path.unlink(missing_ok=True)
 
-    _save_runtime_state(build, clone_release_path=str(release_path))
+    _save_runtime_state(build, clone_release_path="")
     _append_build_log(build=build, stage="done", message="Build completed successfully")
-    return {"clone_release_path": str(release_path)}
+    return {"clone_release_path": ""}
 
 
 def _execute_step(build: BuildDefinition, step: str) -> dict[str, str]:

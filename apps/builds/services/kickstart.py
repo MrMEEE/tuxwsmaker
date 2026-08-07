@@ -198,7 +198,7 @@ def render_deploy_restore_script(*, output_dir: Path, os_family: str, build=None
 
     content = dedent(
         """#!/usr/bin/env bash
-set -euo pipefail
+      set -Eeuo pipefail
 
 DEPLOY_ROOT="${DEPLOY_ROOT:-/run/tuxwsmaker}"
 DEPLOY_MANIFEST_URL="${DEPLOY_MANIFEST_URL:-file:///run/install/repo/deploy.json}"
@@ -207,12 +207,129 @@ WORK_DIR="/tmp/tuxwsmaker-deploy"
 MOUNT_ROOT="/mnt/sysimage"
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
 DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"
+RESTORE_LOG="${RESTORE_LOG:-/tmp/tuxwsmaker-restore.log}"
+CURRENT_PHASE="bootstrap"
+INPUT_TTY="${DEPLOY_INPUT_TTY:-}"
+
+# Keep restore output single-path to avoid garbled duplicate lines when caller
+# already mirrors stdout/stderr to /dev/console.
+exec > >(tee -a "$RESTORE_LOG") 2>&1
+if [[ -z "$INPUT_TTY" && -c /dev/tty ]]; then
+  INPUT_TTY="/dev/tty"
+fi
+if [[ -z "$INPUT_TTY" && -c /dev/console ]]; then
+  INPUT_TTY="/dev/console"
+fi
+if [[ -n "$INPUT_TTY" && -c "$INPUT_TTY" && -r "$INPUT_TTY" ]]; then
+  exec < "$INPUT_TTY"
+else
+  INPUT_TTY=""
+fi
+# Some installer TTY paths can have ONLCR disabled, which renders each newline
+# without carriage return and causes staircase-like indented output.
+if [[ -t 1 ]] && command -v stty >/dev/null 2>&1; then
+  stty sane echo icrnl onlcr 2>/dev/null || true
+fi
+
+hold_on_error() {
+  local exit_code="$1"
+  echo
+  echo "[deploy] Restore failed with exit code ${exit_code}" >&2
+  echo "[deploy] Failing phase: ${CURRENT_PHASE}" >&2
+  echo "[deploy] Command: ${BASH_COMMAND:-unknown}" >&2
+  echo "[deploy] Line: ${BASH_LINENO[0]:-unknown}" >&2
+  echo "[deploy] Detailed log: ${RESTORE_LOG}" >&2
+  echo "[deploy] Press Enter to continue, or wait 15 minutes for automatic timeout" >&2
+  if [[ -n "$INPUT_TTY" ]]; then
+    read -r -t 900 _ < "$INPUT_TTY" || true
+  else
+    read -r -t 900 _ || true
+  fi
+}
+
+prompt_read_line() {
+  local prompt_text="$1"
+  local timeout_seconds="$2"
+  local out_var="$3"
+  local line=""
+
+  if [[ -n "$INPUT_TTY" ]]; then
+    printf '%s' "$prompt_text" > "$INPUT_TTY"
+    IFS= read -r -t "$timeout_seconds" line < "$INPUT_TTY" || true
+    printf '\r\n' > "$INPUT_TTY" || true
+  else
+    printf '%s' "$prompt_text"
+    IFS= read -r -t "$timeout_seconds" line || true
+    printf '\r\n' || true
+  fi
+
+  line="${line//$'\r'/}"
+  line="${line#${line%%[![:space:]]*}}"
+  line="${line%${line##*[![:space:]]}}"
+  printf -v "$out_var" '%s' "$line"
+}
+
+on_error() {
+  local exit_code=$?
+  hold_on_error "$exit_code"
+  exit "$exit_code"
+}
+
+trap on_error ERR
 
 mkdir -p "$DEPLOY_ROOT" "$WORK_DIR"
 
 status() {
   local msg="$1"
   echo "[deploy] $msg"
+}
+
+prompt_clear_target_disk() {
+  local prompt="[deploy] Existing partitions detected on ${TARGET_DEV}. Clear disk and continue? [yes/no] (default: no): "
+  local reply=""
+  while true; do
+    prompt_read_line "$prompt" 300 reply
+    reply="${reply:-no}"
+    case "${reply,,}" in
+      y|yes|true|1)
+        return 0
+        ;;
+      n|no|false|0|"")
+        return 1
+        ;;
+      *)
+        status "Please answer yes or no"
+        ;;
+    esac
+  done
+}
+
+release_target_disk_usage() {
+  status "Releasing mounts, swaps, and mappings on $TARGET_DEV"
+
+  if command -v lsblk >/dev/null 2>&1; then
+    while read -r mount_point; do
+      [[ -n "${mount_point:-}" ]] || continue
+      [[ "$mount_point" == "/run/install/repo" ]] && continue
+      umount -lf "$mount_point" >/dev/null 2>&1 || true
+    done < <(lsblk -nr -o MOUNTPOINT "$TARGET_DEV" | awk 'NF')
+  fi
+
+  while read -r swap_dev; do
+    [[ -n "${swap_dev:-}" ]] || continue
+    swapoff "$swap_dev" >/dev/null 2>&1 || true
+  done < <(lsblk -nr -o PATH,FSTYPE "$TARGET_DEV" | awk '$2=="swap" {print $1}')
+
+  while read -r crypt_name; do
+    [[ -n "${crypt_name:-}" ]] || continue
+    cryptsetup close "$crypt_name" >/dev/null 2>&1 || true
+  done < <(lsblk -nr -o NAME,TYPE "$TARGET_DEV" | awk '$2=="crypt" {print $1}')
+
+  if command -v vgchange >/dev/null 2>&1; then
+    vgchange -an >/dev/null 2>&1 || true
+  fi
+
+  udevadm settle >/dev/null 2>&1 || true
 }
 
 write_sparse_blocks() {
@@ -333,6 +450,59 @@ raw_part() {
   fi
 }
 
+resolve_lv_path() {
+  local vg_name="$1"
+  local lv_name="$2"
+
+  if [[ -n "$vg_name" && -n "$lv_name" && -b "/dev/$vg_name/$lv_name" ]]; then
+    printf '/dev/%s/%s' "$vg_name" "$lv_name"
+    return 0
+  fi
+
+  if ! command -v lvs >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local exact_path
+  exact_path="$(lvs --noheadings -o vg_name,lv_name,lv_path --separator='|' 2>/dev/null | awk -F'|' -v want_vg="$vg_name" -v want_lv="$lv_name" '
+    function trim(v) { sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v); return v }
+    {
+      vg=trim($1); lv=trim($2); path=trim($3)
+      if (want_vg != "" && want_lv != "" && vg == want_vg && lv == want_lv) {
+        print path
+        exit
+      }
+    }
+  ')"
+  if [[ -n "$exact_path" && -b "$exact_path" ]]; then
+    printf '%s' "$exact_path"
+    return 0
+  fi
+
+  local lv_only_path
+  lv_only_path="$(lvs --noheadings -o lv_name,lv_path --separator='|' 2>/dev/null | awk -F'|' -v want_lv="$lv_name" '
+    function trim(v) { sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v); return v }
+    {
+      lv=trim($1); path=trim($2)
+      if (want_lv != "" && lv == want_lv) {
+        count += 1
+        found = path
+      }
+    }
+    END {
+      if (count == 1) {
+        print found
+      }
+    }
+  ')"
+  if [[ -n "$lv_only_path" && -b "$lv_only_path" ]]; then
+    printf '%s' "$lv_only_path"
+    return 0
+  fi
+
+  return 1
+}
+
 status "Starting restore"
 status "Timestamp: $(date -Is)"
 status "deploy manifest: $DEPLOY_MANIFEST_URL"
@@ -364,6 +534,7 @@ fi
 TARGET_DEV="/dev/$TARGET_DISK"
 status "Target disk: $TARGET_DEV"
 
+CURRENT_PHASE="partition-layout-generation"
 python3 - "$WORK_DIR/deploy.json" "$WORK_DIR/clone-manifest.json" "$WORK_DIR/sfdisk.layout" "$WORK_DIR/parts.map" <<'PY'
 import json
 import sys
@@ -390,17 +561,17 @@ default_total = max((s + z) for s, z in zip(starts, sizes))
 disk_total = max(default_total, int((clone.get("disk_size_bytes") or 0) // sector))
 for idx, part in enumerate(partitions):
     number = int(part["number"])
-  start_sector = starts[idx]
-  size_sector = sizes[idx]
+    start_sector = starts[idx]
+    size_sector = sizes[idx]
     entry = layout_by_order.get(number, {})
-  size_mode = str(entry.get("size_mode") or "fixed").strip().lower()
+    size_mode = str(entry.get("size_mode") or "fixed").strip().lower()
 
-  if size_mode == "remainder":
-    next_start = starts[idx + 1] if idx + 1 < len(starts) else disk_total
-    available = max(1, next_start - start_sector)
-    if available < size_sector:
-      raise SystemExit(f"Target disk too small for remainder partition {number}")
-    size_sector = available
+    if size_mode == "remainder":
+        next_start = starts[idx + 1] if idx + 1 < len(starts) else disk_total
+        available = max(1, next_start - start_sector)
+        if available < size_sector:
+            raise SystemExit(f"Target disk too small for remainder partition {number}")
+        size_sector = available
 
     opts = [f"start={start_sector}", f"size={size_sector}"]
     gpt_type = str(entry.get("gpt_type") or "").strip()
@@ -429,10 +600,10 @@ for idx, part in enumerate(partitions):
         str(entry.get("filesystem") or ""),
         str(entry.get("luks_enabled") or False),
         str(entry.get("luks_name") or ""),
-      str(entry.get("entry_role") or ""),
+          str(entry.get("entry_role") or ""),
       str(entry.get("volume_group") or ""),
       str(entry.get("logical_volume") or ""),
-      str(entry.get("size_mode") or "fixed"),
+          str(entry.get("size_mode") or "fixed"),
     ]))
 
 with open(sfdisk_path, "w", encoding="utf-8") as f:
@@ -441,13 +612,26 @@ with open(map_path, "w", encoding="utf-8") as f:
     f.write("\\n".join(map_lines) + "\\n")
 PY
 
+CURRENT_PHASE="partition-table-creation"
+status "Creating target partition table"
+
+if lsblk -nr -o TYPE "$TARGET_DEV" 2>/dev/null | grep -q '^part$'; then
+  status "Target disk currently has partitions"
+  if ! prompt_clear_target_disk; then
+    status "Operator declined disk clear; aborting restore"
+    exit 1
+  fi
+
+  release_target_disk_usage
+fi
+
 wipefs -a -f -q "$TARGET_DEV" || true
 if command -v sgdisk >/dev/null 2>&1; then
   sgdisk --zap-all "$TARGET_DEV" >/dev/null 2>&1 || true
 fi
 dd if=/dev/zero of="$TARGET_DEV" bs=1M count=16 conv=fsync status=none || true
 
-sfdisk --wipe always --wipe-partitions always "$TARGET_DEV" < "$WORK_DIR/sfdisk.layout"
+sfdisk --force --wipe always --wipe-partitions always "$TARGET_DEV" < "$WORK_DIR/sfdisk.layout"
 partprobe "$TARGET_DEV" || true
 udevadm settle || true
 status "Partition table created"
@@ -461,6 +645,7 @@ fi
 : > "$WORK_DIR/part-dev.map"
 TOTAL_PARTS=$(grep -c '^[0-9]' "$WORK_DIR/parts.map" || true)
 PART_INDEX=0
+CURRENT_PHASE="partition-restore"
 while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ -z "${number:-}" ]] && continue
   PART_INDEX=$((PART_INDEX + 1))
@@ -534,35 +719,103 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
   status "[$PART_INDEX/$TOTAL_PARTS] Partition $number restore completed"
 done < "$WORK_DIR/parts.map"
 
+CURRENT_PHASE="filesystem-and-boot-repair"
 sync
 partprobe "$TARGET_DEV" || true
 udevadm settle || true
-if command -v vgchange >/dev/null 2>&1; then
-  vgchange -ay >/dev/null 2>&1 || true
-fi
 
 while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ -z "${number:-}" ]] && continue
-  [[ "$entry_role" == "pv" && "$luks_enabled" == "True" ]] || continue
+  [[ "$luks_enabled" == "True" ]] || continue
   map_name="${luks_name:-luks-${number}}"
   if cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
     if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
-      cryptsetup open "$part_dev" "$map_name"
+      if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
+        echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot open LUKS mapping for $part_dev" >&2
+        exit 1
+      fi
+      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
     fi
   fi
 done < "$WORK_DIR/part-dev.map"
 
+status "Rescanning and activating LVM volumes"
+if command -v dmsetup >/dev/null 2>&1; then
+  dmsetup mknodes >/dev/null 2>&1 || true
+fi
+if command -v pvscan >/dev/null 2>&1; then
+  pvscan --cache >/dev/null 2>&1 || true
+fi
 if command -v vgscan >/dev/null 2>&1; then
   vgscan --mknodes >/dev/null 2>&1 || true
 fi
-if command -v vgchange >/dev/null 2>&1; then
-  vgchange -ay >/dev/null 2>&1 || true
+if command -v lvscan >/dev/null 2>&1; then
+  lvscan >/dev/null 2>&1 || true
 fi
+if command -v vgchange >/dev/null 2>&1; then
+  vgchange -ay --sysinit >/dev/null 2>&1 || vgchange -ay >/dev/null 2>&1 || true
+fi
+if command -v lvchange >/dev/null 2>&1; then
+  lvchange -ay >/dev/null 2>&1 || true
+fi
+
+CURRENT_PHASE="lv-layout-map"
+status "Merging LV layout metadata into restore device map"
+python3 - "$WORK_DIR/deploy.json" "$WORK_DIR/part-dev.map" <<'PY'
+import json
+import sys
+
+deploy_path, map_path = sys.argv[1:3]
+
+with open(deploy_path, encoding="utf-8") as deploy_file:
+  deploy = json.load(deploy_file)
+
+existing_numbers = set()
+try:
+  with open(map_path, encoding="utf-8") as map_file:
+    for raw in map_file:
+      raw = raw.strip()
+      if not raw:
+        continue
+      number = raw.split("|", 1)[0].strip()
+      if number.isdigit():
+        existing_numbers.add(int(number))
+except FileNotFoundError:
+  pass
+
+append_rows = []
+for entry in sorted(deploy.get("layout_entries", []), key=lambda e: int(e.get("order") or 0)):
+  if str(entry.get("entry_role") or "").strip().lower() != "lv":
+    continue
+  order = int(entry.get("order") or 0)
+  if order <= 0 or order in existing_numbers:
+    continue
+  append_rows.append("|".join([
+    str(order),
+    "",
+    str(entry.get("mount_point") or ""),
+    str(entry.get("filesystem") or ""),
+    str(entry.get("luks_enabled") or False),
+    str(entry.get("luks_name") or ""),
+    str(entry.get("entry_role") or ""),
+    str(entry.get("volume_group") or ""),
+    str(entry.get("logical_volume") or ""),
+    str(entry.get("size_mode") or "fixed"),
+  ]))
+
+if append_rows:
+  with open(map_path, "a", encoding="utf-8") as map_file:
+    map_file.write("\\n".join(append_rows) + "\\n")
+  print(f"[deploy] Added {len(append_rows)} LV entries to part-dev map")
+else:
+  print("[deploy] No additional LV entries needed in part-dev map")
+PY
 
 while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ "$entry_role" == "lv" && "$size_mode" == "remainder" ]] || continue
   [[ -n "${volume_group:-}" && -n "${logical_volume:-}" ]] || continue
-  lv_path="/dev/${volume_group}/${logical_volume}"
+  lv_path="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"
+  [[ -n "$lv_path" ]] || continue
   if command -v lvdisplay >/dev/null 2>&1 && lvdisplay "$lv_path" >/dev/null 2>&1; then
     lvextend -l +100%FREE "$lv_path" >/dev/null 2>&1 || true
   fi
@@ -575,7 +828,10 @@ while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name
   [[ -z "${number:-}" ]] && continue
   if [[ "$mount_point" == "/" ]]; then
     if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
-      ROOT_DEV="/dev/${volume_group}/${logical_volume}"
+      ROOT_DEV="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"
+      if [[ -z "$ROOT_DEV" ]]; then
+        status "Could not resolve LV path for root mount: ${volume_group}/${logical_volume}"
+      fi
     else
       ROOT_DEV="$part_dev"
     fi
@@ -584,8 +840,30 @@ while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name
 done < "$WORK_DIR/part-dev.map"
 
 if [[ -z "$ROOT_DEV" ]]; then
-  status "Root mountpoint not found in deploy metadata; skipping chroot actions"
+  status "ERROR: Root mountpoint not found in deploy metadata"
+  if [[ -f "$WORK_DIR/part-dev.map" ]]; then
+    status "Current part-dev map contents:"
+    cat "$WORK_DIR/part-dev.map" || true
+  fi
+  if command -v lvs >/dev/null 2>&1; then
+    status "Available logical volumes:"
+    lvs -o vg_name,lv_name,lv_path || true
+  fi
+  exit 1
 else
+  CURRENT_PHASE="root-mount"
+  if [[ ! -b "$ROOT_DEV" ]]; then
+    status "Root device $ROOT_DEV is not a block device"
+    if command -v lvs >/dev/null 2>&1; then
+      status "Available logical volumes:"
+      lvs -o vg_name,lv_name,lv_path || true
+    fi
+    if command -v lsblk >/dev/null 2>&1; then
+      status "Available block devices:"
+      lsblk -f || true
+    fi
+    exit 1
+  fi
   mkdir -p "$MOUNT_ROOT"
   mount "$ROOT_DEV" "$MOUNT_ROOT"
   echo "$MOUNT_ROOT" >> "$WORK_DIR/mounted.paths"
@@ -595,7 +873,11 @@ else
     [[ -z "${mount_point:-}" ]] && continue
     [[ "$mount_point" == "/" || "$mount_point" == "swap" ]] && continue
     if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
-      source_dev="/dev/${volume_group}/${logical_volume}"
+      source_dev="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"
+      if [[ -z "$source_dev" ]]; then
+        status "Could not resolve LV path for ${volume_group}/${logical_volume}; skipping mount of $mount_point"
+        continue
+      fi
     else
       source_dev="$part_dev"
     fi
@@ -609,11 +891,16 @@ else
     fi
   done < "$WORK_DIR/part-dev.map"
 
+  CURRENT_PHASE="filesystem-grow"
   while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
     [[ "$size_mode" == "remainder" ]] || continue
     [[ -n "${mount_point:-}" && "$mount_point" != "swap" ]] || continue
     if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
-      source_dev="/dev/${volume_group}/${logical_volume}"
+      source_dev="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"
+      if [[ -z "$source_dev" ]]; then
+        status "Could not resolve LV path for ${volume_group}/${logical_volume}; skipping grow for $mount_point"
+        continue
+      fi
     else
       source_dev="$part_dev"
     fi
@@ -636,6 +923,7 @@ else
     esac
   done < "$WORK_DIR/part-dev.map"
 
+  CURRENT_PHASE="fstab-rebuild"
   status "Rebuilding /etc/fstab"
   : > "$MOUNT_ROOT/etc/fstab"
   while read -r mp; do
@@ -669,6 +957,7 @@ else
     fi
   done < "$WORK_DIR/part-dev.map"
 
+  CURRENT_PHASE="crypttab-rebuild"
   status "Rebuilding /etc/crypttab"
   : > "$MOUNT_ROOT/etc/crypttab"
   while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
@@ -683,15 +972,18 @@ else
   done < "$WORK_DIR/part-dev.map"
 
   if [[ -n "$TARGET_HOSTNAME" ]]; then
+    CURRENT_PHASE="hostname-setup"
     status "Setting hostname to $TARGET_HOSTNAME"
     echo -n "$TARGET_HOSTNAME" > "$MOUNT_ROOT/etc/hostname"
   fi
 
+  CURRENT_PHASE="bind-mount-runtime"
   for bind_path in /dev /dev/pts /proc /sys /sys/firmware/efi/efivars /run; do
     mkdir -p "$MOUNT_ROOT$bind_path"
     mount --bind "$bind_path" "$MOUNT_ROOT$bind_path" || true
   done
 
+  CURRENT_PHASE="bootloader-repair"
   status "Repairing bootloader and initramfs in chroot"
   BOOT_MODE="bios"
   if [[ -d /sys/firmware/efi ]]; then
@@ -762,6 +1054,7 @@ CHROOT
 
   EFI_NUM=$(awk -F'|' '$3=="/boot/efi" {print $1; exit}' "$WORK_DIR/part-dev.map")
   if [[ -d /sys/firmware/efi && -n "$EFI_NUM" ]] && command -v efibootmgr >/dev/null 2>&1; then
+    CURRENT_PHASE="uefi-boot-entry-refresh"
     status "Refreshing UEFI boot entry"
     efi_loader="\\EFI\\BOOT\\BOOTX64.EFI"
     for cand in \
@@ -783,6 +1076,7 @@ CHROOT
 
   AFTERBURNER="/run/install/repo/deploy/afterburner.sh"
   if [[ -f "$AFTERBURNER" ]]; then
+    CURRENT_PHASE="afterburner"
 __REPO_SETUP__
     status "Running afterburner in restore context"
     chmod +x "$AFTERBURNER"
@@ -801,6 +1095,7 @@ __REPO_CLEANUP__
   fi
 fi
 
+CURRENT_PHASE="completed"
 status "Restore completed successfully"
 __FINISH_STEP__
 """
@@ -836,9 +1131,41 @@ firewall --disabled
 selinux --permissive
 
 %pre --erroronfail --log=/tmp/deploy-pre.log
-if [ -c /dev/console ]; then
-  exec > >(tee /dev/console) 2>&1
+set -Eeuo pipefail
+PRE_INPUT_TTY="${{DEPLOY_INPUT_TTY:-/dev/tty2}}"
+if [ ! -c "$PRE_INPUT_TTY" ]; then
+  PRE_INPUT_TTY=""
 fi
+if [ -z "$PRE_INPUT_TTY" ] && [ -c /dev/tty ]; then
+  PRE_INPUT_TTY="/dev/tty"
+fi
+if [ -z "$PRE_INPUT_TTY" ] && [ -c /dev/console ]; then
+  PRE_INPUT_TTY="/dev/console"
+fi
+if [ -c /dev/console ]; then
+  echo "[deploy-pre] Interactive terminal selected: ${{PRE_INPUT_TTY:-none}}" > /dev/console 2>/dev/null || true
+fi
+if [ -n "$PRE_INPUT_TTY" ] && [ -c "$PRE_INPUT_TTY" ]; then
+  exec < "$PRE_INPUT_TTY" > "$PRE_INPUT_TTY" 2>&1
+fi
+export DEPLOY_INPUT_TTY="$PRE_INPUT_TTY"
+if [ -t 1 ] && command -v stty >/dev/null 2>&1; then
+  stty sane echo icrnl onlcr 2>/dev/null || true
+fi
+pre_hold_on_error() {{
+  local exit_code="$1"
+  echo "[deploy-pre] ERROR: pre-script failed with exit code ${{exit_code}}" >&2
+  echo "[deploy-pre] Command: ${{BASH_COMMAND:-unknown}}" >&2
+  echo "[deploy-pre] Line: ${{BASH_LINENO[0]:-unknown}}" >&2
+  echo "[deploy-pre] Press Enter to continue, or wait 15 minutes for automatic timeout" >&2
+  read -r -t 900 _ || true
+}}
+pre_on_error() {{
+  local exit_code=$?
+  pre_hold_on_error "$exit_code"
+  exit "$exit_code"
+}}
+trap pre_on_error ERR
 echo "[deploy-pre] Starting at $(date -Is)"
 export DEPLOY_MANIFEST_URL={deploy_manifest_url}
 export CLONE_MANIFEST_URL={clone_manifest_url}
@@ -848,16 +1175,61 @@ if [ ! -f /run/install/repo/deploy/restore.sh ]; then
 fi
 cp /run/install/repo/deploy/restore.sh /tmp/restore.sh
 chmod +x /tmp/restore.sh
+restore_rc=0
+if command -v tmux >/dev/null 2>&1 && tmux display-message -p '#S' >/dev/null 2>&1; then
+  RESTORE_WAIT_KEY="tuxwsmaker-restore-done-$$"
+  RESTORE_RC_FILE="/tmp/tuxwsmaker-restore.rc"
+  cat > /tmp/tuxwsmaker-restore-tmux-runner.sh <<'TMUX_RESTORE'
+#!/usr/bin/env bash
+set +e
 bash /tmp/restore.sh
+rc=$?
+echo "$rc" > "$1"
+tmux wait-for -S "$2"
+echo
+echo "[deploy-pre] Restore session complete (rc=$rc). Press Enter to continue, or wait 15 minutes for automatic timeout"
+read -r -t 900 _ || true
+exit "$rc"
+TMUX_RESTORE
+  chmod +x /tmp/tuxwsmaker-restore-tmux-runner.sh
+  rm -f "$RESTORE_RC_FILE"
+  tmux new-window -d -n restore-io "/tmp/tuxwsmaker-restore-tmux-runner.sh '$RESTORE_RC_FILE' '$RESTORE_WAIT_KEY'"
+  tmux select-window -t restore-io || true
+  tmux wait-for "$RESTORE_WAIT_KEY"
+  restore_rc=$(cat "$RESTORE_RC_FILE" 2>/dev/null || echo 1)
+else
+  bash /tmp/restore.sh || restore_rc=$?
+fi
+
+if [[ "$restore_rc" -ne 0 ]]; then
+  trap - ERR
+  echo "[deploy-pre] ERROR: restore.sh failed with exit code ${{restore_rc}}" >&2
+  if [ -f /tmp/tuxwsmaker-restore.log ]; then
+    echo "[deploy-pre] ---- restore log tail ----" >&2
+    tail -n 200 /tmp/tuxwsmaker-restore.log >&2 || true
+    echo "[deploy-pre] ---- end restore log tail ----" >&2
+  fi
+  echo "[deploy-pre] Press Enter to continue, or wait 15 minutes for automatic timeout" >&2
+  read -r -t 900 _ || true
+  exit "${{restore_rc}}"
+fi
 echo "[deploy-pre] Restore script finished at $(date -Is)"
 cat <<'EOF'
 ================================================================
 Restore complete.
 
-Powering off. Remove install media and boot from disk.
+Restore looks complete. Remove install media and press Enter to power off,
+or wait 15 minutes for automatic timeout.
 ================================================================
 EOF
-echo "[deploy-pre] Restore complete, powering off"
+echo "[deploy-pre] Restore complete; waiting for console confirmation before poweroff"
+trap - ERR
+if [ -c /dev/console ]; then
+  read -r -t 900 _ || true
+else
+  sleep 900
+fi
+echo "[deploy-pre] Powering off after restore completion"
 sync
 poweroff -f || halt -f
 %end

@@ -12,6 +12,7 @@ from apps.builds.services.kickstart import calculate_layout_disk_size_gib
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
 from apps.repositories.models import PackageRepository, RedHatRepositoryCatalog
+from apps.serverconfig.models import ServerConfiguration
 
 
 class BuildValidationTests(TestCase):
@@ -216,6 +217,120 @@ class BuildDefinitionFormAfterburnerTests(TestCase):
         form = BuildDefinitionForm(data=data)
 
         self.assertTrue(form.is_valid(), form.errors.as_text())
+
+    def test_accepts_rhsm_configuration_credentials_mode_with_selected_repositories(self):
+        cfg = ServerConfiguration.get_solo()
+        cfg.rhn_username = "server-rh-user"
+        cfg.set_rhn_password("server-rh-pass")
+        cfg.save()
+        rh_repo = RedHatRepositoryCatalog.objects.create(
+            rhel_major=10,
+            architecture="x86_64",
+            repo_id="rhel-10-baseos-rpms",
+            name="RHEL 10 BaseOS",
+        )
+        data = self._form_data()
+        data.update(
+            {
+                "rhsm_auth_mode": BuildDefinition.RHSM_AUTH_CONFIG,
+                "rhsm_repositories": [str(rh_repo.id)],
+            }
+        )
+
+        form = BuildDefinitionForm(data=data)
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+
+    def test_accepts_rhsm_repository_order_payload(self):
+        cfg = ServerConfiguration.get_solo()
+        cfg.rhn_username = "server-rh-user"
+        cfg.set_rhn_password("server-rh-pass")
+        cfg.save()
+        rh_repo = RedHatRepositoryCatalog.objects.create(
+            rhel_major=10,
+            architecture="x86_64",
+            repo_id="rhel-10-baseos-rpms",
+            name="RHEL 10 BaseOS",
+        )
+        data = self._form_data()
+        data.update(
+            {
+                "rhsm_auth_mode": BuildDefinition.RHSM_AUTH_CONFIG,
+                "rhsm_repository_order_json": json.dumps(
+                    [
+                        {
+                            "id": rh_repo.id,
+                            "during_build": True,
+                            "before_afterburner": True,
+                        }
+                    ]
+                ),
+            }
+        )
+
+        form = BuildDefinitionForm(data=data)
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        self.assertEqual(
+            form.cleaned_data["ordered_rhsm_repository_payload"],
+            [{"id": rh_repo.id, "during_build": True, "before_afterburner": True}],
+        )
+
+    def test_rejects_rhsm_repository_order_payload_without_phase(self):
+        cfg = ServerConfiguration.get_solo()
+        cfg.rhn_username = "server-rh-user"
+        cfg.set_rhn_password("server-rh-pass")
+        cfg.save()
+        rh_repo = RedHatRepositoryCatalog.objects.create(
+            rhel_major=10,
+            architecture="x86_64",
+            repo_id="rhel-10-baseos-rpms",
+            name="RHEL 10 BaseOS",
+        )
+        data = self._form_data()
+        data.update(
+            {
+                "rhsm_auth_mode": BuildDefinition.RHSM_AUTH_CONFIG,
+                "rhsm_repository_order_json": json.dumps(
+                    [
+                        {
+                            "id": rh_repo.id,
+                            "during_build": False,
+                            "before_afterburner": False,
+                        }
+                    ]
+                ),
+            }
+        )
+
+        form = BuildDefinitionForm(data=data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("Each attached RHSM repository must be enabled for at least one phase", form.errors.as_text())
+
+    def test_rejects_rhsm_configuration_credentials_mode_without_server_credentials(self):
+        cfg = ServerConfiguration.get_solo()
+        cfg.rhn_username = ""
+        cfg.clear_rhn_password()
+        cfg.save()
+        rh_repo = RedHatRepositoryCatalog.objects.create(
+            rhel_major=10,
+            architecture="x86_64",
+            repo_id="rhel-10-baseos-rpms",
+            name="RHEL 10 BaseOS",
+        )
+        data = self._form_data()
+        data.update(
+            {
+                "rhsm_auth_mode": BuildDefinition.RHSM_AUTH_CONFIG,
+                "rhsm_repositories": [str(rh_repo.id)],
+            }
+        )
+
+        form = BuildDefinitionForm(data=data)
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("Server configuration RHSM credentials are required", form.errors.as_text())
 
     def test_rejects_rhsm_repository_with_mismatched_iso_major(self):
         rh_repo = RedHatRepositoryCatalog.objects.create(

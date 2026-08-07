@@ -1,0 +1,277 @@
+{% extends 'base.html' %}
+
+{% block title %}Afterburner Item | TuxWSMaker{% endblock %}
+
+{% block content %}
+<style>
+  .tpm-pcr-editor {
+    border: 1px solid #d7dde5;
+    border-radius: 8px;
+    padding: 0.75rem;
+    background: #f8fafc;
+  }
+
+  .tpm-pcr-row {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .tpm-pcr-row:last-child {
+    margin-bottom: 0;
+  }
+
+  .tpm-pcr-row select {
+    max-width: 140px;
+  }
+</style>
+
+<div class="card">
+  <div class="card-header">
+    <h5 class="mb-0">{% if form.instance.pk %}Edit{% else %}New{% endif %} Afterburner Item</h5>
+  </div>
+  <div class="card-body">
+    <form method="post">
+      {% csrf_token %}
+      {% if form.non_field_errors %}
+      <div class="alert alert-danger">{{ form.non_field_errors }}</div>
+      {% endif %}
+      <div class="row g-3">
+        <div class="col-md-6">{{ form.item_type.label_tag }} {{ form.item_type }}</div>
+
+        <div id="item-fields-ad_join" class="row g-3 d-none">
+          <div class="col-md-6">{{ form.ad_domain.label_tag }} {{ form.ad_domain }}</div>
+          <div class="col-md-6">{{ form.ad_join_user.label_tag }} {{ form.ad_join_user }}</div>
+          <div class="col-12">{{ form.ad_computer_ou.label_tag }} {{ form.ad_computer_ou }}</div>
+        </div>
+
+        <div id="item-fields-static_ip" class="row g-3 d-none">
+          <div class="col-md-4">{{ form.static_interface.label_tag }} {{ form.static_interface }}</div>
+          <div class="col-md-4">{{ form.static_ip_address.label_tag }} {{ form.static_ip_address }}</div>
+          <div class="col-md-4">{{ form.static_prefix.label_tag }} {{ form.static_prefix }}</div>
+          <div class="col-md-6">{{ form.static_gateway.label_tag }} {{ form.static_gateway }}</div>
+          <div class="col-md-6">{{ form.static_dns.label_tag }} {{ form.static_dns }}</div>
+        </div>
+
+        <div id="item-fields-luks_rotate" class="row g-3 d-none">
+          <div class="col-md-6" data-luks-device-field>{{ form.luks_device.label_tag }} {{ form.luks_device }}</div>
+          <div class="col-md-6">
+            <div class="form-check mt-4">
+              {{ form.luks_autodetect }}
+              {{ form.luks_autodetect.label_tag }}
+            </div>
+            <div class="form-text">{{ form.luks_autodetect.help_text }}</div>
+          </div>
+        </div>
+
+        <div id="item-fields-bootloader_password" class="row g-3 d-none">
+          <div class="col-md-6">{{ form.bootloader_user.label_tag }} {{ form.bootloader_user }}</div>
+        </div>
+
+        <div id="item-fields-redhat_registration" class="row g-3 d-none">
+          <div class="col-12"><div class="form-text">Either preconfigure credentials below or enable prompting to ask during afterburner execution.</div></div>
+          <div class="col-md-6">{{ form.rhsm_username.label_tag }} {{ form.rhsm_username }}</div>
+          <div class="col-md-6">{{ form.rhsm_password.label_tag }} {{ form.rhsm_password }}</div>
+          <div class="col-md-6">{{ form.rhsm_org_id.label_tag }} {{ form.rhsm_org_id }}</div>
+          <div class="col-md-6">{{ form.rhsm_activation_key.label_tag }} {{ form.rhsm_activation_key }}</div>
+          <div class="col-12">{{ form.rhsm_repo_ids.label_tag }} {{ form.rhsm_repo_ids }}</div>
+          <div class="col-md-6">
+            <div class="form-check mt-2">
+              {{ form.rhsm_prompt_credentials }}
+              {{ form.rhsm_prompt_credentials.label_tag }}
+            </div>
+          </div>
+          <div class="col-md-6">
+            <div class="form-check mt-2">
+              {{ form.rhsm_prompt_repositories }}
+              {{ form.rhsm_prompt_repositories.label_tag }}
+            </div>
+          </div>
+        </div>
+
+        <div id="item-fields-tpm_integration" class="row g-3 d-none">
+          <div class="col-md-6">{{ form.tpm_device.label_tag }} {{ form.tpm_device }}</div>
+          <div class="col-md-4">{{ form.tpm_hash.label_tag }} {{ form.tpm_hash }}</div>
+          <div class="col-md-4">{{ form.tpm_pcr_bank.label_tag }} {{ form.tpm_pcr_bank }}</div>
+          <div class="col-md-4">{{ form.tpm_key.label_tag }} {{ form.tpm_key }}</div>
+          <div class="col-12">
+            {{ form.tpm_pcr_ids.label_tag }}
+            <div class="d-none">{{ form.tpm_pcr_ids }}</div>
+            <div class="tpm-pcr-editor" data-tpm-pcr-editor></div>
+            <div class="form-text">{{ form.tpm_pcr_ids.help_text }}</div>
+          </div>
+          <div class="col-12">
+            <div class="form-check">
+              {{ form.tpm_autodetect }}
+              {{ form.tpm_autodetect.label_tag }}
+            </div>
+            <div class="form-text">{{ form.tpm_autodetect.help_text }}</div>
+          </div>
+        </div>
+
+        <div id="item-fields-wait_for_enter" class="row g-3 d-none">
+          <div class="col-12">{{ form.wait_message.label_tag }} {{ form.wait_message }}</div>
+        </div>
+
+        <div id="item-fields-custom_script" class="row g-3 d-none">
+          <div class="col-12">{{ form.script_body.label_tag }} {{ form.script_body }}</div>
+          <div class="col-12"><div class="form-text">The script runs on the target system during restore. Any custom script inputs become environment variables you can read in your shell script.</div></div>
+          <div class="col-12">
+            <pre class="bg-body-tertiary border rounded p-3 small mb-0">{% for line in custom_script_example_lines %}{{ line }}
+{% endfor %}</pre>
+          </div>
+        </div>
+      </div>
+      <div class="alert alert-info mt-3 mb-0 small">
+        Hostname and Local user items use built-in prompts and do not require extra configuration here.
+      </div>
+      <div class="d-flex gap-2 mt-3">
+        <button class="btn btn-primary" type="submit">Save</button>
+        <a class="btn btn-outline-secondary" href="{% url 'afterburners:profile-detail' profile_id %}">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+  (function () {
+    const typeSelect = document.querySelector('[name="item_type"]');
+    if (!typeSelect) {
+      return;
+    }
+
+    const sectionIds = ['ad_join', 'static_ip', 'luks_rotate', 'bootloader_password', 'redhat_registration', 'tpm_integration', 'wait_for_enter', 'custom_script'];
+    const autodetectCheckbox = document.querySelector('input[name="luks_autodetect"]');
+    const luksDeviceField = document.querySelector('[data-luks-device-field]');
+
+    function initTpmPcrEditor(root) {
+      root.querySelectorAll('[data-tpm-pcr-editor]').forEach((editor) => {
+        if (editor.dataset.initialized === 'true') {
+          return;
+        }
+        const hiddenSelect = editor.parentElement.querySelector('select[name="tpm_pcr_ids"]');
+        if (!hiddenSelect) {
+          return;
+        }
+
+        editor.dataset.initialized = 'true';
+        const choices = Array.from(hiddenSelect.options).map((option) => ({ value: option.value, label: option.textContent }));
+        const selectedValues = Array.from(hiddenSelect.selectedOptions).map((option) => option.value);
+
+        function refreshDisabledOptions() {
+          const selects = Array.from(editor.querySelectorAll('[data-tpm-pcr-select]'));
+          const selectedValues = selects
+            .map((select) => select.value)
+            .filter((value) => value !== '');
+
+          selects.forEach((select) => {
+            Array.from(select.options).forEach((option) => {
+              if (!option.value) {
+                option.disabled = false;
+                return;
+              }
+              option.disabled = selectedValues.includes(option.value) && option.value !== select.value;
+            });
+          });
+        }
+
+        function syncHiddenSelect() {
+          const values = Array.from(editor.querySelectorAll('[data-tpm-pcr-select]'))
+            .map((select) => select.value)
+            .filter((value) => value !== '');
+          Array.from(hiddenSelect.options).forEach((option) => {
+            option.selected = values.includes(option.value);
+          });
+          refreshDisabledOptions();
+        }
+
+        function renderRows(values) {
+          editor.innerHTML = '';
+
+          values.forEach((value, idx) => {
+            const row = document.createElement('div');
+            row.className = 'tpm-pcr-row';
+
+            const select = document.createElement('select');
+            select.className = 'form-select form-select-sm';
+            select.setAttribute('data-tpm-pcr-select', 'true');
+
+            const blankOption = document.createElement('option');
+            blankOption.value = '';
+            blankOption.textContent = 'Choose PCR';
+            select.appendChild(blankOption);
+
+            choices.forEach((choice) => {
+              const option = document.createElement('option');
+              option.value = choice.value;
+              option.textContent = choice.label;
+              option.selected = choice.value === value;
+              select.appendChild(option);
+            });
+
+            select.addEventListener('change', syncHiddenSelect);
+
+            const removeBtn = document.createElement('button');
+            removeBtn.type = 'button';
+            removeBtn.className = 'btn btn-sm btn-outline-danger';
+            removeBtn.textContent = 'Remove';
+            removeBtn.addEventListener('click', () => {
+              row.remove();
+              syncHiddenSelect();
+            });
+
+            const label = document.createElement('span');
+            label.className = 'text-muted small';
+            label.textContent = `PCR ${idx + 1}`;
+
+            row.appendChild(label);
+            row.appendChild(select);
+            row.appendChild(removeBtn);
+            editor.appendChild(row);
+          });
+
+          const addBtn = document.createElement('button');
+          addBtn.type = 'button';
+          addBtn.className = 'btn btn-sm btn-outline-secondary';
+          addBtn.textContent = 'Add PCR ID';
+          addBtn.addEventListener('click', () => {
+            renderRows([...Array.from(editor.querySelectorAll('[data-tpm-pcr-select]')).map((select) => select.value), '']);
+            syncHiddenSelect();
+          });
+          editor.appendChild(addBtn);
+          syncHiddenSelect();
+        }
+
+        renderRows(selectedValues);
+      });
+    }
+
+    function updateLuksDeviceVisibility() {
+      if (!luksDeviceField || !autodetectCheckbox) {
+        return;
+      }
+      luksDeviceField.classList.toggle('d-none', autodetectCheckbox.checked && typeSelect.value === 'luks_rotate');
+    }
+
+    function updateTypeSections() {
+      const value = typeSelect.value;
+      sectionIds.forEach((key) => {
+        const section = document.getElementById(`item-fields-${key}`);
+        if (!section) {
+          return;
+        }
+        section.classList.toggle('d-none', value !== key);
+      });
+      updateLuksDeviceVisibility();
+    }
+
+    typeSelect.addEventListener('change', updateTypeSections);
+    if (autodetectCheckbox) {
+      autodetectCheckbox.addEventListener('change', updateTypeSections);
+    }
+    initTpmPcrEditor(document);
+    updateTypeSections();
+  })();
+</script>
+{% endblock %}
