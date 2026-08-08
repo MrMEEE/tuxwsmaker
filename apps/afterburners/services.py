@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import shlex
 from pathlib import Path
@@ -201,12 +202,45 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "  echo \"[afterburner] LUKS password rotated successfully for $luks_dev\"\n"
             "}\n"
             "discover_luks_devices() {\n"
-            "  lsblk -rpn -o NAME,TYPE | awk '$2 == \"disk\" || $2 == \"part\" {print $1}' | while read -r candidate; do\n"
-            "    [[ -n \"$candidate\" ]] || continue\n"
-            "    if cryptsetup isLuks \"$candidate\" >/dev/null 2>&1; then\n"
-            "      printf '%s\\n' \"$candidate\"\n"
+            "  resolve_crypttab_source() {\n"
+            "    local source_spec=\"$1\"\n"
+            "    case \"$source_spec\" in\n"
+            "      UUID=*) blkid -U \"${source_spec#UUID=}\" 2>/dev/null || true ;;\n"
+            "      LABEL=*) blkid -L \"${source_spec#LABEL=}\" 2>/dev/null || true ;;\n"
+            "      /dev/*) printf '%s\\n' \"$source_spec\" ;;\n"
+            "      *) return 0 ;;\n"
+            "    esac\n"
+            "  }\n"
+            "  local discovered_from_crypttab=0\n"
+            "  if [[ -f \"$TARGET_ROOT/etc/crypttab\" ]]; then\n"
+            "    while IFS= read -r crypt_source; do\n"
+            "      [[ -n \"${crypt_source:-}\" ]] || continue\n"
+            "      while IFS= read -r candidate; do\n"
+            "        [[ -n \"${candidate:-}\" ]] || continue\n"
+            "        if cryptsetup isLuks \"$candidate\" >/dev/null 2>&1; then\n"
+            "          printf '%s\\n' \"$candidate\"\n"
+            "          discovered_from_crypttab=1\n"
+            "        fi\n"
+            "      done < <(resolve_crypttab_source \"$crypt_source\")\n"
+            "    done < <(awk 'NF >= 2 && $1 !~ /^[[:space:]]*#/ {print $2}' \"$TARGET_ROOT/etc/crypttab\")\n"
+            "  fi\n"
+            "  if [[ $discovered_from_crypttab -eq 0 ]]; then\n"
+            "    local -a fallback_candidates=()\n"
+            "    while IFS= read -r candidate; do\n"
+            "      [[ -n \"$candidate\" ]] || continue\n"
+            "      if cryptsetup isLuks \"$candidate\" >/dev/null 2>&1; then\n"
+            "        fallback_candidates+=(\"$candidate\")\n"
+            "      fi\n"
+            "    done < <(lsblk -rpn -o NAME,TYPE | awk '$2 == \"disk\" || $2 == \"part\" {print $1}')\n"
+            "    if [[ ${#fallback_candidates[@]} -gt 1 ]]; then\n"
+            "      echo \"[afterburner] ERROR: LUKS autodetect is ambiguous without $TARGET_ROOT/etc/crypttab guidance: ${fallback_candidates[*]}\" >&2\n"
+            "      echo \"[afterburner] Set an explicit LUKS device in this afterburner item or fix crypttab in the restored target.\" >&2\n"
+            "      return 1\n"
             "    fi\n"
-            "  done\n"
+            "    for candidate in \"${fallback_candidates[@]}\"; do\n"
+            "      printf '%s\\n' \"$candidate\"\n"
+            "    done\n"
+            "  fi\n"
             "}\n"
             "declare -a LUKS_TARGETS=()\n"
             "declare -A LUKS_SEEN=()\n"
@@ -220,9 +254,14 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "}\n"
             f'add_luks_target {_shell_quote(default_device)}\n'
             + (
+                "LUKS_AUTODETECT_OUTPUT=\"$(discover_luks_devices)\"; LUKS_AUTODETECT_RC=$?\n"
+                "if [[ $LUKS_AUTODETECT_RC -ne 0 ]]; then\n"
+                "  exit $LUKS_AUTODETECT_RC\n"
+                "fi\n"
                 "while IFS= read -r luks_dev; do\n"
+                "  [[ -n \"${luks_dev:-}\" ]] || continue\n"
                 "  add_luks_target \"$luks_dev\"\n"
-                "done < <(discover_luks_devices)\n"
+                "done <<< \"$LUKS_AUTODETECT_OUTPUT\"\n"
                 if autodetect
                 else ""
             )
@@ -386,6 +425,7 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             tpm_policy_payload["pcr_ids"] = ",".join(pcr_ids)
 
         tpm_policy = json.dumps(tpm_policy_payload, separators=(",", ":"))
+        tpm_policy_b64 = base64.b64encode(tpm_policy.encode("utf-8")).decode("ascii")
 
         return (
             f'echo "[afterburner] {label}: tpm integration"\n'
@@ -397,7 +437,49 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             '  echo "cryptsetup is not available; skipping TPM integration" >&2\n'
             '  exit 1\n'
             'fi\n'
-            'TPM2_POLICY=' + _shell_quote(tpm_policy) + '\n'
+            'TPM2_POLICY_B64=' + _shell_quote(tpm_policy_b64) + '\n'
+            'TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"\n'
+            "discover_tpm_luks_devices() {\n"
+            "  resolve_crypttab_source() {\n"
+            "    local source_spec=\"$1\"\n"
+            "    case \"$source_spec\" in\n"
+            "      UUID=*) blkid -U \"${source_spec#UUID=}\" 2>/dev/null || true ;;\n"
+            "      LABEL=*) blkid -L \"${source_spec#LABEL=}\" 2>/dev/null || true ;;\n"
+            "      /dev/*) printf '%s\\n' \"$source_spec\" ;;\n"
+            "      *) return 0 ;;\n"
+            "    esac\n"
+            "  }\n"
+            "  local discovered_from_crypttab=0\n"
+            "  if [[ -f \"$TARGET_ROOT/etc/crypttab\" ]]; then\n"
+            "    while IFS= read -r crypt_source; do\n"
+            "      [[ -n \"${crypt_source:-}\" ]] || continue\n"
+            "      while IFS= read -r candidate; do\n"
+            "        [[ -n \"${candidate:-}\" ]] || continue\n"
+            "        if cryptsetup isLuks \"$candidate\" >/dev/null 2>&1; then\n"
+            "          printf '%s\\n' \"$candidate\"\n"
+            "          discovered_from_crypttab=1\n"
+            "        fi\n"
+            "      done < <(resolve_crypttab_source \"$crypt_source\")\n"
+            "    done < <(awk 'NF >= 2 && $1 !~ /^[[:space:]]*#/ {print $2}' \"$TARGET_ROOT/etc/crypttab\")\n"
+            "  fi\n"
+            "  if [[ $discovered_from_crypttab -eq 0 ]]; then\n"
+            "    local -a fallback_candidates=()\n"
+            "    while IFS= read -r candidate; do\n"
+            "      [[ -n \"$candidate\" ]] || continue\n"
+            "      if cryptsetup isLuks \"$candidate\" >/dev/null 2>&1; then\n"
+            "        fallback_candidates+=(\"$candidate\")\n"
+            "      fi\n"
+            "    done < <(lsblk -rpn -o NAME,TYPE | awk '$2 == \"disk\" || $2 == \"part\" {print $1}')\n"
+            "    if [[ ${#fallback_candidates[@]} -gt 1 ]]; then\n"
+            "      echo \"[afterburner] ERROR: TPM LUKS autodetect is ambiguous without $TARGET_ROOT/etc/crypttab guidance: ${fallback_candidates[*]}\" >&2\n"
+            "      echo \"[afterburner] Set an explicit TPM integration device in this afterburner item or fix crypttab in the restored target.\" >&2\n"
+            "      return 1\n"
+            "    fi\n"
+            "    for candidate in \"${fallback_candidates[@]}\"; do\n"
+            "      printf '%s\\n' \"$candidate\"\n"
+            "    done\n"
+            "  fi\n"
+            "}\n"
             "declare -a TPM_TARGETS=()\n"
             "declare -A TPM_SEEN=()\n"
             "add_tpm_target() {\n"
@@ -410,12 +492,14 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "}\n"
             f'add_tpm_target {_shell_quote(default_device)}\n'
             + (
+                "TPM_AUTODETECT_OUTPUT=\"$(discover_tpm_luks_devices)\"; TPM_AUTODETECT_RC=$?\n"
+                "if [[ $TPM_AUTODETECT_RC -ne 0 ]]; then\n"
+                "  exit $TPM_AUTODETECT_RC\n"
+                "fi\n"
                 "while IFS= read -r luks_dev; do\n"
                 "  [[ -n \"$luks_dev\" ]] || continue\n"
-                "  if cryptsetup isLuks \"$luks_dev\" >/dev/null 2>&1; then\n"
-                "    add_tpm_target \"$luks_dev\"\n"
-                "  fi\n"
-                "done < <(lsblk -rpn -o NAME,TYPE | awk '$2 == \"disk\" || $2 == \"part\" {print $1}')\n"
+                "  add_tpm_target \"$luks_dev\"\n"
+                "done <<< \"$TPM_AUTODETECT_OUTPUT\"\n"
                 if autodetect
                 else ""
             )

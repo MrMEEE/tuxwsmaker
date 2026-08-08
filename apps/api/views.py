@@ -107,7 +107,7 @@ class BuildSnapshotView(APIView):
 				"message": log.message,
 				"created_at": log.created_at.isoformat(),
 			}
-			for log in build.logs.all().order_by("created_at", "id")
+			for log in build.logs.all().order_by("-created_at", "-id")
 		]
 		step_labels = dict(BuildDefinition.STEP_CHOICES)
 		manual_steps = []

@@ -604,7 +604,9 @@ def dump_clone_partitions(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     sparse_chunk_size = 1024 * 1024
-    with tempfile.NamedTemporaryFile(prefix=f"build-{build.id}-", suffix=".raw", delete=False) as raw_tmp:
+    tmp_dir = output_dir.parent / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=tmp_dir, prefix=f"build-{build.id}-", suffix=".raw", delete=False) as raw_tmp:
         raw_path = Path(raw_tmp.name)
 
     try:

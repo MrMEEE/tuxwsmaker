@@ -656,20 +656,29 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
 
   part_dev=$(raw_part "$TARGET_DISK" "$number")
   image_url="$CLONE_BASE/$file_name"
+  if [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]]; then
+    luks_enabled="False"
+    luks_name=""
+  fi
+  status "[$PART_INDEX/$TOTAL_PARTS] Partition metadata: mount=${mount_point:-none} fs=${fs_type:-none} role=${entry_role:-none} luks=${luks_enabled:-False} name=${luks_name:-none}"
   echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name|$entry_role|$volume_group|$logical_volume|$size_mode" >> "$WORK_DIR/part-dev.map"
 
   restore_target="$part_dev"
   if [[ "$luks_enabled" == "True" ]]; then
     map_name="${luks_name:-luks-${number}}"
+    if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
+      echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot bootstrap LUKS for $part_dev" >&2
+      exit 1
+    fi
     if ! cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
-      if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
-        echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot bootstrap LUKS for $part_dev" >&2
-        exit 1
-      fi
       printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
     fi
     if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
-      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
+      if ! printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -; then
+        status "LUKS open failed for $part_dev with bootstrap passphrase; reinitializing container"
+        printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
+        printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
+      fi
     fi
     restore_target="/dev/mapper/$map_name"
   fi
@@ -967,10 +976,11 @@ else
   while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
     [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]] || continue
     swap_uuid=$(blkid -s UUID -o value "$part_dev" 2>/dev/null || true)
+    swap_opts="defaults,nofail,x-systemd.device-timeout=10s"
     if [[ -n "$swap_uuid" ]]; then
-      echo "UUID=$swap_uuid none swap defaults 0 0" >> "$MOUNT_ROOT/etc/fstab"
+      echo "UUID=$swap_uuid none swap $swap_opts 0 0" >> "$MOUNT_ROOT/etc/fstab"
     else
-      echo "$part_dev none swap defaults 0 0" >> "$MOUNT_ROOT/etc/fstab"
+      echo "$part_dev none swap $swap_opts 0 0" >> "$MOUNT_ROOT/etc/fstab"
     fi
   done < "$WORK_DIR/part-dev.map"
 
@@ -1224,9 +1234,11 @@ bash /tmp/restore.sh
 rc=$?
 echo "$rc" > "$1"
 tmux wait-for -S "$2"
-echo
-echo "[deploy-pre] Restore session complete (rc=$rc). Press Enter to continue, or wait 15 minutes for automatic timeout"
-read -r -t 900 _ || true
+if [[ "$rc" -ne 0 ]]; then
+  echo
+  echo "[deploy-pre] Restore session complete (rc=$rc). Press Enter to continue, or wait 15 minutes for automatic timeout"
+  read -r -t 900 _ || true
+fi
 exit "$rc"
 TMUX_RESTORE
   chmod +x /tmp/tuxwsmaker-restore-tmux-runner.sh
@@ -1256,20 +1268,13 @@ cat <<'EOF'
 ================================================================
 Restore complete.
 
-Restore looks complete. Remove install media and press Enter to power off,
-or wait 15 minutes for automatic timeout.
+Restore looks complete. The system will reboot automatically.
 ================================================================
 EOF
-echo "[deploy-pre] Restore complete; waiting for console confirmation before poweroff"
+echo "[deploy-pre] Restore complete; rebooting automatically"
 trap - ERR
-if [ -c /dev/console ]; then
-  read -r -t 900 _ || true
-else
-  sleep 900
-fi
-echo "[deploy-pre] Powering off after restore completion"
 sync
-poweroff -f || halt -f
+reboot -f || systemctl reboot -f || reboot || poweroff -f || halt -f
 %end
 """
     path.write_text(content, encoding="utf-8")

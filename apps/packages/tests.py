@@ -4,7 +4,7 @@ from apps.packages.models import PackageItem, PackageList
 from apps.builds.models import BuildDefinition, BuildMachineConfig
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
-from apps.workers.tasks import _collect_selected_packages_for_build
+from apps.workers.tasks import _collect_selected_package_group_log_entries, _collect_selected_packages_for_build
 
 
 def _make_build(os_family="rhel", suffix=""):
@@ -56,6 +56,16 @@ class CollectPackagesTest(TestCase):
         self.assertEqual(installs, [])
         self.assertEqual(removes, [])
 
+    def test_environment_group_prefix_is_preserved(self):
+        build = _make_build("rhel", "-env")
+        pl = PackageList.objects.create(name="env", distro_family=PackageList.DISTRO_RHEL)
+        PackageItem.objects.create(package_list=pl, package_name="@^minimal-environment")
+        build.package_lists.add(pl)
+        groups, installs, removes, _ = _collect_selected_packages_for_build(build)
+        self.assertEqual(groups, ["minimal-environment"])
+        self.assertEqual(installs, [])
+        self.assertEqual(removes, [])
+
     def test_minus_prefix_goes_to_removes(self):
         build = _make_build("rhel", "-rem")
         pl = PackageList.objects.create(name="trim", distro_family=PackageList.DISTRO_RHEL)
@@ -101,6 +111,20 @@ class CollectPackagesTest(TestCase):
         self.assertIn("gnome-desktop", groups)
         self.assertEqual(installs, [])
         self.assertEqual(removes, [])
+
+    def test_group_log_entries_show_raw_and_normalized_names(self):
+        build = _make_build("rhel", "-log")
+        pl = PackageList.objects.create(name="log", distro_family=PackageList.DISTRO_RHEL)
+        PackageItem.objects.create(package_list=pl, package_name="@gnome-desktop")
+        PackageItem.objects.create(package_list=pl, package_name="@^minimal-environment")
+        build.package_lists.add(pl)
+
+        entries = _collect_selected_package_group_log_entries(build)
+
+        self.assertCountEqual(
+            entries,
+            ["@gnome-desktop -> gnome-desktop", "@^minimal-environment -> minimal-environment"],
+        )
 
     def test_deduplication_across_lists(self):
         build = _make_build("rhel", "-dup")

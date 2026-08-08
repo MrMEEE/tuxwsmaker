@@ -140,6 +140,10 @@ class ArtifactGenerationTests(TestCase):
 
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
         self.assertIn("discover_luks_devices", script)
+        self.assertIn('"$TARGET_ROOT/etc/crypttab"', script)
+        self.assertIn("resolve_crypttab_source", script)
+        self.assertIn("LUKS autodetect is ambiguous", script)
+        self.assertIn("LUKS_AUTODETECT_OUTPUT", script)
         self.assertIn("rotate_luks_container", script)
         self.assertIn("LUKS_TARGETS", script)
         self.assertIn("cryptsetup isLuks", script)
@@ -246,6 +250,115 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("tuxwsmaker-repo-", script)
         self.assertIn("Cleaning up temporary repositories for deploy/afterburner", script)
 
+    def test_deploy_restore_script_marks_swap_entries_nofail(self):
+        layout = PartitionLayout.objects.create(name="swap-layout")
+        PartitionEntry.objects.create(
+            layout=layout,
+            order=1,
+            name="root",
+            mount_point="/",
+            filesystem="xfs",
+            size_mode=PartitionEntry.SIZE_REMAINDER,
+        )
+        PartitionEntry.objects.create(
+            layout=layout,
+            order=2,
+            name="swap",
+            mount_point="swap",
+            filesystem="swap",
+            size_mode=PartitionEntry.SIZE_FIXED,
+            size_mib=2048,
+        )
+
+        build = BuildDefinition.objects.create(
+            name="build-swap",
+            operating_system=self.build.operating_system,
+            iso_image=self.build.iso_image,
+            partition_layout=layout,
+            machine_config=self.build.machine_config,
+        )
+
+        root = Path("/tmp/tuxwsmaker-test-restore-swap")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        path = render_deploy_restore_script(output_dir=root, os_family=build.operating_system.family, build=build)
+        script = path.read_text(encoding="utf-8")
+
+        self.assertIn("nofail,x-systemd.device-timeout=10s", script)
+
+    def test_deploy_restore_script_never_opens_swap_as_luks(self):
+        layout = PartitionLayout.objects.create(name="swap-luks-guard")
+        PartitionEntry.objects.create(
+            layout=layout,
+            order=1,
+            name="root",
+            mount_point="/",
+            filesystem="xfs",
+            size_mode=PartitionEntry.SIZE_REMAINDER,
+        )
+        PartitionEntry.objects.create(
+            layout=layout,
+            order=2,
+            name="swap",
+            mount_point="swap",
+            filesystem="swap",
+            size_mode=PartitionEntry.SIZE_FIXED,
+            size_mib=2048,
+            luks_enabled=True,
+            luks_name="cryptswap",
+        )
+
+        build = BuildDefinition.objects.create(
+            name="build-swap-luks-guard",
+            operating_system=self.build.operating_system,
+            iso_image=self.build.iso_image,
+            partition_layout=layout,
+            machine_config=self.build.machine_config,
+        )
+
+        root = Path("/tmp/tuxwsmaker-test-restore-swap-luks-guard")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        path = render_deploy_restore_script(output_dir=root, os_family=build.operating_system.family, build=build)
+        script = path.read_text(encoding="utf-8")
+
+        self.assertIn('if [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]]; then', script)
+        self.assertIn('luks_enabled="False"', script)
+        self.assertIn('luks_name=""', script)
+
+    def test_deploy_restore_script_logs_partition_metadata(self):
+        layout = PartitionLayout.objects.create(name="partition-log-layout")
+        PartitionEntry.objects.create(
+            layout=layout,
+            order=1,
+            name="root",
+            mount_point="/",
+            filesystem="xfs",
+            size_mode=PartitionEntry.SIZE_REMAINDER,
+        )
+
+        build = BuildDefinition.objects.create(
+            name="build-partition-log",
+            operating_system=self.build.operating_system,
+            iso_image=self.build.iso_image,
+            partition_layout=layout,
+            machine_config=self.build.machine_config,
+        )
+
+        root = Path("/tmp/tuxwsmaker-test-restore-partition-log")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        path = render_deploy_restore_script(output_dir=root, os_family=build.operating_system.family, build=build)
+        script = path.read_text(encoding="utf-8")
+
+        self.assertIn("Partition metadata:", script)
+        self.assertIn("mount=${mount_point:-none}", script)
+        self.assertIn("fs=${fs_type:-none}", script)
+        self.assertIn("luks=${luks_enabled:-False}", script)
+
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
     @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
     @patch("apps.builds.services.artifacts._export_usb_image")
@@ -329,6 +442,7 @@ class ArtifactGenerationTests(TestCase):
             item_type=AfterburnerItem.TYPE_TPM_INTEGRATION,
             config={
                 "device": "/dev/sda3",
+                "autodetect": True,
                 "hash": "sha256",
                 "pcr_bank": "sha256",
                 "key": "ecc",
@@ -353,8 +467,12 @@ class ArtifactGenerationTests(TestCase):
         generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
 
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
-        self.assertIn('TPM2_POLICY=', script)
-        self.assertIn('{"hash":"sha256","key":"ecc","pcr_bank":"sha256","pcr_ids":"7"}', script)
+        self.assertIn('TPM2_POLICY_B64=', script)
+        self.assertIn('TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"', script)
+        self.assertIn("discover_tpm_luks_devices", script)
+        self.assertIn('"$TARGET_ROOT/etc/crypttab"', script)
+        self.assertIn("TPM LUKS autodetect is ambiguous", script)
+        self.assertIn("TPM_AUTODETECT_OUTPUT", script)
         self.assertIn('clevis luks bind -y -k - -d "$container_dev" tpm2 "$TPM2_POLICY"', script)
         self.assertIn('clevis luks list -d "$container_dev"', script)
         self.assertIn('cryptsetup luksRemoveKey "$container_dev" -', script)
@@ -397,7 +515,8 @@ class ArtifactGenerationTests(TestCase):
         generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
 
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
-        self.assertIn('{"hash":"sha256","key":"ecc","pcr_bank":"sha256"}', script)
+        self.assertIn('TPM2_POLICY_B64=', script)
+        self.assertIn('TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"', script)
         self.assertNotIn('"pcr_ids":', script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
@@ -469,6 +588,9 @@ class ArtifactGenerationTests(TestCase):
         self.assertNotIn("chvt 6", deploy_kickstart)
         self.assertIn("read -r -t 900 _ || true", deploy_kickstart)
         self.assertIn("bash /tmp/restore.sh", deploy_kickstart)
+        self.assertIn("Restore looks complete. The system will reboot automatically.", deploy_kickstart)
+        self.assertIn('reboot -f || systemctl reboot -f || reboot || poweroff -f || halt -f', deploy_kickstart)
+        self.assertNotIn("waiting for console confirmation before poweroff", deploy_kickstart)
         self.assertNotIn("%packages", deploy_kickstart)
         self.assertIn("Missing local restore script", deploy_kickstart)
         self.assertNotIn("curl -fsSL", deploy_kickstart)

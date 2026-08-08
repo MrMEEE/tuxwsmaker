@@ -7,6 +7,7 @@ from django.http import FileResponse, Http404, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
 from django.urls import reverse_lazy
 from django.views.generic import CreateView, DetailView, ListView, UpdateView, View
+from django.db.models import Prefetch
 import subprocess
 import tarfile
 import tempfile
@@ -323,7 +324,10 @@ class BuildDetailView(LoginRequiredMixin, DetailView):
 	def get_queryset(self):
 		return BuildDefinition.objects.select_related(
 			"machine_config", "iso_image", "operating_system", "partition_layout"
-		).prefetch_related("artifacts", "logs")
+		).prefetch_related(
+			"artifacts",
+			Prefetch("logs", queryset=BuildLogEntry.objects.order_by("-created_at", "-id")),
+		)
 
 	def get_context_data(self, **kwargs):
 		context = super().get_context_data(**kwargs)
@@ -639,6 +643,32 @@ class BuildArtifactDownloadView(LoginRequiredMixin, View):
 			)
 
 		raise Http404("Artifact path does not exist")
+
+
+class BuildArtifactPathView(LoginRequiredMixin, View):
+	def get(self, request, pk, artifact_id):
+		build = get_object_or_404(BuildDefinition, pk=pk)
+		artifact = get_object_or_404(BuildArtifact, pk=artifact_id, build=build)
+
+		artifact_root = Path(settings.ARTIFACT_ROOT).resolve()
+		artifact_path = Path(artifact.file_path).resolve()
+
+		if artifact_root not in artifact_path.parents and artifact_root != artifact_path:
+			raise Http404("Artifact path is outside configured artifact root")
+
+		if not artifact_path.exists():
+			raise Http404("Artifact path does not exist")
+
+		return JsonResponse(
+			{
+				"build_id": build.id,
+				"artifact_id": artifact.id,
+				"artifact_type": artifact.artifact_type,
+				"path": str(artifact_path),
+				"is_dir": artifact_path.is_dir(),
+				"is_file": artifact_path.is_file(),
+			}
+		)
 
 
 class SSHKeyListView(LoginRequiredMixin, ListView):

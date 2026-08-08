@@ -138,6 +138,16 @@ def _disk_path(build: BuildDefinition) -> Path:
     return _artifact_root() / "disks" / f"{_vm_name(build)}.qcow2"
 
 
+def _unique_disk_path(build: BuildDefinition) -> Path:
+    disks_dir = _artifact_root() / "disks"
+    vm_name = _vm_name(build)
+    for _ in range(8):
+        candidate = disks_dir / f"{vm_name}-{secrets.token_hex(4)}.qcow2"
+        if not candidate.exists():
+            return candidate
+    return disks_dir / f"{vm_name}-{secrets.token_hex(8)}.qcow2"
+
+
 def _runtime_state(build: BuildDefinition) -> dict:
     return dict(build.runtime_state or {})
 
@@ -263,6 +273,43 @@ def _run_remote_checked(
         raise ProvisioningError(
             f"Builder remote command failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
         )
+    return proc.stdout or ""
+
+
+def _append_remote_command_log(*, build: BuildDefinition, label: str, proc: subprocess.CompletedProcess) -> None:
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    _append_build_log(build=build, stage="packages", message=f"{label} finished (rc={proc.returncode})")
+    if stdout:
+        _append_build_log(build=build, stage="packages", message=f"{label} stdout: {stdout[:2000]}")
+    if stderr:
+        _append_build_log(build=build, stage="packages", message=f"{label} stderr: {stderr[:2000]}")
+
+
+def _run_remote_logged(
+    *,
+    build: BuildDefinition,
+    provisioner: AnsibleProvisioner,
+    host: str,
+    user: str,
+    private_key_path: str,
+    command: str,
+    timeout_seconds: int,
+    label: str,
+    input_text: str | None = None,
+) -> str:
+    _append_build_log(build=build, stage="packages", message=f"{label}: starting")
+    proc = provisioner.run_remote_command(
+        host=host,
+        user=user,
+        private_key_path=private_key_path,
+        command=command,
+        timeout_seconds=timeout_seconds,
+        input_text=input_text,
+    )
+    _append_remote_command_log(build=build, label=label, proc=proc)
+    if proc.returncode != 0:
+        raise ProvisioningError(f"{label} failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout or ""
 
 
@@ -631,6 +678,7 @@ def _collect_selected_packages_for_build(
 
     Package name prefixes:
       @name  → group install  (dnf group install / tasksel on Debian)
+    @^name → environment group install on RHEL-family guests
       -name  → remove after install
       name   → regular install
     """
@@ -652,20 +700,50 @@ def _collect_selected_packages_for_build(
             skipped_lists.append(package_list.name)
             continue
         for item in package_list.items.all():
-            pkg = str(item.package_name or "").strip().strip('"').strip("'")
-            # Strip optional surrounding quotes so '"@KDE Plasma Workspaces"' works.
-            if len(pkg) >= 2 and pkg[0] in ('"', "'") and pkg[-1] == pkg[0]:
-                pkg = pkg[1:-1].strip()
-            if not pkg or pkg in seen:
+            raw_pkg = str(item.package_name or "").strip().strip('"').strip("'")
+            if len(raw_pkg) >= 2 and raw_pkg[0] in ('"', "'") and raw_pkg[-1] == raw_pkg[0]:
+                raw_pkg = raw_pkg[1:-1].strip()
+            if not raw_pkg or raw_pkg in seen:
                 continue
-            seen.add(pkg)
-            if pkg.startswith("@"):
-                groups.append(pkg[1:])   # strip @, keep bare group name
-            elif pkg.startswith("-"):
-                removes.append(pkg[1:])  # strip -, keep bare package name
+            seen.add(raw_pkg)
+            if raw_pkg.startswith("@^"):
+                groups.append(raw_pkg[2:])
+            elif raw_pkg.startswith("@"):
+                groups.append(raw_pkg[1:])
+            elif raw_pkg.startswith("-"):
+                removes.append(raw_pkg[1:])
             else:
-                installs.append(pkg)
+                installs.append(raw_pkg)
     return groups, installs, removes, skipped_lists
+
+
+def _collect_selected_package_group_log_entries(build: BuildDefinition) -> list[str]:
+    os_family = str(build.operating_system.family or "").strip().lower()
+    allowed_families = {PackageList.DISTRO_ALL}
+    if os_family == "rhel":
+        allowed_families.add(PackageList.DISTRO_RHEL)
+    elif os_family == "debian":
+        allowed_families.add(PackageList.DISTRO_DEBIAN)
+
+    entries: list[str] = []
+    seen: set[str] = set()
+    selected_lists = build.package_lists.prefetch_related("items").order_by("name")
+    for package_list in selected_lists:
+        if package_list.distro_family not in allowed_families:
+            continue
+        for item in package_list.items.all():
+            raw_pkg = str(item.package_name or "").strip().strip('"').strip("'")
+            if len(raw_pkg) >= 2 and raw_pkg[0] in ('"', "'") and raw_pkg[-1] == raw_pkg[0]:
+                raw_pkg = raw_pkg[1:-1].strip()
+            if not raw_pkg or raw_pkg in seen:
+                continue
+            if raw_pkg.startswith("@^"):
+                entries.append(f"{raw_pkg} -> {raw_pkg[2:]}")
+                seen.add(raw_pkg)
+            elif raw_pkg.startswith("@"):
+                entries.append(f"{raw_pkg} -> {raw_pkg[1:]}")
+                seen.add(raw_pkg)
+    return entries
 
 
 def _rhsm_selected_repo_ids(build: BuildDefinition, *, phase: str = "during_build") -> list[str]:
@@ -873,6 +951,20 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
             if removes:
                 parts.append(f"{len(removes)} removal(s)")
             _append_build_log(build=build, stage="packages", message=f"Processing {', '.join(parts)} from selected package lists")
+            group_log_entries = _collect_selected_package_group_log_entries(build)
+            if groups:
+                if group_log_entries:
+                    _append_build_log(
+                        build=build,
+                        stage="packages",
+                        message=f"Package groups selected (raw -> normalized): {', '.join(group_log_entries)}",
+                    )
+                else:
+                    _append_build_log(build=build, stage="packages", message=f"Package groups selected: {', '.join(groups)}")
+            if installs:
+                _append_build_log(build=build, stage="packages", message=f"Packages selected: {', '.join(installs)}")
+            if removes:
+                _append_build_log(build=build, stage="packages", message=f"Packages selected for removal: {', '.join(removes)}")
 
             if os_family == "debian":
                 cmd_parts = [
@@ -883,7 +975,7 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                 ]
                 if groups:
                     for g in groups:
-                        cmd_parts.append(f"echo 'Skipping group @{g}: groups are not supported on Debian/Ubuntu' >&2 || true")
+                        cmd_parts.append(f"echo 'Skipping package group {shlex.quote(g)}: groups are not supported on Debian/Ubuntu' >&2 || true")
                 if installs:
                     quoted_installs = " ".join(shlex.quote(p) for p in installs)
                     cmd_parts.append(f"apt-get install -y --no-install-recommends {quoted_installs}")
@@ -909,15 +1001,6 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                     pkg_mgr_prefix,
                     f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True makecache || true",
                 ]
-                if groups:
-                    quoted_groups = " ".join(shlex.quote(g) for g in groups)
-                    cmd_parts.append(f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True group install {quoted_groups}")
-                if installs:
-                    quoted_installs = " ".join(shlex.quote(p) for p in installs)
-                    cmd_parts.append(f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True install {quoted_installs}")
-                if removes:
-                    quoted_removes = " ".join(shlex.quote(p) for p in removes)
-                    cmd_parts.append(f"$PKG_MGR -y remove {quoted_removes}")
                 install_command = "; ".join(cmd_parts)
 
             _append_build_log(build=build, stage="packages", message=f"Running package operations on guest")
@@ -942,14 +1025,81 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                         private_key_path=str(key_pair.private_key_path),
                         allowed_repo_ids=allowed_repo_ids,
                     )
-                _run_remote_checked(
-                    provisioner=provisioner,
-                    host=ip_address,
-                    user=ssh_user,
-                    private_key_path=str(key_pair.private_key_path),
-                    command=install_command,
-                    timeout_seconds=1200,
-                )
+                if os_family == "rhel":
+                    pkg_mgr_prefix = (
+                        "PKG_MGR=''; "
+                        "if command -v dnf >/dev/null 2>&1; then PKG_MGR='dnf'; "
+                        "elif command -v yum >/dev/null 2>&1; then PKG_MGR='yum'; fi; "
+                        "if [[ -z \"$PKG_MGR\" ]]; then echo 'dnf/yum is not available on guest' >&2; exit 1; fi"
+                    )
+                    if groups:
+                        quoted_groups = " ".join(shlex.quote(g) for g in groups)
+                        group_command = (
+                            f"{pkg_mgr_prefix}; "
+                            f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True makecache || true; "
+                            f"for group_name in {quoted_groups}; do "
+                            f"  if ! $PKG_MGR -q {repo_scope} --setopt=skip_if_unavailable=True group info \"$group_name\" >/dev/null 2>&1; then "
+                            f"    echo 'Package group is unavailable, aborting: ' \"$group_name\" >&2; "
+                            f"    exit 1; "
+                            f"  fi; "
+                            f"  echo 'Installing package group: ' \"$group_name\"; "
+                            f"  $PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True group install \"$group_name\"; "
+                            f"done"
+                        )
+                        _run_remote_logged(
+                            build=build,
+                            provisioner=provisioner,
+                            host=ip_address,
+                            user=ssh_user,
+                            private_key_path=str(key_pair.private_key_path),
+                            command=group_command,
+                            timeout_seconds=1200,
+                            label="group install",
+                        )
+                    if installs:
+                        quoted_installs = " ".join(shlex.quote(p) for p in installs)
+                        install_packages_command = (
+                            f"{pkg_mgr_prefix}; "
+                            f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True makecache || true; "
+                            f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True install {quoted_installs}"
+                        )
+                        _run_remote_logged(
+                            build=build,
+                            provisioner=provisioner,
+                            host=ip_address,
+                            user=ssh_user,
+                            private_key_path=str(key_pair.private_key_path),
+                            command=install_packages_command,
+                            timeout_seconds=1200,
+                            label="package install",
+                        )
+                    if removes:
+                        quoted_removes = " ".join(shlex.quote(p) for p in removes)
+                        remove_packages_command = (
+                            f"{pkg_mgr_prefix}; "
+                            f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True remove {quoted_removes}"
+                        )
+                        _run_remote_logged(
+                            build=build,
+                            provisioner=provisioner,
+                            host=ip_address,
+                            user=ssh_user,
+                            private_key_path=str(key_pair.private_key_path),
+                            command=remove_packages_command,
+                            timeout_seconds=1200,
+                            label="package removal",
+                        )
+                else:
+                    _run_remote_logged(
+                        build=build,
+                        provisioner=provisioner,
+                        host=ip_address,
+                        user=ssh_user,
+                        private_key_path=str(key_pair.private_key_path),
+                        command=install_command,
+                        timeout_seconds=1200,
+                        label="package install",
+                    )
             finally:
                 _cleanup_build_phase_repositories(
                     build=build,
@@ -1063,7 +1213,7 @@ def _step_create_vm_shell(build: BuildDefinition) -> dict[str, str]:
     ssh_user = getattr(settings, "BUILD_VM_SSH_USER", "root")
     artifact_root = _artifact_root()
     kickstart_dir = artifact_root / "kickstarts"
-    disk_path = _disk_path(build)
+    disk_path = _unique_disk_path(build)
     key_pair = _materialize_build_keypair(build)
     try:
         _append_build_log(build=build, stage="ssh", message="Generated guest SSH keypair")
@@ -1471,8 +1621,9 @@ def _execute_step(build: BuildDefinition, step: str) -> dict[str, str]:
         return _step_save_release(build)
     if step == BuildDefinition.STEP_CLEANUP:
         vm_name = str(_runtime_state(build).get("vm_name") or _vm_name(build))
+        disk_path = str(_runtime_state(build).get("disk_path") or _disk_path(build))
         vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
-        vm_manager.remove_domain(name=vm_name, disk_path="")
+        vm_manager.remove_domain(name=vm_name, disk_path=disk_path)
         build.status = BuildDefinition.STATUS_DRAFT
         build.current_step = BuildDefinition.STEP_PENDING
         build.runtime_state = {

@@ -173,6 +173,7 @@ class BuildManualStepTests(TestCase):
 		self.build.runtime_state = {
 			"last_completed_step": BuildDefinition.STEP_SAVE_RELEASE,
 			"vm_name": "build-vm",
+			"disk_path": str(Path(settings.ARTIFACT_ROOT) / "disks" / "build-vm.qcow2"),
 		}
 		self.build.save(update_fields=["status", "current_step", "runtime_state", "updated_at"])
 
@@ -183,7 +184,8 @@ class BuildManualStepTests(TestCase):
 		self.assertEqual(self.build.current_step, BuildDefinition.STEP_PENDING)
 		self.assertEqual(self.build.runtime_state.get("last_completed_step"), BuildDefinition.STEP_PENDING)
 		self.assertEqual(self.build.runtime_state.get("vm_name"), None)
-		mock_remove_domain.assert_called_once_with(name="build-vm", disk_path="")
+		expected_disk = str(Path(settings.ARTIFACT_ROOT) / "disks" / "build-vm.qcow2")
+		mock_remove_domain.assert_called_once_with(name="build-vm", disk_path=expected_disk)
 
 	@patch("apps.builds.services.artifacts._write_usb_image_from_bundle")
 	@patch("apps.builds.services.artifacts._extract_iso_stage2_payload")

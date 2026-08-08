@@ -68,11 +68,22 @@ class LibvirtVMManager:
             try:
                 domain = conn.lookupByName(vm.name)
                 if replace_existing:
+                    existing_disk_path = ""
+                    try:
+                        xml = domain.XMLDesc(0)
+                        root = ET.fromstring(xml)
+                        source = root.find("./devices/disk[@device='disk']/source")
+                        if source is not None:
+                            existing_disk_path = (source.get("file") or source.get("dev") or "").strip()
+                    except Exception:
+                        existing_disk_path = ""
+
                     if domain.isActive() == 1:
                         domain.destroy()
                     self._undefine_domain(domain)
-                    if vm.disk_path:
-                        disk = Path(vm.disk_path)
+                    disk_to_delete = existing_disk_path or vm.disk_path
+                    if disk_to_delete:
+                        disk = Path(disk_to_delete)
                         if disk.exists():
                             disk.unlink()
                 else:
