@@ -865,7 +865,17 @@ else
     exit 1
   fi
   mkdir -p "$MOUNT_ROOT"
-  mount "$ROOT_DEV" "$MOUNT_ROOT"
+  _fstype=$(blkid -o value -s TYPE "$ROOT_DEV" 2>/dev/null || true)
+  if echo "$_fstype" | grep -qE '^ext[234]$'; then
+    fsck -y "$ROOT_DEV" >/dev/null 2>&1 || true
+  elif [[ "$_fstype" == "xfs" ]] && command -v xfs_repair >/dev/null 2>&1; then
+    xfs_repair "$ROOT_DEV" >/dev/null 2>&1 || xfs_repair -L "$ROOT_DEV" >/dev/null 2>&1 || true
+  fi
+  if ! mount "$ROOT_DEV" "$MOUNT_ROOT"; then
+    status "ERROR: Could not mount root device $ROOT_DEV on $MOUNT_ROOT"
+    dmesg | tail -5 || true
+    exit 1
+  fi
   echo "$MOUNT_ROOT" >> "$WORK_DIR/mounted.paths"
 
   while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
@@ -884,10 +894,17 @@ else
     [[ "$entry_role" == "pv" ]] && continue
     target="$MOUNT_ROOT$mount_point"
     mkdir -p "$target"
+    _fstype=$(blkid -o value -s TYPE "$source_dev" 2>/dev/null || true)
+    if echo "$_fstype" | grep -qE '^ext[234]$'; then
+      fsck -y "$source_dev" >/dev/null 2>&1 || true
+    elif [[ "$_fstype" == "xfs" ]] && command -v xfs_repair >/dev/null 2>&1; then
+      xfs_repair "$source_dev" >/dev/null 2>&1 || xfs_repair -L "$source_dev" >/dev/null 2>&1 || true
+    fi
     if mount "$source_dev" "$target"; then
       echo "$target" >> "$WORK_DIR/mounted.paths"
     else
-      status "Could not mount $source_dev on $target (continuing)"
+      status "WARNING: Could not mount $source_dev on $target — skipping"
+      dmesg | tail -3 2>/dev/null || true
     fi
   done < "$WORK_DIR/part-dev.map"
 
@@ -1006,10 +1023,12 @@ if [[ "${BOOT_MODE:-bios}" == "bios" ]]; then
     grub-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
   fi
 else
-  if command -v grub2-install >/dev/null 2>&1; then
+  if command -v grub2-install >/dev/null 2>&1 && [[ -d /usr/lib/grub/x86_64-efi || -d /usr/lib/grub2/x86_64-efi ]]; then
     grub2-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
-  elif command -v grub-install >/dev/null 2>&1; then
+  elif command -v grub-install >/dev/null 2>&1 && [[ -d /usr/lib/grub/x86_64-efi || -d /usr/lib/grub2/x86_64-efi ]]; then
     grub-install "$TARGET_DEV" && touch /tmp/tuxwsmaker-grub-install.ok || true
+  else
+    echo "UEFI grub-install prerequisites not found in chroot; skipping explicit grub-install" >&2
   fi
 fi
 
@@ -1074,17 +1093,36 @@ CHROOT
     efibootmgr -q -w -c -d "$TARGET_DEV" -p "$EFI_NUM" -L "TuxWSMaker Restored" -l "$efi_loader" || true
   fi
 
-  AFTERBURNER="/run/install/repo/deploy/afterburner.sh"
-  if [[ -f "$AFTERBURNER" ]]; then
+  AFTERBURNER_SRC="/run/install/repo/deploy/afterburner.sh"
+  AFTERBURNER_RUN="$WORK_DIR/afterburner.sh"
+  TARGET_RESOLV_BACKUP="$WORK_DIR/target-resolv.conf.before-afterburner"
+  TARGET_RESOLV_INJECTED=0
+  if [[ -f "$AFTERBURNER_SRC" ]]; then
     CURRENT_PHASE="afterburner"
+    if [[ -f /etc/resolv.conf ]]; then
+      mkdir -p "$MOUNT_ROOT/etc"
+      if [[ -e "$MOUNT_ROOT/etc/resolv.conf" || -L "$MOUNT_ROOT/etc/resolv.conf" ]]; then
+        cp -a "$MOUNT_ROOT/etc/resolv.conf" "$TARGET_RESOLV_BACKUP" 2>/dev/null || true
+      fi
+      cp -L /etc/resolv.conf "$MOUNT_ROOT/etc/resolv.conf" 2>/dev/null || true
+      TARGET_RESOLV_INJECTED=1
+      status "Injected live installer resolver into target (overwriting build-time DNS)"
+    fi
 __REPO_SETUP__
     status "Running afterburner in restore context"
-    chmod +x "$AFTERBURNER"
+    cp "$AFTERBURNER_SRC" "$AFTERBURNER_RUN"
+    chmod +x "$AFTERBURNER_RUN"
     set +e
-    MOUNT_ROOT="$MOUNT_ROOT" TARGET_DEV="$TARGET_DEV" WORK_DIR="$WORK_DIR" bash "$AFTERBURNER"
+    MOUNT_ROOT="$MOUNT_ROOT" TARGET_DEV="$TARGET_DEV" WORK_DIR="$WORK_DIR" bash "$AFTERBURNER_RUN"
     afterburner_exit=$?
     set -e
 __REPO_CLEANUP__
+    if [[ -e "$TARGET_RESOLV_BACKUP" || -L "$TARGET_RESOLV_BACKUP" ]]; then
+      cp -a "$TARGET_RESOLV_BACKUP" "$MOUNT_ROOT/etc/resolv.conf" 2>/dev/null || true
+    elif [[ "$TARGET_RESOLV_INJECTED" == "1" ]]; then
+      rm -f "$MOUNT_ROOT/etc/resolv.conf" 2>/dev/null || true
+    fi
+    rm -f "$AFTERBURNER_RUN" "$TARGET_RESOLV_BACKUP" 2>/dev/null || true
     if [[ $afterburner_exit -ne 0 ]]; then
       status "Afterburner failed"
       exit $afterburner_exit

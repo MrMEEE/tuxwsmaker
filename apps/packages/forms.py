@@ -26,8 +26,13 @@ class PackageItemsBulkForm(forms.Form):
             value = raw.strip()
             if not value:
                 continue
-            if " " in value:
-                raise forms.ValidationError(f"Line {idx} contains spaces; use one package name per line")
+            # Allow spaces in group names (@Group Name) and quoted entries ("@Group Name").
+            bare = value.strip('"').strip("'")
+            if " " in value and not bare.startswith("@"):
+                raise forms.ValidationError(
+                    f"Line {idx} contains spaces; use one package name per line "
+                    f"(group names with spaces must start with @ e.g. @KDE Plasma Workspaces)"
+                )
             if value in seen:
                 continue
             seen.add(value)

@@ -144,7 +144,8 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("LUKS_TARGETS", script)
         self.assertIn("cryptsetup isLuks", script)
         self.assertIn("for LUKS_DEV in \"${LUKS_TARGETS[@]}\"", script)
-        self.assertIn("Current LUKS password for", script)
+        self.assertIn("DEFAULT_LUKS_PASSWORD", script)
+        self.assertIn("test-passphrase", script)
         self.assertIn("Confirm new LUKS password for", script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")

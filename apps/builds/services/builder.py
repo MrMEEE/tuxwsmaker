@@ -174,21 +174,6 @@ class BuilderVMManager:
 		shared_iso_dir = Path(self.definition.shared_iso_dir)
 		shared_iso_dir.mkdir(parents=True, exist_ok=True)
 
-		if not self.definition.base_image_path:
-			return
-
-		disk_path = Path(self.definition.disk_path)
-		disk_path.parent.mkdir(parents=True, exist_ok=True)
-		self._progress(progress_cb, "ssh", "Ensuring builder access SSH keypair")
-		key_pair = self.ensure_access_keypair()
-		if not disk_path.exists():
-			self._progress(progress_cb, "disk", f"Creating overlay disk at {disk_path}")
-			self._create_overlay_disk(disk_path=disk_path)
-			self._progress(progress_cb, "disk", "Injecting SSH key into builder disk")
-			self._inject_ssh_key(disk_path=disk_path, public_key=key_pair.public_key)
-			self._progress(progress_cb, "network", "Injecting static network configuration")
-			self._inject_static_network_config(disk_path=disk_path)
-
 		conn = self._connect()
 		try:
 			self._ensure_default_storage_pool(conn=conn)
@@ -202,6 +187,24 @@ class BuilderVMManager:
 				return
 			except Exception:
 				pass
+
+			if not self.definition.base_image_path:
+				raise BuilderError(
+					"Builder VM does not exist and no builder base image is configured. "
+					"Set builder base image path in server configuration, then retry."
+				)
+
+			disk_path = Path(self.definition.disk_path)
+			disk_path.parent.mkdir(parents=True, exist_ok=True)
+			self._progress(progress_cb, "ssh", "Ensuring builder access SSH keypair")
+			key_pair = self.ensure_access_keypair()
+			if not disk_path.exists():
+				self._progress(progress_cb, "disk", f"Creating overlay disk at {disk_path}")
+				self._create_overlay_disk(disk_path=disk_path)
+				self._progress(progress_cb, "disk", "Injecting SSH key into builder disk")
+				self._inject_ssh_key(disk_path=disk_path, public_key=key_pair.public_key)
+				self._progress(progress_cb, "network", "Injecting static network configuration")
+				self._inject_static_network_config(disk_path=disk_path)
 
 			if shutil.which("virt-install") is None:
 				raise BuilderError("virt-install is required to create the builder VM")

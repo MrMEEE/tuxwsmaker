@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -20,6 +21,58 @@ class AnsibleProvisioner:
     def __init__(self, project_root: Path) -> None:
         self.project_root = project_root
 
+    @staticmethod
+    def _ssh_base_options() -> list[str]:
+        # Keep SSH non-interactive and skip slow auth/canonicalization paths.
+        return [
+            "-F",
+            "/dev/null",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ConnectionAttempts=1",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "GSSAPIAuthentication=no",
+            "-o",
+            "PreferredAuthentications=publickey",
+            "-o",
+            "PasswordAuthentication=no",
+            "-o",
+            "KbdInteractiveAuthentication=no",
+            "-o",
+            "CanonicalizeHostname=no",
+            "-o",
+            "VerifyHostKeyDNS=no",
+            "-o",
+            "KnownHostsCommand=none",
+            "-o",
+            "AddressFamily=inet",
+        ]
+
+    @classmethod
+    def _ansible_ssh_common_args(cls) -> str:
+        return (
+            "-F /dev/null "
+            "-o ConnectTimeout=10 "
+            "-o ConnectionAttempts=1 "
+            "-o StrictHostKeyChecking=no "
+            "-o UserKnownHostsFile=/dev/null "
+            "-o GSSAPIAuthentication=no "
+            "-o PreferredAuthentications=publickey "
+            "-o PasswordAuthentication=no "
+            "-o KbdInteractiveAuthentication=no "
+            "-o CanonicalizeHostname=no "
+            "-o VerifyHostKeyDNS=no "
+            "-o KnownHostsCommand=none "
+            "-o AddressFamily=inet"
+        )
+
     def wait_for_ssh(
         self,
         *,
@@ -31,12 +84,7 @@ class AnsibleProvisioner:
         end = time.time() + timeout_seconds
         cmd = [
             "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            *self._ssh_base_options(),
             "-i",
             private_key_path,
             f"{user}@{host}",
@@ -61,12 +109,7 @@ class AnsibleProvisioner:
     ) -> subprocess.CompletedProcess:
         ssh_cmd = [
             "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            *self._ssh_base_options(),
             "-i",
             private_key_path,
             f"{user}@{host}",
@@ -74,14 +117,19 @@ class AnsibleProvisioner:
             "-lc",
             shlex.quote(command),
         ]
-        return subprocess.run(
-            ssh_cmd,
-            input=input_text,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_seconds,
-        )
+        try:
+            return subprocess.run(
+                ssh_cmd,
+                input=input_text,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProvisioningError(
+                f"SSH remote command timed out after {timeout_seconds}s: {command[:200]}"
+            ) from exc
 
     def upload_file(
         self,
@@ -95,18 +143,18 @@ class AnsibleProvisioner:
     ) -> None:
         scp_cmd = [
             "scp",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            *self._ssh_base_options(),
             "-i",
             private_key_path,
             str(local_path),
             f"{user}@{host}:{remote_path}",
         ]
-        proc = subprocess.run(scp_cmd, capture_output=True, text=True, check=False, timeout=timeout_seconds)
+        try:
+            proc = subprocess.run(scp_cmd, capture_output=True, text=True, check=False, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as exc:
+            raise ProvisioningError(
+                f"scp timed out after {timeout_seconds}s while uploading {local_path} to {user}@{host}:{remote_path}"
+            ) from exc
         if proc.returncode != 0:
             raise ProvisioningError(f"scp failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}")
 
@@ -361,12 +409,7 @@ class AnsibleProvisioner:
 
                 ssh_cmd = [
                     "ssh",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
+                    *self._ssh_base_options(),
                     "-i",
                     ssh_private_key_path,
                     f"{ssh_user}@{current_ip}",
@@ -522,6 +565,7 @@ class AnsibleProvisioner:
             inventory_path = Path(inventory_file.name)
 
         try:
+            ssh_common_args = self._ansible_ssh_common_args()
             cmd = [
                 "ansible-playbook",
                 "-i",
@@ -530,14 +574,19 @@ class AnsibleProvisioner:
                 user,
                 "--private-key",
                 private_key_path,
+                "--ssh-common-args",
+                ssh_common_args,
                 str(playbook_path),
             ]
+            env = dict(os.environ)
+            env.setdefault("ANSIBLE_HOST_KEY_CHECKING", "False")
             return subprocess.run(
                 cmd,
                 cwd=working_dir,
                 capture_output=True,
                 text=True,
                 check=False,
+                env=env,
             )
         finally:
             inventory_path.unlink(missing_ok=True)

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import secrets
 import shlex
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from apps.builds.services.artifacts import (
     generate_artifacts,
     prepare_iso_pxe_assets,
 )
-from apps.builds.services.builder import BuilderVMManager
+from apps.builds.services.builder import BuilderError, BuilderVMManager
 from apps.builds.services.kickstart import calculate_layout_disk_size_gib, render_kickstart_file, render_pxe_boot_configs
 from apps.builds.services.provisioning import AnsibleProvisioner, ProvisioningError
 from apps.builds.services.ssh_keys import SSHKeyError, generate_build_ssh_keypair
@@ -491,30 +493,50 @@ def _builder_ready_timeout_seconds(build: BuildDefinition) -> int:
 def _builder_session(build: BuildDefinition, *, ensure_iso_shared: bool) -> tuple[BuilderVMManager, AnsibleProvisioner, str, str, Path]:
     builder_manager = BuilderVMManager()
     builder_timeout = _builder_ready_timeout_seconds(build)
-    if ensure_iso_shared:
-        builder_manager.ensure_iso_shared(Path(build.iso_image.iso_file.path))
-    _append_build_log(build=build, stage="builder", message="Ensuring builder VM exists")
-    builder_manager.ensure_builder_vm()
-    _append_build_log(build=build, stage="builder", message="Checking whether builder VM is running")
-    if not builder_manager.builder_vm_running():
-        _append_build_log(build=build, stage="builder", message="Builder VM is not running; starting it")
-        builder_manager.start_builder_vm()
-    else:
-        _append_build_log(build=build, stage="builder", message="Builder VM is already running")
-    _append_build_log(build=build, stage="builder", message="Waiting for builder DHCP/IP address")
-    builder_ip = builder_manager.wait_for_ipv4(timeout_seconds=builder_timeout)
-    _append_build_log(build=build, stage="builder", message=f"Builder VM IP detected: {builder_ip}")
-    builder_access = builder_manager.ensure_access_keypair()
-    builder_ssh_user = getattr(settings, "BUILDER_VM_SSH_USER", "root")
-    provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
-    _append_build_log(build=build, stage="ssh", message=f"Waiting for builder SSH on {builder_ssh_user}@{builder_ip}")
-    provisioner.wait_for_ssh(
-        host=builder_ip,
-        user=builder_ssh_user,
-        private_key_path=str(builder_access.private_key_path),
-        timeout_seconds=builder_timeout,
-    )
-    return builder_manager, provisioner, builder_ip, builder_ssh_user, builder_access.private_key_path
+    try:
+        if ensure_iso_shared:
+            builder_manager.ensure_iso_shared(Path(build.iso_image.iso_file.path))
+        _append_build_log(build=build, stage="builder", message="Ensuring builder VM exists")
+        builder_manager.ensure_builder_vm()
+        _append_build_log(build=build, stage="builder", message="Checking whether builder VM is running")
+        if not builder_manager.builder_vm_running():
+            _append_build_log(build=build, stage="builder", message="Builder VM is not running; starting it")
+            builder_manager.start_builder_vm()
+        else:
+            _append_build_log(build=build, stage="builder", message="Builder VM is already running")
+        _append_build_log(build=build, stage="builder", message="Waiting for builder DHCP/IP address")
+        builder_ip = builder_manager.wait_for_ipv4(timeout_seconds=builder_timeout)
+        _append_build_log(build=build, stage="builder", message=f"Builder VM IP detected: {builder_ip}")
+        builder_access = builder_manager.ensure_access_keypair()
+        builder_ssh_user = getattr(settings, "BUILDER_VM_SSH_USER", "root")
+        provisioner = AnsibleProvisioner(project_root=Path(__file__).resolve().parents[2])
+        _append_build_log(build=build, stage="ssh", message=f"Waiting for builder SSH on {builder_ssh_user}@{builder_ip}")
+        provisioner.wait_for_ssh(
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_access.private_key_path),
+            timeout_seconds=builder_timeout,
+        )
+        _append_build_log(build=build, stage="ssh", message="Applying builder SSH performance profile (disable reverse DNS/GSSAPI)")
+        _run_remote_checked(
+            provisioner=provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_access.private_key_path),
+            command=(
+                "mkdir -p /etc/ssh/sshd_config.d; "
+                "cat > /etc/ssh/sshd_config.d/99-tuxwsmaker-fast-ssh.conf <<'EOF'\n"
+                "UseDNS no\n"
+                "GSSAPIAuthentication no\n"
+                "EOF\n"
+                "if command -v sshd >/dev/null 2>&1; then sshd -t; fi; "
+                "systemctl reload sshd >/dev/null 2>&1 || systemctl reload ssh >/dev/null 2>&1 || true"
+            ),
+            timeout_seconds=120,
+        )
+        return builder_manager, provisioner, builder_ip, builder_ssh_user, builder_access.private_key_path
+    except BuilderError as exc:
+        raise ProvisioningError(f"Builder VM setup failed: {exc}") from exc
 
 
 def _materialize_build_keypair(build: BuildDefinition):
@@ -602,7 +624,16 @@ def _run_selected_playbooks(
         )
 
 
-def _collect_selected_packages_for_build(build: BuildDefinition) -> tuple[list[str], list[str]]:
+def _collect_selected_packages_for_build(
+    build: BuildDefinition,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Return (groups, installs, removes, skipped_lists).
+
+    Package name prefixes:
+      @name  → group install  (dnf group install / tasksel on Debian)
+      -name  → remove after install
+      name   → regular install
+    """
     os_family = str(build.operating_system.family or "").strip().lower()
     allowed_families = {PackageList.DISTRO_ALL}
     if os_family == "rhel":
@@ -610,7 +641,9 @@ def _collect_selected_packages_for_build(build: BuildDefinition) -> tuple[list[s
     elif os_family == "debian":
         allowed_families.add(PackageList.DISTRO_DEBIAN)
 
-    package_names: list[str] = []
+    groups: list[str] = []
+    installs: list[str] = []
+    removes: list[str] = []
     seen: set[str] = set()
     skipped_lists: list[str] = []
     selected_lists = build.package_lists.prefetch_related("items").order_by("name")
@@ -619,12 +652,20 @@ def _collect_selected_packages_for_build(build: BuildDefinition) -> tuple[list[s
             skipped_lists.append(package_list.name)
             continue
         for item in package_list.items.all():
-            pkg = str(item.package_name or "").strip()
+            pkg = str(item.package_name or "").strip().strip('"').strip("'")
+            # Strip optional surrounding quotes so '"@KDE Plasma Workspaces"' works.
+            if len(pkg) >= 2 and pkg[0] in ('"', "'") and pkg[-1] == pkg[0]:
+                pkg = pkg[1:-1].strip()
             if not pkg or pkg in seen:
                 continue
             seen.add(pkg)
-            package_names.append(pkg)
-    return package_names, skipped_lists
+            if pkg.startswith("@"):
+                groups.append(pkg[1:])   # strip @, keep bare group name
+            elif pkg.startswith("-"):
+                removes.append(pkg[1:])  # strip -, keep bare package name
+            else:
+                installs.append(pkg)
+    return groups, installs, removes, skipped_lists
 
 
 def _rhsm_selected_repo_ids(build: BuildDefinition, *, phase: str = "during_build") -> list[str]:
@@ -811,27 +852,45 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                     message=f"Enabled RHSM repositories: {', '.join(rhsm_repo_ids)}",
                 )
 
-            package_names, skipped_lists = _collect_selected_packages_for_build(build)
+            groups, installs, removes, skipped_lists = _collect_selected_packages_for_build(build)
             if skipped_lists:
                 _append_build_log(
                     build=build,
                     stage="packages",
                     message=f"Skipping incompatible package lists for {build.operating_system.family}: {', '.join(skipped_lists)}",
                 )
-            if not package_names:
+            if not groups and not installs and not removes:
                 _append_build_log(build=build, stage="packages", message="No package list entries selected for installation")
                 _save_runtime_state(build, build_ip_address=ip_address)
                 return {"ip": ip_address, "packages_installed": "0"}
 
-            quoted_packages = " ".join(shlex.quote(pkg) for pkg in package_names)
+            total_count = len(groups) + len(installs) + len(removes)
+            parts = []
+            if groups:
+                parts.append(f"{len(groups)} group(s)")
+            if installs:
+                parts.append(f"{len(installs)} package(s)")
+            if removes:
+                parts.append(f"{len(removes)} removal(s)")
+            _append_build_log(build=build, stage="packages", message=f"Processing {', '.join(parts)} from selected package lists")
+
             if os_family == "debian":
-                install_command = (
+                cmd_parts = [
                     "if ! command -v apt-get >/dev/null 2>&1; then "
                     "echo 'apt-get is not available on guest' >&2; exit 1; fi; "
                     "export DEBIAN_FRONTEND=noninteractive; "
-                    "apt-get update -y; "
-                    f"apt-get install -y --no-install-recommends {quoted_packages}"
-                )
+                    "apt-get update -y",
+                ]
+                if groups:
+                    for g in groups:
+                        cmd_parts.append(f"echo 'Skipping group @{g}: groups are not supported on Debian/Ubuntu' >&2 || true")
+                if installs:
+                    quoted_installs = " ".join(shlex.quote(p) for p in installs)
+                    cmd_parts.append(f"apt-get install -y --no-install-recommends {quoted_installs}")
+                if removes:
+                    quoted_removes = " ".join(shlex.quote(p) for p in removes)
+                    cmd_parts.append(f"apt-get remove -y {quoted_removes}")
+                install_command = "; ".join(cmd_parts)
             else:
                 if os_family == "rhel" and not allowed_repo_ids:
                     raise ProvisioningError(
@@ -840,16 +899,28 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                 repo_scope = "--disablerepo='*' " + " ".join(
                     f"--enablerepo={shlex.quote(repo_id)}" for repo_id in allowed_repo_ids
                 )
-                install_command = (
+                pkg_mgr_prefix = (
                     "PKG_MGR=''; "
                     "if command -v dnf >/dev/null 2>&1; then PKG_MGR='dnf'; "
                     "elif command -v yum >/dev/null 2>&1; then PKG_MGR='yum'; fi; "
-                    "if [[ -z \"$PKG_MGR\" ]]; then echo 'dnf/yum is not available on guest' >&2; exit 1; fi; "
-                    f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True makecache || true; "
-                    f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True install {quoted_packages}"
+                    "if [[ -z \"$PKG_MGR\" ]]; then echo 'dnf/yum is not available on guest' >&2; exit 1; fi"
                 )
+                cmd_parts = [
+                    pkg_mgr_prefix,
+                    f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True makecache || true",
+                ]
+                if groups:
+                    quoted_groups = " ".join(shlex.quote(g) for g in groups)
+                    cmd_parts.append(f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True group install {quoted_groups}")
+                if installs:
+                    quoted_installs = " ".join(shlex.quote(p) for p in installs)
+                    cmd_parts.append(f"$PKG_MGR -y {repo_scope} --setopt=skip_if_unavailable=True install {quoted_installs}")
+                if removes:
+                    quoted_removes = " ".join(shlex.quote(p) for p in removes)
+                    cmd_parts.append(f"$PKG_MGR -y remove {quoted_removes}")
+                install_command = "; ".join(cmd_parts)
 
-            _append_build_log(build=build, stage="packages", message=f"Installing {len(package_names)} package(s) from selected package lists")
+            _append_build_log(build=build, stage="packages", message=f"Running package operations on guest")
             _run_build_phase_repositories(
                 build=build,
                 provisioner=provisioner,
@@ -887,9 +958,9 @@ def _step_install_packages(build: BuildDefinition) -> dict[str, str]:
                     ssh_user=ssh_user,
                     private_key_path=str(key_pair.private_key_path),
                 )
-            _append_build_log(build=build, stage="packages", message="Package installation completed")
+            _append_build_log(build=build, stage="packages", message="Package operations completed")
             _save_runtime_state(build, build_ip_address=ip_address)
-            return {"ip": ip_address, "packages_installed": str(len(package_names))}
+            return {"ip": ip_address, "packages_installed": str(total_count)}
         finally:
             if rhsm_repo_ids:
                 _run_remote_checked(
@@ -1113,7 +1184,7 @@ def _step_create_vm_shell(build: BuildDefinition) -> dict[str, str]:
             kickstart_url=f"http://{builder_ip}/kickstarts/{kickstart_path.name}",
             install_source_url=install_source_url,
         )
-        for remote_path, content in [
+        boot_config_targets = [
             (remote_bios_config, boot_configs["bios"]),
             (remote_efi_config, boot_configs["efi"]),
             (remote_efi_config_alt, boot_configs["efi"]),
@@ -1124,16 +1195,21 @@ def _step_create_vm_shell(build: BuildDefinition) -> dict[str, str]:
             (remote_efi32_config, boot_configs["efi"]),
             (remote_efi32_config_alt, boot_configs["efi"]),
             (remote_efi32_default, boot_configs["efi"]),
-        ]:
-            _run_remote_checked(
-                provisioner=builder_provisioner,
-                host=builder_ip,
-                user=builder_ssh_user,
-                private_key_path=str(builder_key_path),
-                command=f"cat > {remote_path}",
-                timeout_seconds=timeout_seconds,
-                input_text=content,
+        ]
+        write_commands = ["set -euo pipefail"]
+        for remote_path, content in boot_config_targets:
+            encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+            write_commands.append(
+                f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_path)}"
             )
+        _run_remote_checked(
+            provisioner=builder_provisioner,
+            host=builder_ip,
+            user=builder_ssh_user,
+            private_key_path=str(builder_key_path),
+            command="; ".join(write_commands),
+            timeout_seconds=timeout_seconds,
+        )
         _run_remote_checked(
             provisioner=builder_provisioner,
             host=builder_ip,
@@ -1437,7 +1513,7 @@ def run_build_definition(self, build_id: int) -> dict[str, str]:
             build.refresh_from_db()
             _complete_step(build, step=step, keep_running=step != BuildDefinition.STEP_SAVE_RELEASE)
         return {"status": build.status, **result}
-    except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError) as exc:
+    except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError, subprocess.TimeoutExpired) as exc:
         _fail_build(build, step=current_step, exc=exc)
         raise RuntimeError(str(exc)) from exc
     finally:
@@ -1467,7 +1543,7 @@ def run_build_step(self, build_id: int, step: str) -> dict[str, str]:
         if step != BuildDefinition.STEP_CLEANUP:
             _complete_step(build, step=step, keep_running=False)
         return {"status": build.status, "step": step, **result}
-    except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError) as exc:
+    except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError, subprocess.TimeoutExpired) as exc:
         _fail_build(build, step=step, exc=exc)
         raise RuntimeError(str(exc)) from exc
     finally:
@@ -1534,7 +1610,7 @@ def rerun_build_playbooks(self, build_id: int, ip_address: str = "") -> dict[str
             return {"status": "ok", "ip": effective_ip, "vm": vm_name}
         finally:
             key_pair.cleanup_private()
-    except (ProvisioningError, SSHKeyError, PlaybookSyncError) as exc:
+    except (ProvisioningError, SSHKeyError, PlaybookSyncError, subprocess.TimeoutExpired) as exc:
         _append_build_log(build=build, stage="error", message=str(exc))
         raise RuntimeError(str(exc)) from exc
     finally:

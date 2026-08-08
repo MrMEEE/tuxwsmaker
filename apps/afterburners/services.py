@@ -36,8 +36,11 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
     if item.item_type == AfterburnerItem.TYPE_LOCAL_USER:
         return (
             f'echo "[afterburner] {label}: local user"\n'
-            "prompt_text LOCAL_USER_USERNAME \"Username (blank to skip)\" \"\"\n"
-            "if [[ -n \"${LOCAL_USER_USERNAME:-}\" ]]; then\n"
+            "while true; do\n"
+            "  prompt_text LOCAL_USER_USERNAME \"Username (blank to skip)\" \"\"\n"
+            "  if [[ -z \"${LOCAL_USER_USERNAME:-}\" ]]; then\n"
+            "    break\n"
+            "  fi\n"
             "  prompt_text LOCAL_USER_FIRSTNAME \"First name\" \"\"\n"
             "  prompt_text LOCAL_USER_LASTNAME \"Last name\" \"\"\n"
             "  while true; do\n"
@@ -54,8 +57,17 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "    break\n"
             "  done\n"
             "  prompt_bool LOCAL_USER_ADMIN \"Grant sudo (wheel) access\" \"no\"\n"
-            "  if ! run_chroot id \"$LOCAL_USER_USERNAME\" >/dev/null 2>&1; then\n"
-            "    run_chroot useradd -m \"$LOCAL_USER_USERNAME\"\n"
+            "  if run_chroot id \"$LOCAL_USER_USERNAME\" >/dev/null 2>&1; then\n"
+            "    echo \"User $LOCAL_USER_USERNAME already exists; updating.\"\n"
+            "    _useradd_ok=1\n"
+            "  else\n"
+            "    run_chroot useradd -m \"$LOCAL_USER_USERNAME\" 2>/tmp/_useradd_err.txt; _useradd_ok=$?\n"
+            "    _useradd_err=$(cat /tmp/_useradd_err.txt 2>/dev/null || true)\n"
+            "    if [[ $_useradd_ok -ne 0 ]]; then\n"
+            "      echo \"useradd failed: $_useradd_err\" >&2\n"
+            "      echo \"Please enter a valid username and try again.\" >&2\n"
+            "      continue\n"
+            "    fi\n"
             "  fi\n"
             "  FULL_NAME=\"$LOCAL_USER_FIRSTNAME $LOCAL_USER_LASTNAME\"\n"
             "  FULL_NAME=\"${FULL_NAME## }\"\n"
@@ -69,7 +81,8 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "  else\n"
             "    run_chroot gpasswd -d \"$LOCAL_USER_USERNAME\" wheel >/dev/null 2>&1 || true\n"
             "  fi\n"
-            "fi\n"
+            "  break\n"
+            "done\n"
         )
 
     if item.item_type == AfterburnerItem.TYPE_AD_JOIN:
@@ -142,7 +155,21 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "rotate_luks_container() {\n"
             "  local luks_dev=\"$1\"\n"
             "  echo \"[afterburner] Rotating LUKS password for $luks_dev\"\n"
-            "  prompt_password LUKS_OLD \"Current LUKS password for $luks_dev\"\n"
+            "  # Try the known build-time passphrase first; fall back to prompting if it doesn't match.\n"
+            "  local luks_current=\"${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}\"\n"
+            "  if ! printf '%s' \"$luks_current\" | cryptsetup open --test-passphrase \"$luks_dev\" 2>/dev/null; then\n"
+            "    echo \"[afterburner] Build-time passphrase did not match $luks_dev — please enter the current LUKS password.\"\n"
+            "    while true; do\n"
+            "      prompt_password luks_current \"Current LUKS password for $luks_dev\"\n"
+            "      if [[ -z \"${luks_current:-}\" ]]; then\n"
+            "        echo \"Password cannot be empty\" >&2; continue\n"
+            "      fi\n"
+            "      if printf '%s' \"$luks_current\" | cryptsetup open --test-passphrase \"$luks_dev\" 2>/dev/null; then\n"
+            "        break\n"
+            "      fi\n"
+            "      echo \"Incorrect LUKS password — try again\" >&2\n"
+            "    done\n"
+            "  fi\n"
             "  while true; do\n"
             "    prompt_password LUKS_NEW \"New LUKS password for $luks_dev\"\n"
             "    prompt_password LUKS_NEW_CONFIRM \"Confirm new LUKS password for $luks_dev\"\n"
@@ -156,12 +183,22 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "    fi\n"
             "    break\n"
             "  done\n"
-            "  if [[ -z \"${LUKS_OLD:-}\" ]]; then\n"
-            "    echo \"Current LUKS password is required\" >&2\n"
-            "    exit 1\n"
-            "  fi\n"
-            "  printf '%s\\n%s\\n' \"$LUKS_OLD\" \"$LUKS_NEW\" | cryptsetup luksAddKey \"$luks_dev\" -\n"
-            "  printf '%s\\n' \"$LUKS_OLD\" | cryptsetup luksRemoveKey \"$luks_dev\" -\n"
+            "  # Write current passphrase to a temp key file so both add and remove\n"
+            "  # operations read from the same source without stdin ambiguity.\n"
+            "  local _luks_tmpkey\n"
+            "  _luks_tmpkey=$(mktemp /tmp/luks-key-XXXXXX)\n"
+            "  chmod 600 \"$_luks_tmpkey\"\n"
+            "  printf '%s' \"$luks_current\" > \"$_luks_tmpkey\"\n"
+            "  printf '%s' \"$LUKS_NEW\" | cryptsetup luksAddKey --key-file \"$_luks_tmpkey\" \"$luks_dev\" - || {\n"
+            "    echo \"[afterburner] ERROR: Failed to add new LUKS key on $luks_dev\" >&2\n"
+            "    rm -f \"$_luks_tmpkey\"; return 1\n"
+            "  }\n"
+            "  cryptsetup luksRemoveKey --key-file \"$_luks_tmpkey\" \"$luks_dev\" || {\n"
+            "    echo \"[afterburner] ERROR: Failed to remove old LUKS key on $luks_dev\" >&2\n"
+            "    rm -f \"$_luks_tmpkey\"; return 1\n"
+            "  }\n"
+            "  rm -f \"$_luks_tmpkey\"\n"
+            "  echo \"[afterburner] LUKS password rotated successfully for $luks_dev\"\n"
             "}\n"
             "discover_luks_devices() {\n"
             "  lsblk -rpn -o NAME,TYPE | awk '$2 == \"disk\" || $2 == \"part\" {print $1}' | while read -r candidate; do\n"
@@ -390,16 +427,25 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             + "      echo \"$container_dev is not a LUKS container; skipping\" >&2\n"
             + "      continue\n"
             + "    fi\n"
-            + "    prompt_password LUKS_CRYPT_PASSWORD \"Current LUKS password for $container_dev\"\n"
-            + "    if [[ -z \"${LUKS_CRYPT_PASSWORD:-}\" ]]; then\n"
-            + "      echo \"Current LUKS password is required\" >&2\n"
-            + "      exit 1\n"
-            + "    fi\n"
+            + "    luks_tpm_pass=''\n"
+            + "    while true; do\n"
+            + "      prompt_password luks_tpm_pass \"Current LUKS password for $container_dev\"\n"
+            + "      if [[ -z \"${luks_tpm_pass:-}\" ]]; then\n"
+            + "        echo \"Password cannot be empty\" >&2; continue\n"
+            + "      fi\n"
+            + "      if printf '%s' \"$luks_tpm_pass\" | cryptsetup open --test-passphrase \"$container_dev\" 2>/dev/null; then\n"
+            + "        break\n"
+            + "      fi\n"
+            + "      echo \"Incorrect LUKS password — try again\" >&2\n"
+            + "    done\n"
             + "    echo \"Binding clevis TPM2 to: $container_dev\"\n"
-            + "    printf '%s' \"$LUKS_CRYPT_PASSWORD\" | clevis luks bind -y -k - -d \"$container_dev\" tpm2 \"$TPM2_POLICY\"\n"
-            + "    echo \"List binding\"\n"
+            + "    printf '%s' \"$luks_tpm_pass\" | clevis luks bind -y -k - -d \"$container_dev\" tpm2 \"$TPM2_POLICY\" || {\n"
+            + "      echo \"[afterburner] ERROR: clevis TPM2 bind failed on $container_dev\" >&2\n"
+            + "      continue\n"
+            + "    }\n"
+            + "    echo \"Clevis bindings on $container_dev:\"\n"
             + "    clevis luks list -d \"$container_dev\"\n"
-            + "    printf '%s' \"$LUKS_CRYPT_PASSWORD\" | cryptsetup luksRemoveKey \"$container_dev\" -\n"
+            + "    printf '%s' \"$luks_tpm_pass\" | cryptsetup luksRemoveKey \"$container_dev\" -\n"
             + "  done\n"
             + "  if run_chroot command -v dracut >/dev/null 2>&1; then\n"
             + "    run_chroot dracut -q -f --regenerate-all\n"
@@ -503,6 +549,7 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "  else",
         "    read -r -p \"$label: \" value || true",
         "  fi",
+        "  value=\"${value//$'\\r'/}\"",
         "  printf -v \"$var_name\" '%s' \"$value\"",
         "}",
         "",
@@ -512,6 +559,7 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "  local value=\"\"",
         "  read -r -s -p \"$label: \" value || true",
         "  echo",
+        "  value=\"${value//$'\\r'/}\"",
         "  printf -v \"$var_name\" '%s' \"$value\"",
         "}",
         "",
@@ -521,6 +569,7 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "  local default_value=\"${3:-no}\"",
         "  local value=\"\"",
         "  read -r -p \"$label [${default_value}]: \" value || true",
+        "  value=\"${value//$'\\r'/}\"",
         "  value=\"${value:-$default_value}\"",
         "  case \"${value,,}\" in",
         "    y|yes|true|1) value=\"yes\" ;;",
