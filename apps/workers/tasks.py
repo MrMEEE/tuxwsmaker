@@ -234,6 +234,15 @@ def _complete_step(build: BuildDefinition, *, step: str, keep_running: bool) -> 
     )
 
 
+def _manual_step_prerequisites_met(build: BuildDefinition, step: str) -> bool:
+    if step not in BuildDefinition.STEP_SEQUENCE:
+        return False
+    if step == BuildDefinition.STEP_VM_SHELL:
+        return True
+    previous_step = BuildDefinition.STEP_SEQUENCE[BuildDefinition.STEP_SEQUENCE.index(step) - 1]
+    return build.has_completed_step(previous_step)
+
+
 def _fail_build(build: BuildDefinition, *, step: str, exc: Exception) -> None:
     _append_build_log(build=build, stage="error", message=str(exc))
     build.status = BuildDefinition.STATUS_FAILED
@@ -632,7 +641,10 @@ def _run_selected_playbooks(
             _append_build_log(
                 build=build,
                 stage="playbooks",
-                message=f"Running playbook {selection.playbook.repository.name} [{branch}] {selection.playbook.path}",
+                message=(
+                    f"Running playbook {selection.playbook.repository.name} [{branch}] {selection.playbook.path} "
+                    "(mode=non_chroot)"
+                ),
             )
             provisioner.configure_guest(
                 host=ip_address,
@@ -1681,7 +1693,12 @@ def run_build_step(self, build_id: int, step: str) -> dict[str, str]:
         cache.set(build_task_cache_key(build_id), task_id, timeout=BUILD_TASK_CACHE_TTL_SECONDS)
 
     build = _load_build(build_id)
-    if not build.can_run_manual_step(step):
+    state = _runtime_state(build)
+    active_task_id = str(state.get("active_task_id") or "").strip()
+    if build.status in {BuildDefinition.STATUS_QUEUED, BuildDefinition.STATUS_RUNNING}:
+        if not (task_id and active_task_id == task_id and _manual_step_prerequisites_met(build, step)):
+            raise RuntimeError(f"Step '{step}' is not available for this build right now")
+    elif not build.can_run_manual_step(step):
         raise RuntimeError(f"Step '{step}' is not available for this build right now")
 
     _set_build_running(build, run_mode=BuildDefinition.RUN_MODE_MANUAL, reset=step == BuildDefinition.STEP_VM_SHELL)
@@ -1696,6 +1713,71 @@ def run_build_step(self, build_id: int, step: str) -> dict[str, str]:
         return {"status": build.status, "step": step, **result}
     except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError, subprocess.TimeoutExpired) as exc:
         _fail_build(build, step=step, exc=exc)
+        raise RuntimeError(str(exc)) from exc
+    finally:
+        build.refresh_from_db()
+        _clear_active_task_id(build, task_id)
+        if task_id and cache.get(build_task_cache_key(build_id)) == task_id:
+            cache.delete(build_task_cache_key(build_id))
+
+
+@shared_task(bind=True)
+def run_build_until_step(self, build_id: int, target_step: str) -> dict[str, object]:
+    task_id = str(getattr(self.request, "id", "") or "")
+    if task_id:
+        cache.set(build_task_cache_key(build_id), task_id, timeout=BUILD_TASK_CACHE_TTL_SECONDS)
+
+    build = _load_build(build_id)
+    if target_step not in BuildDefinition.STEP_SEQUENCE:
+        raise RuntimeError(f"Unknown target step '{target_step}'")
+
+    next_step = build.next_manual_step()
+    if next_step not in BuildDefinition.STEP_SEQUENCE:
+        raise RuntimeError("No runnable manual steps available")
+
+    start_index = BuildDefinition.STEP_SEQUENCE.index(next_step)
+    target_index = BuildDefinition.STEP_SEQUENCE.index(target_step)
+    if target_index < start_index:
+        raise RuntimeError(
+            f"Target step '{target_step}' is already completed; next runnable step is '{next_step}'"
+        )
+
+    steps_to_run = BuildDefinition.STEP_SEQUENCE[start_index : target_index + 1]
+    _set_build_running(
+        build,
+        run_mode=BuildDefinition.RUN_MODE_MANUAL,
+        reset=steps_to_run[0] == BuildDefinition.STEP_VM_SHELL,
+    )
+    _set_active_task_id(build, task_id)
+    _append_build_log(
+        build=build,
+        stage="manual",
+        message=(
+            "Running manual steps until: "
+            f"{dict(BuildDefinition.STEP_CHOICES).get(target_step, target_step)}"
+        ),
+    )
+
+    result: dict[str, str] = {}
+    current_step = BuildDefinition.STEP_PENDING
+    try:
+        for step in steps_to_run:
+            current_step = step
+            build.refresh_from_db()
+            _begin_step(build, step=step)
+            _append_build_log(
+                build=build,
+                stage="manual",
+                message=f"Running manual step: {dict(BuildDefinition.STEP_CHOICES).get(step, step)}",
+            )
+            result.update(_execute_step(build, step))
+            build.refresh_from_db()
+            if step != BuildDefinition.STEP_CLEANUP:
+                _complete_step(build, step=step, keep_running=step != target_step)
+
+        return {"status": build.status, "target_step": target_step, "steps": steps_to_run, **result}
+    except (VirtualizationError, ProvisioningError, SSHKeyError, ArtifactExportError, PlaybookSyncError, subprocess.TimeoutExpired) as exc:
+        _fail_build(build, step=current_step, exc=exc)
         raise RuntimeError(str(exc)) from exc
     finally:
         build.refresh_from_db()

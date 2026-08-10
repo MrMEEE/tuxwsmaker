@@ -63,6 +63,7 @@ class PartitionEntry(models.Model):
 
 	layout = models.ForeignKey(PartitionLayout, on_delete=models.CASCADE, related_name="entries")
 	order = models.PositiveIntegerField()
+	partition_number = models.PositiveIntegerField(blank=True)
 	name = models.CharField(max_length=120)
 	entry_role = models.CharField(max_length=16, choices=ROLE_CHOICES, default=ROLE_STANDARD)
 	mount_point = models.CharField(max_length=120, blank=True)
@@ -78,9 +79,11 @@ class PartitionEntry(models.Model):
 
 	class Meta:
 		ordering = ["order"]
-		unique_together = ("layout", "order")
+		unique_together = (("layout", "order"), ("layout", "partition_number"))
 
 	def clean(self) -> None:
+		if not self.partition_number:
+			self.partition_number = self.order
 		if self.size_mode == self.SIZE_FIXED and not self.size_mib:
 			raise ValidationError("size_mib is required for fixed-size partitions")
 		if self.size_mode == self.SIZE_REMAINDER and self.size_mib:
@@ -109,6 +112,11 @@ class PartitionEntry(models.Model):
 			raise ValidationError("filesystem must be 'none' for LVM physical volumes")
 
 	def __str__(self) -> str:
-		return f"{self.layout.name}:{self.order}:{self.mount_point or self.name}"
+		return f"{self.layout.name}:{self.order}:{self.partition_number}:{self.mount_point or self.name}"
+
+	def save(self, *args, **kwargs):
+		if not self.partition_number:
+			self.partition_number = self.order
+		super().save(*args, **kwargs)
 
 # Create your models here.

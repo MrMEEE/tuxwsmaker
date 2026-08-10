@@ -238,7 +238,7 @@ def inspect_repository(
     if branch not in branches:
         branch = branches[0]
 
-    workdir = _checkout_repository_url(repo_url, branch, ssh_key=ssh_key, api_key=api_key)
+    workdir = _checkout_repository_url(repo_url, branch, ssh_key=ssh_key, api_key=api_key, force_refresh=True)
     tree = _build_tree(workdir, Path("."), max_nodes=800, counter=[0])
     return {
         "branches": branches,

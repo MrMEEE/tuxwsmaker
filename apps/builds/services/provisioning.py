@@ -476,8 +476,17 @@ class AnsibleProvisioner:
 
         # Unknown/mixed structures get one fallback wrapper attempt for compatibility.
         if file_kind == "playbook":
+            stderr_text = (proc.stderr or "").strip()
+            stdout_text = (proc.stdout or "").strip()
+            combined_output = " | ".join(
+                part for part in [
+                    f"stderr: {stderr_text}" if stderr_text else "",
+                    f"stdout: {stdout_text}" if stdout_text else "",
+                ]
+                if part
+            )
             raise ProvisioningError(
-                f"ansible-playbook failed ({proc.returncode}): {proc.stderr.strip() or proc.stdout.strip()}"
+                f"ansible-playbook failed ({proc.returncode}): {combined_output or 'no output'}"
             )
 
         wrapped_proc = self._run_task_list_wrapper(
@@ -488,10 +497,16 @@ class AnsibleProvisioner:
             working_dir=cwd,
         )
         if wrapped_proc.returncode != 0:
+            direct_stderr = (proc.stderr or "").strip()
+            direct_stdout = (proc.stdout or "").strip()
+            wrapped_stderr = (wrapped_proc.stderr or "").strip()
+            wrapped_stdout = (wrapped_proc.stdout or "").strip()
             raise ProvisioningError(
                 "ansible-playbook failed as playbook and task-list wrapper. "
-                f"Direct error: {proc.stderr.strip() or proc.stdout.strip()} | "
-                f"Wrapper error: {wrapped_proc.stderr.strip() or wrapped_proc.stdout.strip()}"
+                f"Direct stderr: {direct_stderr or 'none'} | "
+                f"Direct stdout: {direct_stdout or 'none'} | "
+                f"Wrapper stderr: {wrapped_stderr or 'none'} | "
+                f"Wrapper stdout: {wrapped_stdout or 'none'}"
             )
 
     def _run_task_list_wrapper(
@@ -554,9 +569,7 @@ class AnsibleProvisioner:
     ) -> subprocess.CompletedProcess:
         inventory_text = (
             "[all]\n"
-            f"template_vm ansible_host={host}\n"
-            "[template_vm]\n"
-            "template_vm\n"
+            f"template_vm ansible_host={host} ansible_python_interpreter=auto_silent\n"
             "[target_vm]\n"
             "template_vm\n"
         )

@@ -31,6 +31,28 @@
       {% csrf_token %}
       <button class="btn btn-primary" type="submit">Run Full Build</button>
     </form>
+    <div class="btn-group">
+      <button class="btn btn-outline-primary dropdown-toggle" type="button" id="build-until-toggle" data-bs-toggle="dropdown" data-bs-auto-close="true" aria-expanded="false">
+        Build Until
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="build-until-toggle">
+        {% with selectable_count=0 %}
+        {% for step in manual_steps %}
+          {% if step.build_until_selectable %}
+            <li>
+              <form method="post" action="{% url 'builds:build-run-until' build.pk %}" data-confirm-message="Run build steps from the current point until {{ step.label }} is completed?" data-confirm-title="Build Until" data-confirm-accept="Run Until" data-confirm-class="btn-primary">
+                {% csrf_token %}
+                <input type="hidden" name="target_step" value="{{ step.slug }}">
+                <button type="submit" class="dropdown-item">{{ step.label }}</button>
+              </form>
+            </li>
+          {% endif %}
+        {% empty %}
+          <li><span class="dropdown-item-text text-muted">No manual steps available</span></li>
+        {% endfor %}
+        {% endwith %}
+      </ul>
+    </div>
     {% endif %}
     {% if show_rerun_playbooks %}
     <form method="post" action="{% url 'builds:build-rerun-playbooks' build.pk %}" data-confirm-message="Re-run assigned playbooks on the running build VM?" data-confirm-title="Re-run Playbooks" data-confirm-accept="Re-run" data-confirm-class="btn-primary">
@@ -61,7 +83,10 @@
           <dd class="col-sm-7">
             <ol class="mb-0 ps-3">
               {% for sel in build.ordered_playbook_selections %}
-                <li><span class="small">{{ sel.playbook.repository.name }} [{{ sel.playbook.branch }}] {{ sel.playbook.path }}</span></li>
+                <li>
+                  <span class="small">{{ sel.playbook.repository.name }} [{{ sel.playbook.branch }}] {{ sel.playbook.path }}</span>
+                  <span class="badge text-bg-light border">non-chroot</span>
+                </li>
               {% empty %}
                 <li class="text-muted">none</li>
               {% endfor %}

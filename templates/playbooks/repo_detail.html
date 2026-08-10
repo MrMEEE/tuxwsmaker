@@ -46,12 +46,7 @@
     <div class="card">
       <div class="card-header"><h6 class="mb-0">Repository Sync</h6></div>
       <div class="card-body">
-        <form method="post" action="{% url 'playbooks:repo-sync-branches' repo.pk %}" class="mb-3">
-          {% csrf_token %}
-          <button class="btn btn-sm btn-primary" type="submit">Check Branches</button>
-        </form>
-
-        <form method="post" action="{% url 'playbooks:repo-sync-playbooks' repo.pk %}">
+        <form method="post" action="{% url 'playbooks:repo-refresh' repo.pk %}">
           {% csrf_token %}
           <label class="form-label">Branch</label>
           <select name="branch" class="form-select form-select-sm mb-2">
@@ -61,7 +56,7 @@
               <option value="{{ repo.default_branch }}">{{ repo.default_branch }}</option>
             {% endfor %}
           </select>
-          <button class="btn btn-sm btn-outline-primary" type="submit">Scan Playbooks</button>
+          <button class="btn btn-sm btn-primary" type="submit">Update</button>
         </form>
 
         <hr>
@@ -95,7 +90,7 @@
                 <td>{% if item.is_active %}yes{% else %}no{% endif %}</td>
               </tr>
             {% empty %}
-              <tr><td colspan="3">No playbooks discovered yet. Save/update repo or run "Scan Playbooks" for the selected branch.</td></tr>
+              <tr><td colspan="3">No playbooks discovered yet. Save/update repo or run "Update" for the selected branch.</td></tr>
             {% endfor %}
             </tbody>
           </table>

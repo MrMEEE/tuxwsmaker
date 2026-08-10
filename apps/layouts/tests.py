@@ -30,6 +30,7 @@ class PartitionEntrySchemaTests(TestCase):
 		form = PartitionEntryForm(
 			data={
 				"order": 1,
+				"partition_number": 7,
 				"name": "crypt container",
 				"entry_role": PartitionEntry.ROLE_PV,
 				"mount_point": "",
@@ -44,3 +45,11 @@ class PartitionEntrySchemaTests(TestCase):
 		)
 
 		self.assertTrue(form.is_valid(), form.errors.as_text())
+		entry = form.save(commit=False)
+		self.assertEqual(entry.partition_number, 7)
+
+	def test_partition_number_defaults_to_order(self):
+		entry = PartitionEntry(layout=self.layout, order=2, name="root")
+		entry.save()
+
+		self.assertEqual(entry.partition_number, 2)

@@ -16,6 +16,7 @@ class PartitionEntryForm(forms.ModelForm):
         model = PartitionEntry
         fields = [
             "order",
+            "partition_number",
             "name",
             "entry_role",
             "mount_point",

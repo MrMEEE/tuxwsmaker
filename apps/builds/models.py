@@ -212,7 +212,7 @@ class BuildDefinition(models.Model):
 			return self.STEP_VM_SHELL
 		index = self.STEP_SEQUENCE.index(last_completed) + 1
 		if index >= len(self.STEP_SEQUENCE):
-			return self.STEP_SAVE_RELEASE
+			return self.STEP_CLEANUP
 		return self.STEP_SEQUENCE[index]
 
 	def has_completed_step(self, step: str) -> bool:
@@ -271,6 +271,13 @@ class BuildLogEntry(models.Model):
 
 
 class BuildPlaybookSelection(models.Model):
+	RUN_MODE_NON_CHROOT = "non_chroot"
+	RUN_MODE_CHROOT = "chroot"
+	RUN_MODE_CHOICES = [
+		(RUN_MODE_NON_CHROOT, "Non-chroot"),
+		(RUN_MODE_CHROOT, "Chroot"),
+	]
+
 	build = models.ForeignKey(
 		BuildDefinition,
 		on_delete=models.CASCADE,
@@ -282,6 +289,7 @@ class BuildPlaybookSelection(models.Model):
 		related_name="build_selections",
 	)
 	order = models.PositiveIntegerField(default=1)
+	run_mode = models.CharField(max_length=16, choices=RUN_MODE_CHOICES, default=RUN_MODE_NON_CHROOT)
 
 	class Meta:
 		ordering = ["order", "id"]

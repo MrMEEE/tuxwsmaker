@@ -17,6 +17,7 @@ from apps.workers.tasks import run_build_definition
 from apps.workers.tasks import build_task_cache_key
 from apps.workers.tasks import rerun_build_playbooks
 from apps.workers.tasks import run_build_step
+from apps.workers.tasks import run_build_until_step
 from apps.serverconfig.models import ServerConfiguration
 from apps.realtime.events import publish_event
 from config.celery import app as celery_app
@@ -42,14 +43,19 @@ def _is_modal_request(request) -> bool:
 	return request.GET.get("modal") == "1" or request.POST.get("modal") == "1" or request.headers.get("X-Modal-Request") == "1"
 
 
-def _persist_build_playbook_order(build: BuildDefinition, ordered_ids: list[int]) -> None:
+def _persist_build_playbook_order(build: BuildDefinition, ordered_rows: list[dict[str, object]]) -> None:
 	BuildPlaybookSelection.objects.filter(build=build).delete()
-	if not ordered_ids:
+	if not ordered_rows:
 		return
 	BuildPlaybookSelection.objects.bulk_create(
 		[
-			BuildPlaybookSelection(build=build, playbook_id=playbook_id, order=index + 1)
-			for index, playbook_id in enumerate(ordered_ids)
+			BuildPlaybookSelection(
+				build=build,
+				playbook_id=int(row["id"]),
+				order=index + 1,
+				run_mode=BuildPlaybookSelection.RUN_MODE_NON_CHROOT,
+			)
+			for index, row in enumerate(ordered_rows)
 		]
 	)
 
@@ -209,11 +215,14 @@ def _probe_vm_ssh_ready(build: BuildDefinition) -> tuple[bool, bool, str]:
 def _manual_step_items(build: BuildDefinition) -> list[dict[str, object]]:
 	items: list[dict[str, object]] = []
 	next_step = build.next_manual_step()
+	next_index = BuildDefinition.STEP_SEQUENCE.index(next_step) if next_step in BuildDefinition.STEP_SEQUENCE else None
 	for step, label in BuildDefinition.STEP_CHOICES:
 		if step == BuildDefinition.STEP_PENDING:
 			continue
 		completed = build.has_completed_step(step)
 		enabled = build.can_run_manual_step(step)
+		step_index = BuildDefinition.STEP_SEQUENCE.index(step)
+		build_until_selectable = next_index is not None and step_index >= next_index
 		items.append(
 			{
 				"slug": step,
@@ -221,6 +230,7 @@ def _manual_step_items(build: BuildDefinition) -> list[dict[str, object]]:
 				"completed": completed,
 				"enabled": enabled,
 				"is_next": step == next_step and not completed,
+				"build_until_selectable": build_until_selectable,
 			}
 		)
 	return items
@@ -379,7 +389,7 @@ class BuildCreateView(LoginRequiredMixin, CreateView):
 
 	def form_valid(self, form):
 		response = super().form_valid(form)
-		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_ids", []))
+		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_payload", []))
 		_persist_build_afterburner_order(self.object, form.cleaned_data.get("ordered_afterburner_ids", []))
 		_persist_build_repository_order(self.object, form.cleaned_data.get("ordered_repository_payload", []))
 		_persist_build_rhsm_repository_order(self.object, form.cleaned_data.get("ordered_rhsm_repository_payload", []))
@@ -412,7 +422,7 @@ class BuildUpdateView(LoginRequiredMixin, UpdateView):
 
 	def form_valid(self, form):
 		response = super().form_valid(form)
-		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_ids", []))
+		_persist_build_playbook_order(self.object, form.cleaned_data.get("ordered_playbook_payload", []))
 		_persist_build_afterburner_order(self.object, form.cleaned_data.get("ordered_afterburner_ids", []))
 		_persist_build_repository_order(self.object, form.cleaned_data.get("ordered_repository_payload", []))
 		_persist_build_rhsm_repository_order(self.object, form.cleaned_data.get("ordered_rhsm_repository_payload", []))
@@ -465,6 +475,8 @@ class BuildCancelView(LoginRequiredMixin, View):
 	def post(self, request, pk):
 		build = get_object_or_404(BuildDefinition.objects.select_related("machine_config"), pk=pk)
 		vm_name = f"build-{build.id}"
+		state = dict(build.runtime_state or {})
+		disk_path = str(state.get("disk_path") or (Path(settings.ARTIFACT_ROOT) / "disks" / (vm_name + ".qcow2")))
 
 		task_id = cache.get(build_task_cache_key(build.id))
 		if task_id:
@@ -473,7 +485,7 @@ class BuildCancelView(LoginRequiredMixin, View):
 
 		try:
 			vm_manager = LibvirtVMManager(uri=build.machine_config.hypervisor_uri)
-			vm_manager.remove_domain(name=vm_name, disk_path=f"{Path(settings.ARTIFACT_ROOT) / 'disks' / (vm_name + '.qcow2')}")
+			vm_manager.remove_domain(name=vm_name, disk_path=disk_path)
 		except Exception:
 			pass
 
@@ -505,10 +517,68 @@ class BuildRunStepView(LoginRequiredMixin, View):
 			messages.error(request, "That step is not available yet. Run the previous step first.")
 			return redirect("builds:build-detail", pk=build.pk)
 
+		build.status = BuildDefinition.STATUS_QUEUED
+		build.started_by = request.user
+		build.save(update_fields=["status", "started_by", "updated_at"])
+		publish_event("builds", "queued", {"build_id": build.id, "status": build.status})
+		BuildLogEntry.objects.create(
+			build=build,
+			stage="queued",
+			message=f"Manual step queued: {dict(BuildDefinition.STEP_CHOICES).get(step, step)}",
+		)
+
 		task = run_build_step.delay(build.id, step)
 		_set_build_active_task(build, task.id)
 		cache.set(build_task_cache_key(build.id), task.id, timeout=6 * 60 * 60)
 		messages.success(request, f"Queued manual step: {dict(BuildDefinition.STEP_CHOICES).get(step, step)}")
+		return redirect("builds:build-detail", pk=build.pk)
+
+
+class BuildRunUntilView(LoginRequiredMixin, View):
+	def post(self, request, pk):
+		build = get_object_or_404(BuildDefinition.objects.select_related("machine_config"), pk=pk)
+		if _recover_stale_build_state(build):
+			build.refresh_from_db()
+
+		target_step = str(request.POST.get("target_step") or "").strip()
+		if target_step not in BuildDefinition.STEP_SEQUENCE:
+			messages.error(request, "Select a valid manual step for Build Until")
+			return redirect("builds:build-detail", pk=build.pk)
+		if build.status in {BuildDefinition.STATUS_RUNNING, BuildDefinition.STATUS_QUEUED}:
+			messages.error(request, "Cannot run Build Until while the build is queued or running")
+			return redirect("builds:build-detail", pk=build.pk)
+
+		next_step = build.next_manual_step()
+		if next_step not in BuildDefinition.STEP_SEQUENCE:
+			messages.error(request, "No runnable manual steps are available")
+			return redirect("builds:build-detail", pk=build.pk)
+
+		next_index = BuildDefinition.STEP_SEQUENCE.index(next_step)
+		target_index = BuildDefinition.STEP_SEQUENCE.index(target_step)
+		if target_index < next_index:
+			messages.error(request, "Selected step is already completed. Choose a later step.")
+			return redirect("builds:build-detail", pk=build.pk)
+
+		build.status = BuildDefinition.STATUS_QUEUED
+		build.started_by = request.user
+		build.save(update_fields=["status", "started_by", "updated_at"])
+		publish_event("builds", "queued", {"build_id": build.id, "status": build.status})
+		BuildLogEntry.objects.create(
+			build=build,
+			stage="queued",
+			message=(
+				"Build-until queued: "
+				f"{dict(BuildDefinition.STEP_CHOICES).get(target_step, target_step)}"
+			),
+		)
+
+		task = run_build_until_step.delay(build.id, target_step)
+		_set_build_active_task(build, task.id)
+		cache.set(build_task_cache_key(build.id), task.id, timeout=6 * 60 * 60)
+		messages.success(
+			request,
+			f"Queued Build Until: {dict(BuildDefinition.STEP_CHOICES).get(target_step, target_step)}",
+		)
 		return redirect("builds:build-detail", pk=build.pk)
 
 
@@ -529,6 +599,12 @@ class BuildRerunPlaybooksView(LoginRequiredMixin, View):
 		if not vm_ssh_ready:
 			messages.error(request, "Build VM SSH login is not ready")
 			return redirect("builds:build-detail", pk=build.pk)
+
+		build.status = BuildDefinition.STATUS_QUEUED
+		build.started_by = request.user
+		build.save(update_fields=["status", "started_by", "updated_at"])
+		publish_event("builds", "queued", {"build_id": build.id, "status": build.status})
+		BuildLogEntry.objects.create(build=build, stage="queued", message="Playbook re-run queued")
 
 		task = rerun_build_playbooks.delay(build.id, vm_ip)
 		_set_build_active_task(build, task.id)

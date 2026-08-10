@@ -180,6 +180,7 @@
             <thead>
               <tr>
                 <th>Order</th>
+                <th>Part #</th>
                 <th>Name</th>
                 <th>Role</th>
                 <th>Mount</th>
@@ -196,6 +197,7 @@
               <tr
                 data-entry-id="{{ entry.pk }}"
                 data-order="{{ entry.order }}"
+                data-partition-number="{{ entry.partition_number }}"
                 data-name="{{ entry.name }}"
                 data-role="{{ entry.entry_role }}"
                 data-mount="{{ entry.mount_point }}"
@@ -210,6 +212,7 @@
                 data-boot="{% if entry.is_boot %}1{% else %}0{% endif %}"
               >
                   <td class="mono">{{ entry.order }}</td>
+                  <td class="mono">{% if entry.entry_role == 'lv' %}-{% else %}{{ entry.partition_number }}{% endif %}</td>
                   <td>{{ entry.name }}</td>
                   <td>{{ entry.get_entry_role_display }}</td>
                   <td>{{ entry.mount_point|default:'-' }}</td>
@@ -233,7 +236,7 @@
                   </td>
               </tr>
               {% empty %}
-              <tr><td colspan="10">No entries yet.</td></tr>
+              <tr><td colspan="11">No entries yet.</td></tr>
               {% endfor %}
             </tbody>
           </table>
@@ -289,6 +292,11 @@
             <div class="col-md-3">
               <label class="form-label">Order</label>
               <select class="form-select" name="order" id="f-order" required></select>
+            </div>
+            <div class="col-md-3">
+              <label class="form-label">Partition Number / Restore ID</label>
+              <input class="form-control mono" type="number" min="1" name="partition_number" id="f-partition-number" required>
+              <div class="form-text">Used as the physical partition number for disk partitions and as the restore identifier for LVs.</div>
             </div>
             <div class="col-md-5">
               <label class="form-label">Name</label>
@@ -424,6 +432,7 @@
     const yamlPreviewUrl = "{% url 'layouts:layout-yaml-preview' layout.pk %}";
 
     const fOrder = document.getElementById("f-order");
+    const fPartitionNumber = document.getElementById("f-partition-number");
     const fName = document.getElementById("f-name");
     const fEntryRole = document.getElementById("f-entry-role");
     const fMount = document.getElementById("f-mount");
@@ -449,6 +458,7 @@
     let nextTempId = 1;
     let yamlIsValid = true;
     let isDirty = false;
+    let currentEditingEntryId = null;
 
     function setSaveState(dirty, statusText) {
       isDirty = !!dirty;
@@ -525,6 +535,22 @@
       }
     }
 
+    function populatePartitionNumberChoices(selectedNumber) {
+      const numbers = entriesState
+        .map((entry) => Number(entry.partition_number || 0))
+        .filter((value) => value > 0);
+      const maxNumber = Math.max(numbers.length ? Math.max(...numbers) : 0, entriesState.length + 1);
+      const selected = Math.max(1, Number(selectedNumber || 1));
+      const options = [];
+      for (let number = 1; number <= maxNumber; number += 1) {
+        options.push(optionHtml(String(number), String(number), number === selected));
+      }
+      fPartitionNumber.innerHTML = options.join("");
+      if (selected > maxNumber) {
+        fPartitionNumber.insertAdjacentHTML("beforeend", optionHtml(String(selected), String(selected), true));
+      }
+    }
+
     function readEntriesFromDom() {
       if (!tableBody) {
         return [];
@@ -536,6 +562,7 @@
         return {
           id: Number(row.getAttribute("data-entry-id")),
           order: Number(row.getAttribute("data-order") || 0),
+          partition_number: Number(row.getAttribute("data-partition-number") || row.getAttribute("data-order") || 0),
           name: row.getAttribute("data-name") || "partition",
           entry_role: row.getAttribute("data-role") || "standard",
           mount_point: row.getAttribute("data-mount") || "",
@@ -554,6 +581,10 @@
 
     function normalizeOrders() {
       entriesState = entriesState.map((entry, index) => ({ ...entry, order: index + 1 }));
+    }
+
+    function partitionNumberInUse(partitionNumber, entryId) {
+      return entriesState.some((entry) => entry.id !== entryId && Number(entry.partition_number || 0) === Number(partitionNumber || 0));
     }
 
     function renderTable() {
@@ -583,6 +614,7 @@
         return ""
           + "<tr data-entry-id=\"" + entry.id + "\">"
           + "<td class=\"mono\">" + entry.order + "</td>"
+          + "<td class=\"mono\">" + (entry.entry_role === "lv" ? "-" : (entry.partition_number || entry.order)) + "</td>"
           + "<td>" + entry.name + "</td>"
           + "<td>" + (roleLabel ? roleLabel.label : entry.entry_role) + "</td>"
           + "<td>" + (entry.mount_point || "-") + "</td>"
@@ -627,6 +659,7 @@
       entriesState = selectedTemplate.entries.map((entry, index) => ({
         id: nextTempId + index,
         order: index + 1,
+        partition_number: Number(entry.partition_number || index + 1),
         name: entry.name,
         entry_role: entry.entry_role || "standard",
         mount_point: entry.mount_point,
@@ -687,6 +720,7 @@
         table_type: currentTableType(),
         entries: entriesState.map((entry) => ({
           order: entry.order,
+          partition_number: entry.partition_number,
           name: entry.name,
           role: entry.entry_role || "standard",
           mount_point: entry.mount_point,
@@ -705,6 +739,7 @@
       const lines = ["table_type: " + yamlScalar(payload.table_type), "entries:"];
       payload.entries.forEach((entry) => {
         lines.push("  - order: " + yamlScalar(entry.order));
+        lines.push("    partition_number: " + yamlScalar(entry.partition_number));
         lines.push("    name: " + yamlScalar(entry.name));
         lines.push("    mount_point: " + yamlScalar(entry.mount_point));
         lines.push("    filesystem: " + yamlScalar(entry.filesystem));
@@ -755,6 +790,7 @@
           entriesState = result.data.entries.map((entry) => ({
             id: nextTempId++,
             order: Number(entry.order || 0),
+            partition_number: Number(entry.partition_number || entry.order || 0),
             name: entry.name || "",
             entry_role: entry.entry_role || "standard",
             mount_point: entry.mount_point || "",
@@ -785,6 +821,7 @@
       titleEl.textContent = "New Partition";
       form.action = "{% url 'layouts:entry-create' layout.pk %}";
       populateOrderChoices(entriesState.length + 1);
+      populatePartitionNumberChoices(entriesState.length + 1);
       fName.value = "";
       populateRoleChoices("standard");
       fMount.value = "";
@@ -798,6 +835,7 @@
       fLuksEnabled.checked = false;
       fLuksName.value = "";
       fIsBoot.checked = false;
+      currentEditingEntryId = null;
       updateTableTypeUi();
       updateRoleUi();
       updateSizeModeUi();
@@ -809,6 +847,7 @@
       titleEl.textContent = "Edit Partition";
       form.action = "/partitions/{{ layout.pk }}/entries/" + entry.id + "/edit/";
       populateOrderChoices(entry.order);
+      populatePartitionNumberChoices(entry.partition_number || entry.order);
       fName.value = entry.name;
       populateRoleChoices(entry.entry_role || "standard");
       fMount.value = entry.mount_point;
@@ -822,6 +861,7 @@
       fLuksEnabled.checked = entry.luks_enabled;
       fLuksName.value = entry.luks_name;
       fIsBoot.checked = entry.is_boot;
+      currentEditingEntryId = entry.id;
       updateTableTypeUi();
       updateRoleUi();
       updateSizeModeUi();
@@ -1083,6 +1123,13 @@
           warning = "Fixed size mode requires size_mib > 0.";
         }
       }
+      const partitionNumber = Number(fPartitionNumber.value || 0);
+      if (partitionNumber <= 0) {
+        warning = "Partition number must be greater than 0.";
+      }
+      if (!warning && partitionNumberInUse(partitionNumber, currentEditingEntryId)) {
+        warning = "Partition number must be unique within the layout.";
+      }
       if (fLuksEnabled.checked && !fLuksName.value.trim()) {
         warning = "LUKS name is required when encryption is enabled.";
       }
@@ -1158,6 +1205,7 @@
     [fName, fSizeMib, fLuksName, fOrder].forEach((node) => {
       node.addEventListener("input", validateEditorForm);
     });
+    fPartitionNumber.addEventListener("input", validateEditorForm);
     fLuksEnabled.addEventListener("change", validateEditorForm);
     diskSizeInput.addEventListener("input", renderDiskMap);
 
@@ -1170,6 +1218,7 @@
       event.preventDefault();
       const payload = {
         order: Number(fOrder.value || 0),
+        partition_number: Number(fPartitionNumber.value || 0),
         name: fName.value.trim(),
         entry_role: fEntryRole.value,
         mount_point: fMount.value.trim(),
@@ -1232,6 +1281,7 @@
 
       entriesJson.value = JSON.stringify(entriesState.map((entry) => ({
         order: entry.order,
+        partition_number: entry.partition_number,
         name: entry.name,
         entry_role: entry.entry_role,
         mount_point: entry.mount_point,

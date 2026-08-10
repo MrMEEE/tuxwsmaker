@@ -63,9 +63,11 @@ def _normalize_yaml_entries(parsed_layout):
 		else:
 			size_mib = None
 
+		partition_number = int(item.get("partition_number", item.get("number", idx)) or idx)
 		normalized.append(
 			{
 				"order": idx,
+				"partition_number": partition_number,
 				"name": str(item.get("name", "")).strip(),
 				"entry_role": str(item.get("role", item.get("entry_role", PartitionEntry.ROLE_STANDARD))).strip().lower(),
 				"mount_point": str(item.get("mount_point", "")).strip(),
@@ -93,6 +95,7 @@ def _render_layout_yaml(layout, entries):
 		payload["entries"].append(
 			{
 				"order": entry.order,
+				"partition_number": entry.partition_number,
 				"name": entry.name,
 				"role": entry.entry_role,
 				"mount_point": entry.mount_point,
@@ -368,6 +371,7 @@ class PartitionEntriesBulkUpdateView(LoginRequiredMixin, View):
 			entry = PartitionEntry(
 				layout=layout,
 				order=idx,
+				partition_number=int(item.get("partition_number", item.get("number", idx)) or idx),
 				name=str(item.get("name", "")).strip(),
 				entry_role=str(item.get("entry_role", PartitionEntry.ROLE_STANDARD)).strip().lower(),
 				mount_point=str(item.get("mount_point", "")).strip(),
@@ -377,7 +381,6 @@ class PartitionEntriesBulkUpdateView(LoginRequiredMixin, View):
 				gpt_type=str(item.get("gpt_type", "")).strip(),
 				volume_group=str(item.get("volume_group", "")).strip(),
 				logical_volume=str(item.get("logical_volume", "")).strip(),
-				is_boot=bool(item.get("is_boot", False)),
 				luks_enabled=bool(item.get("luks_enabled", False)),
 				luks_name=str(item.get("luks_name", "")).strip(),
 			)

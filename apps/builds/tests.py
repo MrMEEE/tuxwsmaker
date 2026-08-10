@@ -9,14 +9,17 @@ import subprocess
 import shutil
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import Mock
 
-from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig, SSHKey
+from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig, BuildPlaybookSelection, SSHKey
 from apps.builds.services.artifacts import generate_artifacts
 from apps.builds.services.kickstart import render_kickstart_file
 from apps.builds.views import _probe_vm_ssh_ready, _recover_stale_build_state
-from apps.workers.tasks import _execute_step, build_task_cache_key, reconcile_stale_build_states_on_startup
+from apps.workers.tasks import _execute_step, _run_selected_playbooks, build_task_cache_key, reconcile_stale_build_states_on_startup
+from apps.workers.tasks import run_build_step
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
+from apps.playbooks.models import Playbook, PlaybookRepository
 from apps.serverconfig.models import ServerConfiguration
 
 
@@ -166,6 +169,10 @@ class BuildManualStepTests(TestCase):
 		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_CLEANUP)
 		self.assertTrue(self.build.can_run_manual_step(BuildDefinition.STEP_CLEANUP))
 
+	def test_next_manual_step_stays_cleanup_after_cleanup_completed(self):
+		self.build.runtime_state = {"last_completed_step": BuildDefinition.STEP_CLEANUP}
+		self.assertEqual(self.build.next_manual_step(), BuildDefinition.STEP_CLEANUP)
+
 	@patch("apps.workers.tasks.LibvirtVMManager.remove_domain")
 	def test_cleanup_step_resets_manual_build_to_start(self, mock_remove_domain):
 		self.build.status = BuildDefinition.STATUS_DRAFT
@@ -231,6 +238,63 @@ class BuildManualStepTests(TestCase):
 		)
 		self.assertEqual(response.status_code, 302)
 		mock_delay.assert_called_once_with(self.build.id, BuildDefinition.STEP_VM_SHELL)
+		self.build.refresh_from_db()
+		self.assertEqual(self.build.status, BuildDefinition.STATUS_QUEUED)
+
+	@patch("apps.workers.tasks._execute_step")
+	def test_queued_save_release_task_can_start_when_it_owns_the_queue(self, mock_execute_step):
+		mock_execute_step.return_value = {"status": BuildDefinition.STATUS_SUCCEEDED}
+		self.build.status = BuildDefinition.STATUS_QUEUED
+		self.build.current_step = BuildDefinition.STEP_DUMP_PARTITIONS
+		self.build.runtime_state = {
+			"active_task_id": "task-save-release",
+			"last_completed_step": BuildDefinition.STEP_DUMP_PARTITIONS,
+		}
+		self.build.save(update_fields=["status", "current_step", "runtime_state", "updated_at"])
+
+		run_build_step.push_request(id="task-save-release")
+		try:
+			result = run_build_step.run(self.build.id, BuildDefinition.STEP_SAVE_RELEASE)
+		finally:
+			run_build_step.pop_request()
+
+		self.build.refresh_from_db()
+		self.assertEqual(result["step"], BuildDefinition.STEP_SAVE_RELEASE)
+		self.assertEqual(self.build.status, BuildDefinition.STATUS_SUCCEEDED)
+
+	@patch("apps.builds.views.run_build_until_step.delay")
+	def test_build_until_route_queues_selected_target(self, mock_delay):
+		mock_delay.return_value.id = "task-until-1"
+		response = self.client.post(
+			reverse("builds:build-run-until", args=[self.build.pk]),
+			{"target_step": BuildDefinition.STEP_RUN_PLAYBOOKS},
+		)
+		self.assertEqual(response.status_code, 302)
+		mock_delay.assert_called_once_with(self.build.id, BuildDefinition.STEP_RUN_PLAYBOOKS)
+		self.build.refresh_from_db()
+		self.assertEqual(self.build.status, BuildDefinition.STATUS_QUEUED)
+
+	@patch("apps.builds.views.run_build_until_step.delay")
+	def test_build_until_route_rejects_missing_target(self, mock_delay):
+		response = self.client.post(
+			reverse("builds:build-run-until", args=[self.build.pk]),
+			{"target_step": ""},
+		)
+		self.assertEqual(response.status_code, 302)
+		mock_delay.assert_not_called()
+
+	@patch("apps.builds.views.run_build_until_step.delay")
+	def test_build_until_route_rejects_completed_target(self, mock_delay):
+		self.build.current_step = BuildDefinition.STEP_INSTALL_OS
+		self.build.runtime_state = {"last_completed_step": BuildDefinition.STEP_INSTALL_OS}
+		self.build.save(update_fields=["current_step", "runtime_state", "updated_at"])
+
+		response = self.client.post(
+			reverse("builds:build-run-until", args=[self.build.pk]),
+			{"target_step": BuildDefinition.STEP_VM_SHELL},
+		)
+		self.assertEqual(response.status_code, 302)
+		mock_delay.assert_not_called()
 
 	def test_recover_stale_running_state_marks_build_failed(self):
 		self.build.status = BuildDefinition.STATUS_RUNNING
@@ -258,6 +322,40 @@ class BuildManualStepTests(TestCase):
 		self.assertEqual(recovered_count, 1)
 		self.assertEqual(self.build.status, BuildDefinition.STATUS_FAILED)
 		self.assertEqual(self.build.runtime_state.get("active_task_id"), None)
+
+
+class BuildCancelTests(TestCase):
+	def setUp(self):
+		user_model = get_user_model()
+		self.user = user_model.objects.create_user(username="cancel", password="secret", is_local=True)
+		self.client.login(username="cancel", password="secret")
+
+		os_obj = OperatingSystem.objects.create(name="RHEL-CANCEL", family=OperatingSystem.FAMILY_RHEL)
+		layout = PartitionLayout.objects.create(name="layout-cancel")
+		cfg = BuildMachineConfig.objects.create(name="cfg-cancel")
+		iso = ISOImage.objects.create(operating_system=os_obj, version="10.8", iso_file="isos/cancel.iso")
+
+		self.build = BuildDefinition.objects.create(
+			name="build-cancel",
+			operating_system=os_obj,
+			iso_image=iso,
+			partition_layout=layout,
+			machine_config=cfg,
+			status=BuildDefinition.STATUS_RUNNING,
+			runtime_state={
+				"vm_name": "build-cancel",
+				"disk_path": str(Path(settings.ARTIFACT_ROOT) / "disks" / "build-cancel-unique.qcow2"),
+			},
+		)
+
+	@patch("apps.builds.views.LibvirtVMManager.remove_domain")
+	def test_cancel_uses_runtime_disk_path(self, mock_remove_domain):
+		response = self.client.post(reverse("builds:build-cancel", args=[self.build.pk]))
+		self.assertEqual(response.status_code, 302)
+		mock_remove_domain.assert_called_once_with(
+			name=f"build-{self.build.id}",
+			disk_path=str(Path(settings.ARTIFACT_ROOT) / "disks" / "build-cancel-unique.qcow2"),
+		)
 
 
 class BuildVmSshProbeTests(TestCase):
@@ -333,6 +431,96 @@ class BuildVmSshProbeTests(TestCase):
 		self.assertTrue(vm_ssh_ready)
 		self.assertEqual(vm_ip, "192.168.200.10")
 		vm_manager.current_ipv4.assert_not_called()
+
+
+class BuildPlaybookRunModePersistenceTests(TestCase):
+	def setUp(self):
+		user_model = get_user_model()
+		self.user = user_model.objects.create_user(username="playbook-mode", password="secret", is_local=True)
+		self.client.login(username="playbook-mode", password="secret")
+
+		self.os_obj = OperatingSystem.objects.create(name="RHEL-PB-MODE", family=OperatingSystem.FAMILY_RHEL)
+		self.layout = PartitionLayout.objects.create(name="layout-pb-mode", table_type=PartitionLayout.TABLE_MBR)
+		self.cfg = BuildMachineConfig.objects.create(name="cfg-pb-mode", boot_mode=BuildMachineConfig.BOOT_BIOS)
+		self.iso = ISOImage.objects.create(operating_system=self.os_obj, version="10.1", iso_file="isos/pb-mode.iso")
+		repo = PlaybookRepository.objects.create(
+			name="repo-playbook-mode",
+			repo_url="https://example.invalid/repo-playbook-mode.git",
+		)
+		self.playbook = Playbook.objects.create(
+			repository=repo,
+			branch="main",
+			path="site.yml",
+			is_active=True,
+		)
+
+	def test_build_create_persists_playbook_run_mode(self):
+		response = self.client.post(
+			reverse("builds:build-create"),
+			{
+				"name": "build-playbook-mode",
+				"operating_system": str(self.os_obj.id),
+				"iso_image": str(self.iso.id),
+				"partition_layout": str(self.layout.id),
+				"machine_config": str(self.cfg.id),
+				"output_pxe": "on",
+				"output_usb_img": "on",
+				"playbook_order_json": '[{"id": %d, "run_mode": "chroot"}]' % self.playbook.id,
+			},
+		)
+
+		self.assertEqual(response.status_code, 302)
+		build = BuildDefinition.objects.get(name="build-playbook-mode")
+		selection = BuildPlaybookSelection.objects.get(build=build, playbook=self.playbook)
+		self.assertEqual(selection.run_mode, BuildPlaybookSelection.RUN_MODE_NON_CHROOT)
+
+
+class BuildPlaybookRunModeExecutionTests(TestCase):
+	def setUp(self):
+		self.os_obj = OperatingSystem.objects.create(name="RHEL-PB-RUN", family=OperatingSystem.FAMILY_RHEL)
+		self.layout = PartitionLayout.objects.create(name="layout-pb-run", table_type=PartitionLayout.TABLE_MBR)
+		self.cfg = BuildMachineConfig.objects.create(name="cfg-pb-run", boot_mode=BuildMachineConfig.BOOT_BIOS)
+		self.iso = ISOImage.objects.create(operating_system=self.os_obj, version="10.2", iso_file="isos/pb-run.iso")
+		self.build = BuildDefinition.objects.create(
+			name="build-pb-run",
+			operating_system=self.os_obj,
+			iso_image=self.iso,
+			partition_layout=self.layout,
+			machine_config=self.cfg,
+		)
+		repo = PlaybookRepository.objects.create(
+			name="repo-playbook-run",
+			repo_url="https://example.invalid/repo-playbook-run.git",
+		)
+		self.playbook = Playbook.objects.create(
+			repository=repo,
+			branch="main",
+			path="site.yml",
+			is_active=True,
+		)
+		BuildPlaybookSelection.objects.create(
+			build=self.build,
+			playbook=self.playbook,
+			order=1,
+			run_mode=BuildPlaybookSelection.RUN_MODE_CHROOT,
+		)
+
+	@patch("apps.workers.tasks.checkout_repository")
+	def test_selected_playbook_passes_run_mode_to_provisioner(self, mock_checkout):
+		mock_checkout.return_value = Path("/tmp/mock-checkout")
+		provisioner = Mock()
+		_run_selected_playbooks(
+			build=self.build,
+			provisioner=provisioner,
+			ip_address="192.168.122.10",
+			ssh_user="root",
+			private_key_path="/tmp/key",
+		)
+
+		self.assertTrue(provisioner.configure_guest.called)
+		provisioner.run_remote_command.assert_not_called()
+		self.assertNotIn("run_mode", provisioner.configure_guest.call_args.kwargs)
+		self.assertNotIn("chroot_path", provisioner.configure_guest.call_args.kwargs)
 
 
 class KickstartRenderingTests(TestCase):

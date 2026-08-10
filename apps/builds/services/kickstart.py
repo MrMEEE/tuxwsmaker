@@ -5,7 +5,7 @@ from textwrap import dedent
 
 from apps.catalog.models import OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
-from apps.repositories.services import render_repository_activation_snippet, render_repository_cleanup_snippet
+from apps.repositories.services import render_repository_activation_snippet
 
 
 def calculate_layout_disk_size_gib(layout: PartitionLayout) -> int:
@@ -180,16 +180,9 @@ def render_deploy_restore_script(*, output_dir: Path, os_family: str, build=None
         finish_step = "status 'Debian-family finish adapter: restore path complete'"
 
     repo_setup = ""
-    repo_cleanup = ""
     if build is not None:
       selections = [sel for sel in build.ordered_repository_selections() if sel.enable_before_afterburner]
       repo_setup = render_repository_activation_snippet(
-        selections=selections,
-        os_family=os_family,
-        root_expression='"$MOUNT_ROOT"',
-        phase_label="deploy/afterburner",
-      )
-      repo_cleanup = render_repository_cleanup_snippet(
         selections=selections,
         os_family=os_family,
         root_expression='"$MOUNT_ROOT"',
@@ -258,15 +251,24 @@ prompt_read_line() {
     IFS= read -r -t "$timeout_seconds" line < "$INPUT_TTY" || true
     printf '\r\n' > "$INPUT_TTY" || true
   else
-    printf '%s' "$prompt_text"
+    printf '%s' "$prompt_text" >&2
     IFS= read -r -t "$timeout_seconds" line || true
-    printf '\r\n' || true
+    printf '\r\n' >&2 || true
   fi
 
   line="${line//$'\r'/}"
   line="${line#${line%%[![:space:]]*}}"
   line="${line%${line##*[![:space:]]}}"
   printf -v "$out_var" '%s' "$line"
+}
+
+prompt_write() {
+  local message="$1"
+  if [[ -n "$INPUT_TTY" ]]; then
+    printf '%s\n' "$message" > "$INPUT_TTY"
+  else
+    printf '%s\n' "$message" >&2
+  fi
 }
 
 on_error() {
@@ -453,10 +455,26 @@ raw_part() {
 resolve_lv_path() {
   local vg_name="$1"
   local lv_name="$2"
+  local mapper_vg mapper_lv mapper_path
+
+  if command -v dmsetup >/dev/null 2>&1; then
+    dmsetup mknodes >/dev/null 2>&1 || true
+  fi
+  udevadm settle >/dev/null 2>&1 || true
 
   if [[ -n "$vg_name" && -n "$lv_name" && -b "/dev/$vg_name/$lv_name" ]]; then
     printf '/dev/%s/%s' "$vg_name" "$lv_name"
     return 0
+  fi
+
+  if [[ -n "$vg_name" && -n "$lv_name" ]]; then
+    mapper_vg="${vg_name//-/--}"
+    mapper_lv="${lv_name//-/--}"
+    mapper_path="/dev/mapper/${mapper_vg}-${mapper_lv}"
+    if [[ -b "$mapper_path" ]]; then
+      printf '%s' "$mapper_path"
+      return 0
+    fi
   fi
 
   if ! command -v lvs >/dev/null 2>&1; then
@@ -475,6 +493,10 @@ resolve_lv_path() {
     }
   ')"
   if [[ -n "$exact_path" && -b "$exact_path" ]]; then
+    printf '%s' "$exact_path"
+    return 0
+  fi
+  if [[ -n "$exact_path" && -e "$exact_path" ]]; then
     printf '%s' "$exact_path"
     return 0
   fi
@@ -498,6 +520,20 @@ resolve_lv_path() {
   if [[ -n "$lv_only_path" && -b "$lv_only_path" ]]; then
     printf '%s' "$lv_only_path"
     return 0
+  fi
+  if [[ -n "$lv_only_path" && -e "$lv_only_path" ]]; then
+    printf '%s' "$lv_only_path"
+    return 0
+  fi
+
+  if [[ -n "$vg_name" && -n "$lv_name" ]]; then
+    mapper_vg="${vg_name//-/--}"
+    mapper_lv="${lv_name//-/--}"
+    mapper_path="/dev/mapper/${mapper_vg}-${mapper_lv}"
+    if lvs --noheadings "$vg_name/$lv_name" >/dev/null 2>&1; then
+      printf '%s' "$mapper_path"
+      return 0
+    fi
   fi
 
   return 1
@@ -525,29 +561,143 @@ PY
 )"
 status "Source image boot mode: ${SOURCE_BOOT_MODE:-unknown}"
 
-TARGET_DISK="${TARGET_DISK:-$(lsblk -b -dn -o NAME,TYPE,SIZE | awk '$2=="disk"{print $1" "$3}' | sort -k2 -nr | head -n1 | awk '{print $1}') }"
+REQUIRED_SECTORS="$(python3 - "$WORK_DIR/clone-manifest.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as f:
+    clone = json.load(f)
+
+sector = 512
+partitions = sorted(clone.get("partitions", []), key=lambda p: int(p.get("number") or 0))
+starts = [max(0, int(p.get("start_byte") or 0) // sector) for p in partitions]
+sizes = [max(1, int(p.get("size_bytes") or 0) // sector) for p in partitions]
+default_total = max((s + z) for s, z in zip(starts, sizes)) if partitions else 0
+required = max(default_total, int((clone.get("disk_size_bytes") or 0) // sector))
+print(required)
+PY
+)"
+prompt_for_install_disk() {
+  local override="${TARGET_DISK:-}"
+  if [[ -n "$override" ]]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+
+  local -a disk_rows=()
+  while IFS= read -r row; do
+    [[ -n "$row" ]] || continue
+    local dev type bytes sectors
+    dev="$(printf '%s\n' "$row" | awk '{print $1}')"
+    type="$(printf '%s\n' "$row" | awk '{print $2}')"
+
+    [[ "$dev" == /dev/* ]] || continue
+    [[ "$type" == "disk" ]] || continue
+
+    bytes="$(blockdev --getsize64 "$dev" 2>/dev/null || lsblk -b -dn -o SIZE "$dev" 2>/dev/null | awk '{print $1}')"
+    bytes="${bytes//[[:space:]]/}"
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]] || [[ "$bytes" -le 0 ]]; then
+      continue
+    fi
+    sectors="$((bytes / 512))"
+    disk_rows+=("${dev}|${bytes}|${sectors}")
+  done < <(lsblk -b -dn -o PATH,TYPE,SIZE 2>/dev/null)
+
+  if [[ ${#disk_rows[@]} -eq 0 ]]; then
+    echo "[deploy] Could not find target disk large enough for restore (required sectors: $REQUIRED_SECTORS)" >&2
+    return 1
+  fi
+
+  if [[ ${#disk_rows[@]} -eq 1 ]]; then
+    local only_disk only_sectors
+    only_disk="${disk_rows[0]%%|*}"
+    only_sectors="${disk_rows[0]##*|}"
+    if (( only_sectors < REQUIRED_SECTORS )); then
+      echo "[deploy] Could not find target disk large enough for restore (required sectors: $REQUIRED_SECTORS)" >&2
+      return 1
+    fi
+    printf '%s\n' "$only_disk"
+    return 0
+  fi
+
+  local choice=""
+  while true; do
+    prompt_write "[deploy] Multiple candidate disks detected for restore. Choose the target disk:"
+    local index=1
+    for entry in "${disk_rows[@]}"; do
+      local disk_name disk_bytes disk_sectors disk_note
+      disk_name="${entry%%|*}"
+      disk_bytes="${entry#*|}"
+      disk_bytes="${disk_bytes%%|*}"
+      disk_sectors="${entry##*|}"
+      disk_note=""
+      if (( disk_sectors < REQUIRED_SECTORS )); then
+        disk_note=" [too small]"
+      fi
+      prompt_write "[deploy]   ${index}) ${disk_name} (${disk_bytes} bytes, ${disk_sectors} sectors)${disk_note}"
+      index=$((index + 1))
+    done
+
+    prompt_read_line "[deploy] Select a disk number: " 300 choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#disk_rows[@]} )); then
+      local selected_disk selected_sectors
+      selected_disk="${disk_rows[choice - 1]%%|*}"
+      selected_sectors="${disk_rows[choice - 1]##*|}"
+      if (( selected_sectors < REQUIRED_SECTORS )); then
+        prompt_write "[deploy] Selected disk is too small for restore (required sectors: $REQUIRED_SECTORS). Choose another disk."
+        continue
+      fi
+      printf '%s\n' "$selected_disk"
+      return 0
+    fi
+    prompt_write "[deploy] Invalid choice. Please enter one of the numbered options."
+  done
+}
+
+TARGET_DISK="$(prompt_for_install_disk)"
 TARGET_DISK="${TARGET_DISK// /}"
+TARGET_DISK="${TARGET_DISK#/dev/}"
 if [[ -z "$TARGET_DISK" ]]; then
-  echo "[deploy] Could not find target disk" >&2
+  echo "[deploy] Could not find target disk large enough for restore (required sectors: $REQUIRED_SECTORS)" >&2
   exit 1
 fi
 TARGET_DEV="/dev/$TARGET_DISK"
 status "Target disk: $TARGET_DEV"
 
+TARGET_SECTORS="$(blockdev --getsz "$TARGET_DEV" 2>/dev/null || lsblk -b -dn -o SIZE "$TARGET_DEV" 2>/dev/null | awk '{print int($1 / 512)}')"
+TARGET_SECTORS="${TARGET_SECTORS//[[:space:]]/}"
+if ! [[ "${TARGET_SECTORS:-}" =~ ^[0-9]+$ ]] || [[ "$TARGET_SECTORS" -le 0 ]]; then
+  echo "[deploy] Could not determine target disk size in sectors for $TARGET_DEV" >&2
+  exit 1
+fi
+status "Target disk sectors: $TARGET_SECTORS"
+
 CURRENT_PHASE="partition-layout-generation"
-python3 - "$WORK_DIR/deploy.json" "$WORK_DIR/clone-manifest.json" "$WORK_DIR/sfdisk.layout" "$WORK_DIR/parts.map" <<'PY'
+python3 - "$WORK_DIR/deploy.json" "$WORK_DIR/clone-manifest.json" "$WORK_DIR/sfdisk.layout" "$WORK_DIR/parts.map" "$TARGET_SECTORS" <<'PY'
 import json
 import sys
 
-deploy_path, clone_path, sfdisk_path, map_path = sys.argv[1:5]
+deploy_path, clone_path, sfdisk_path, map_path, target_sectors_raw = sys.argv[1:6]
 with open(deploy_path, encoding="utf-8") as f:
     deploy = json.load(f)
 with open(clone_path, encoding="utf-8") as f:
     clone = json.load(f)
 
+try:
+  target_sectors = max(0, int(target_sectors_raw or 0))
+except ValueError as exc:
+  raise SystemExit(f"Invalid target sector count: {target_sectors_raw}") from exc
+
 table_type = str(clone.get("table_type") or deploy.get("boot", {}).get("table_type") or "gpt").lower()
-layout_entries = sorted(deploy.get("layout_entries", []), key=lambda e: int(e.get("order") or 0))
-layout_by_order = {int(e.get("order")): e for e in layout_entries if e.get("order") is not None}
+layout_entries = sorted(
+  deploy.get("layout_entries", []),
+  key=lambda e: int(e.get("partition_number") or e.get("order") or 0),
+)
+layout_by_number = {
+  int(e.get("partition_number") or e.get("order") or 0): e
+  for e in layout_entries
+  if e.get("partition_number") is not None or e.get("order") is not None
+}
 partitions = sorted(clone.get("partitions", []), key=lambda p: int(p.get("number") or 0))
 if not partitions:
     raise SystemExit("No partitions found in clone manifest")
@@ -558,20 +708,26 @@ map_lines = []
 starts = [max(0, int(p.get("start_byte") or 0) // sector) for p in partitions]
 sizes = [max(1, int(p.get("size_bytes") or 0) // sector) for p in partitions]
 default_total = max((s + z) for s, z in zip(starts, sizes))
-disk_total = max(default_total, int((clone.get("disk_size_bytes") or 0) // sector))
+disk_total = max(default_total, int((clone.get("disk_size_bytes") or 0) // sector), target_sectors)
+usable_sector_limit = disk_total
+if table_type == "gpt" and disk_total > 34:
+  # GPT reserves the final sectors for the backup header/table.
+  # For exclusive-end arithmetic we cap at (last_usable + 1) = total - 33.
+  usable_sector_limit = disk_total - 33
 for idx, part in enumerate(partitions):
     number = int(part["number"])
     start_sector = starts[idx]
     size_sector = sizes[idx]
-    entry = layout_by_order.get(number, {})
+    entry = layout_by_number.get(number, {})
     size_mode = str(entry.get("size_mode") or "fixed").strip().lower()
 
     if size_mode == "remainder":
-        next_start = starts[idx + 1] if idx + 1 < len(starts) else disk_total
-        available = max(1, next_start - start_sector)
-        if available < size_sector:
-            raise SystemExit(f"Target disk too small for remainder partition {number}")
-        size_sector = available
+      next_start = starts[idx + 1] if idx + 1 < len(starts) else usable_sector_limit
+      next_start = min(next_start, usable_sector_limit)
+      available = max(1, next_start - start_sector)
+      if available < size_sector:
+          raise SystemExit(f"Target disk too small for remainder partition {number}")
+      size_sector = available
 
     opts = [f"start={start_sector}", f"size={size_sector}"]
     gpt_type = str(entry.get("gpt_type") or "").strip()
@@ -645,43 +801,9 @@ fi
 : > "$WORK_DIR/part-dev.map"
 TOTAL_PARTS=$(grep -c '^[0-9]' "$WORK_DIR/parts.map" || true)
 PART_INDEX=0
-CURRENT_PHASE="partition-restore"
-while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
-  [[ -z "${number:-}" ]] && continue
-  PART_INDEX=$((PART_INDEX + 1))
-  if [[ -z "${file_name:-}" ]]; then
-    echo "[deploy] Missing file_name for partition $number in parts.map" >&2
-    exit 1
-  fi
 
-  part_dev=$(raw_part "$TARGET_DISK" "$number")
-  image_url="$CLONE_BASE/$file_name"
-  if [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]]; then
-    luks_enabled="False"
-    luks_name=""
-  fi
-  status "[$PART_INDEX/$TOTAL_PARTS] Partition metadata: mount=${mount_point:-none} fs=${fs_type:-none} role=${entry_role:-none} luks=${luks_enabled:-False} name=${luks_name:-none}"
-  echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name|$entry_role|$volume_group|$logical_volume|$size_mode" >> "$WORK_DIR/part-dev.map"
-
-  restore_target="$part_dev"
-  if [[ "$luks_enabled" == "True" ]]; then
-    map_name="${luks_name:-luks-${number}}"
-    if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
-      echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot bootstrap LUKS for $part_dev" >&2
-      exit 1
-    fi
-    if ! cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
-      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
-    fi
-    if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
-      if ! printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -; then
-        status "LUKS open failed for $part_dev with bootstrap passphrase; reinitializing container"
-        printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
-        printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
-      fi
-    fi
-    restore_target="/dev/mapper/$map_name"
-  fi
+restore_partition_payload_to() {
+  local restore_target="$1"
 
   status "[$PART_INDEX/$TOTAL_PARTS] Restoring partition $number ($file_name) to $restore_target"
   if [[ "$image_url" == file://* ]]; then
@@ -694,7 +816,7 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
     image_size=$(stat -c%s "$image_path" 2>/dev/null || echo 0)
     if [[ "$image_size" -eq 0 ]]; then
       status "[$PART_INDEX/$TOTAL_PARTS] Partition $number is empty; skipping write"
-      continue
+      return 0
     fi
     if [[ "${payload_format:-raw}" == "sparse-extents-v1" && -n "${extents_path:-}" ]]; then
       status "[$PART_INDEX/$TOTAL_PARTS] Applying sparse extents for partition $number"
@@ -725,11 +847,56 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
       curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$restore_target" 65536
     fi
   fi
+}
+
+CURRENT_PHASE="partition-restore"
+while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
+  [[ -z "${number:-}" ]] && continue
+  PART_INDEX=$((PART_INDEX + 1))
+  if [[ -z "${file_name:-}" ]]; then
+    echo "[deploy] Missing file_name for partition $number in parts.map" >&2
+    exit 1
+  fi
+
+  part_dev=$(raw_part "$TARGET_DISK" "$number")
+  image_url="$CLONE_BASE/$file_name"
+  if [[ "$mount_point" == "swap" || "$fs_type" == "swap" ]]; then
+    luks_enabled="False"
+    luks_name=""
+  fi
+  status "[$PART_INDEX/$TOTAL_PARTS] Partition metadata: mount=${mount_point:-none} fs=${fs_type:-none} role=${entry_role:-none} luks=${luks_enabled:-False} name=${luks_name:-none}"
+  echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name|$entry_role|$volume_group|$logical_volume|$size_mode" >> "$WORK_DIR/part-dev.map"
+
+  # Partition payloads are captured from raw block devices. Even for encrypted
+  # volumes, restore must write back to the raw partition device.
+  restore_target="$part_dev"
+
+  restore_partition_payload_to "$restore_target"
+
+  if [[ "$luks_enabled" == "True" ]]; then
+    map_name="${luks_name:-luks-${number}}"
+    if ! cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
+      status "[$PART_INDEX/$TOTAL_PARTS] No LUKS header detected on $part_dev; bootstrapping LUKS and replaying payload"
+      if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
+        echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot bootstrap LUKS for $part_dev" >&2
+        exit 1
+      fi
+      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
+      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
+      restore_partition_payload_to "/dev/mapper/$map_name"
+    fi
+  fi
+
   status "[$PART_INDEX/$TOTAL_PARTS] Partition $number restore completed"
 done < "$WORK_DIR/parts.map"
 
 CURRENT_PHASE="filesystem-and-boot-repair"
 sync
+partprobe "$TARGET_DEV" || true
+if command -v sgdisk >/dev/null 2>&1; then
+  # On larger restore targets, relocate backup GPT header/table to the actual end.
+  sgdisk -e "$TARGET_DEV" >/dev/null 2>&1 || true
+fi
 partprobe "$TARGET_DEV" || true
 udevadm settle || true
 
@@ -737,14 +904,16 @@ while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name
   [[ -z "${number:-}" ]] && continue
   [[ "$luks_enabled" == "True" ]] || continue
   map_name="${luks_name:-luks-${number}}"
-  if cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
-    if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
-      if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
-        echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot open LUKS mapping for $part_dev" >&2
-        exit 1
-      fi
-      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
+  if ! cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
+    echo "[deploy] Expected LUKS container but did not detect one on $part_dev" >&2
+    exit 1
+  fi
+  if ! cryptsetup status "$map_name" >/dev/null 2>&1; then
+    if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
+      echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot open LUKS mapping for $part_dev" >&2
+      exit 1
     fi
+    printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
   fi
 done < "$WORK_DIR/part-dev.map"
 
@@ -767,6 +936,25 @@ fi
 if command -v lvchange >/dev/null 2>&1; then
   lvchange -ay >/dev/null 2>&1 || true
 fi
+
+status "Expanding remainder PV containers"
+while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
+  [[ "$entry_role" == "pv" && "$size_mode" == "remainder" ]] || continue
+  pv_target="$part_dev"
+  if [[ "$luks_enabled" == "True" ]]; then
+    map_name="${luks_name:-luks-${number}}"
+    if cryptsetup status "$map_name" >/dev/null 2>&1; then
+      cryptsetup resize "$map_name" >/dev/null 2>&1 || true
+      pv_target="/dev/mapper/$map_name"
+    else
+      status "WARNING: LUKS mapping $map_name is not active; skipping PV resize for partition $number"
+      continue
+    fi
+  fi
+  if command -v pvresize >/dev/null 2>&1 && [[ -n "$pv_target" ]]; then
+    pvresize "$pv_target" >/dev/null 2>&1 || true
+  fi
+done < "$WORK_DIR/part-dev.map"
 
 CURRENT_PHASE="lv-layout-map"
 status "Merging LV layout metadata into restore device map"
@@ -793,14 +981,17 @@ except FileNotFoundError:
   pass
 
 append_rows = []
-for entry in sorted(deploy.get("layout_entries", []), key=lambda e: int(e.get("order") or 0)):
+for entry in sorted(
+    deploy.get("layout_entries", []),
+    key=lambda e: int(e.get("partition_number") or e.get("order") or 0),
+):
   if str(entry.get("entry_role") or "").strip().lower() != "lv":
     continue
-  order = int(entry.get("order") or 0)
-  if order <= 0 or order in existing_numbers:
+  number = int(entry.get("partition_number") or entry.get("order") or 0)
+  if number <= 0 or number in existing_numbers:
     continue
   append_rows.append("|".join([
-    str(order),
+    str(number),
     "",
     str(entry.get("mount_point") or ""),
     str(entry.get("filesystem") or ""),
@@ -833,9 +1024,11 @@ done < "$WORK_DIR/part-dev.map"
 status "Mounting restored filesystems"
 : > "$WORK_DIR/mounted.paths"
 ROOT_DEV=""
+ROOT_ENTRY_FOUND=0
 while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ -z "${number:-}" ]] && continue
   if [[ "$mount_point" == "/" ]]; then
+    ROOT_ENTRY_FOUND=1
     if [[ "$entry_role" == "lv" && -n "${volume_group:-}" && -n "${logical_volume:-}" ]]; then
       ROOT_DEV="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"
       if [[ -z "$ROOT_DEV" ]]; then
@@ -848,7 +1041,7 @@ while IFS='|' read -r number part_dev mount_point fs_type luks_enabled luks_name
   fi
 done < "$WORK_DIR/part-dev.map"
 
-if [[ -z "$ROOT_DEV" ]]; then
+if [[ "$ROOT_ENTRY_FOUND" != "1" ]]; then
   status "ERROR: Root mountpoint not found in deploy metadata"
   if [[ -f "$WORK_DIR/part-dev.map" ]]; then
     status "Current part-dev map contents:"
@@ -857,6 +1050,21 @@ if [[ -z "$ROOT_DEV" ]]; then
   if command -v lvs >/dev/null 2>&1; then
     status "Available logical volumes:"
     lvs -o vg_name,lv_name,lv_path || true
+  fi
+  exit 1
+elif [[ -z "$ROOT_DEV" ]]; then
+  status "ERROR: Root device could not be resolved from deploy metadata"
+  if [[ -f "$WORK_DIR/part-dev.map" ]]; then
+    status "Current part-dev map contents:"
+    cat "$WORK_DIR/part-dev.map" || true
+  fi
+  if command -v lvs >/dev/null 2>&1; then
+    status "Available logical volumes:"
+    lvs -o vg_name,lv_name,lv_path || true
+  fi
+  if command -v ls >/dev/null 2>&1; then
+    status "Current device-mapper entries:"
+    ls -l /dev/mapper || true
   fi
   exit 1
 else
@@ -1151,7 +1359,7 @@ __FINISH_STEP__
 
     content = content.replace("__FINISH_STEP__", finish_step)
     content = content.replace("__REPO_SETUP__", repo_setup.rstrip() + ("\n" if repo_setup else ""))
-    content = content.replace("__REPO_CLEANUP__", repo_cleanup.rstrip() + ("\n" if repo_cleanup else ""))
+    content = content.replace("__REPO_CLEANUP__", "")
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path

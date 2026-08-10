@@ -11,6 +11,32 @@ from .forms import AfterburnerItemForm, AfterburnerProfileForm, AfterburnerScrip
 from .models import AfterburnerItem, AfterburnerProfile, AfterburnerScriptInput
 
 
+def _sync_custom_script_inputs(*, item: AfterburnerItem, payload: list[dict[str, object]]) -> None:
+    if item.item_type != AfterburnerItem.TYPE_CUSTOM_SCRIPT:
+        return
+    rows = payload or []
+    with transaction.atomic():
+        item.script_inputs.all().delete()
+        if not rows:
+            return
+        AfterburnerScriptInput.objects.bulk_create(
+            [
+                AfterburnerScriptInput(
+                    item=item,
+                    order=int(row.get("order") or idx + 1),
+                    key=str(row.get("key") or "").strip().upper(),
+                    label=str(row.get("label") or "").strip(),
+                    input_type=str(row.get("input_type") or AfterburnerScriptInput.TYPE_STRING).strip(),
+                    required=bool(row.get("required")),
+                    default_value=str(row.get("default_value") or ""),
+                    select_options=list(row.get("select_options") or []),
+                    description=str(row.get("description") or "").strip(),
+                )
+                for idx, row in enumerate(rows)
+            ]
+        )
+
+
 def _custom_script_example_lines(item: AfterburnerItem | None) -> list[str]:
     lines = [
         "#!/usr/bin/env bash",
@@ -123,6 +149,10 @@ class AfterburnerItemCreateView(LoginRequiredMixin, CreateView):
         max_order = self.profile.items.order_by("-order").values_list("order", flat=True).first() or 0
         form.instance.order = max_order + 1
         response = super().form_valid(form)
+        _sync_custom_script_inputs(
+            item=self.object,
+            payload=form.cleaned_data.get("item_script_inputs_payload") or [],
+        )
         messages.success(self.request, "Afterburner item added")
         return response
 
@@ -144,6 +174,14 @@ class AfterburnerItemUpdateView(LoginRequiredMixin, UpdateView):
     def get_success_url(self):
         return reverse_lazy("afterburners:profile-detail", kwargs={"pk": self.object.profile_id})
 
+    def form_valid(self, form):
+        response = super().form_valid(form)
+        _sync_custom_script_inputs(
+            item=self.object,
+            payload=form.cleaned_data.get("item_script_inputs_payload") or [],
+        )
+        return response
+
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
         context["profile_id"] = self.object.profile_id
@@ -161,6 +199,10 @@ class AfterburnerItemInlineCreateView(LoginRequiredMixin, View):
             max_order = profile.items.order_by("-order").values_list("order", flat=True).first() or 0
             item.order = max_order + 1
             item.save()
+            _sync_custom_script_inputs(
+                item=item,
+                payload=form.cleaned_data.get("item_script_inputs_payload") or [],
+            )
             messages.success(request, "Afterburner item added")
         else:
             errors = "; ".join(form.errors.get("__all__", []))
@@ -179,7 +221,11 @@ class AfterburnerItemInlineUpdateView(LoginRequiredMixin, View):
         item = get_object_or_404(AfterburnerItem, pk=pk)
         form = AfterburnerItemForm(request.POST, instance=item, prefix=f"item-{item.id}")
         if form.is_valid():
-            form.save()
+            item = form.save()
+            _sync_custom_script_inputs(
+                item=item,
+                payload=form.cleaned_data.get("item_script_inputs_payload") or [],
+            )
             messages.success(request, "Afterburner item updated")
         else:
             errors = "; ".join(form.errors.get("__all__", []))

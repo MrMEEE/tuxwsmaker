@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 
 from django import forms
 from django.core.exceptions import ValidationError
@@ -15,6 +16,12 @@ class AfterburnerProfileForm(forms.ModelForm):
 
 
 class AfterburnerItemForm(forms.ModelForm):
+    CUSTOM_SCRIPT_RUN_MODE_NON_CHROOT = "non_chroot"
+    CUSTOM_SCRIPT_RUN_MODE_CHROOT = "chroot"
+    CUSTOM_SCRIPT_RUN_MODE_CHOICES = [
+        (CUSTOM_SCRIPT_RUN_MODE_NON_CHROOT, "Non-chroot"),
+        (CUSTOM_SCRIPT_RUN_MODE_CHROOT, "Chroot (target system)"),
+    ]
     TPM_HASH_CHOICES = [
         ("sha1", "sha1"),
         ("sha256", "sha256"),
@@ -103,6 +110,22 @@ class AfterburnerItemForm(forms.ModelForm):
         label="Custom script body",
         help_text="Runs inside the restored system during deployment. Use the input keys as environment variables inside your script. Example: echo \"Deploying ${ENVIRONMENT}\"; useradd -m \"${USERNAME}\"",
     )
+    custom_name = forms.CharField(
+        required=False,
+        label="Display name",
+        help_text="Shown in the afterburner list for this custom script item.",
+    )
+    script_questions_json = forms.CharField(
+        required=False,
+        widget=forms.HiddenInput(),
+        label="Questions",
+    )
+    script_run_mode = forms.ChoiceField(
+        required=False,
+        label="Run mode",
+        choices=CUSTOM_SCRIPT_RUN_MODE_CHOICES,
+        initial=CUSTOM_SCRIPT_RUN_MODE_NON_CHROOT,
+    )
 
     class Meta:
         model = AfterburnerItem
@@ -179,6 +202,81 @@ class AfterburnerItemForm(forms.ModelForm):
             self.initial["rhsm_prompt_repositories"] = bool(cfg.get("prompt_repositories") or False)
             self.initial["wait_message"] = str(cfg.get("message") or "")
             self.initial["script_body"] = str(cfg.get("script_body") or "")
+            if self.instance.item_type == AfterburnerItem.TYPE_CUSTOM_SCRIPT:
+                default_name = dict(AfterburnerItem.TYPE_CHOICES).get(AfterburnerItem.TYPE_CUSTOM_SCRIPT, "Custom script")
+                self.initial["custom_name"] = self.instance.name if self.instance.name != default_name else ""
+                self.initial["script_run_mode"] = str(cfg.get("run_mode") or self.CUSTOM_SCRIPT_RUN_MODE_NON_CHROOT)
+                lines: list[str] = []
+                payload: list[dict[str, str]] = []
+                for row in self.instance.script_inputs.all().order_by("order", "id"):
+                    lines.append(row.key)
+                    payload.append(
+                        {
+                            "name": str(row.description or row.label or "").strip(),
+                            "question": str(row.label or "").strip(),
+                            "env_var": str(row.key or "").strip(),
+                        }
+                    )
+                self.initial["script_questions_json"] = json.dumps(payload)
+
+    def _parse_script_questions(self, raw_payload: str) -> list[dict[str, object]]:
+        rows: list[dict[str, object]] = []
+        raw = (raw_payload or "").strip()
+        if not raw:
+            return rows
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(f"Invalid questions payload: {exc.msg}") from exc
+
+        if not isinstance(parsed, list):
+            raise ValidationError("Invalid questions payload: expected a list")
+
+        seen_env_vars: set[str] = set()
+        for idx, entry in enumerate(parsed, start=1):
+            if not isinstance(entry, dict):
+                raise ValidationError(f"Question {idx}: invalid entry")
+
+            name = str(entry.get("name") or "").strip()
+            label = str(entry.get("question") or "").strip()
+            key = str(entry.get("env_var") or "").strip().upper()
+
+            if not name:
+                raise ValidationError(f"Question {idx}: Name is required")
+            if not label:
+                raise ValidationError(f"Question {idx}: Question is required")
+            if not key:
+                raise ValidationError(f"Question {idx}: Environment variable name is required")
+            if key in seen_env_vars:
+                raise ValidationError(f"Question {idx}: Duplicate environment variable '{key}'")
+            seen_env_vars.add(key)
+
+            probe = AfterburnerScriptInput(
+                item=self.instance if self.instance and self.instance.pk else AfterburnerItem(item_type=AfterburnerItem.TYPE_CUSTOM_SCRIPT),
+                order=len(rows) + 1,
+                key=key,
+                label=label,
+                input_type=AfterburnerScriptInput.TYPE_STRING,
+                required=False,
+                default_value="",
+                select_options=[],
+                description=name,
+            )
+            probe.item.item_type = AfterburnerItem.TYPE_CUSTOM_SCRIPT
+            probe.clean()
+            rows.append(
+                {
+                    "order": len(rows) + 1,
+                    "key": probe.key,
+                    "label": label,
+                    "input_type": AfterburnerScriptInput.TYPE_STRING,
+                    "required": False,
+                    "default_value": "",
+                    "select_options": [],
+                    "description": name,
+                }
+            )
+        return rows
 
     def clean(self):
         cleaned = super().clean()
@@ -329,8 +427,19 @@ class AfterburnerItemForm(forms.ModelForm):
                 "message": message,
             }
         elif item_type == AfterburnerItem.TYPE_CUSTOM_SCRIPT:
-            body = str(cleaned.get("script_body") or "").rstrip()
-            config = {"script_body": body}
+            body = str(cleaned.get("script_body") or "")
+            body = body.replace("\r\n", "\n").replace("\r", "\n").rstrip()
+            run_mode = str(cleaned.get("script_run_mode") or self.CUSTOM_SCRIPT_RUN_MODE_NON_CHROOT).strip()
+            allowed_modes = {value for value, _label in self.CUSTOM_SCRIPT_RUN_MODE_CHOICES}
+            if run_mode not in allowed_modes:
+                self.add_error("script_run_mode", "Invalid custom script run mode")
+                run_mode = self.CUSTOM_SCRIPT_RUN_MODE_NON_CHROOT
+            config = {
+                "script_body": body,
+                "run_mode": run_mode,
+            }
+            cleaned["item_custom_name"] = str(cleaned.get("custom_name") or "").strip()
+            cleaned["item_script_inputs_payload"] = self._parse_script_questions(str(cleaned.get("script_questions_json") or ""))
 
         cleaned["item_config"] = config
         return cleaned
@@ -338,7 +447,11 @@ class AfterburnerItemForm(forms.ModelForm):
     def save(self, commit: bool = True):
         obj: AfterburnerItem = super().save(commit=False)
         display = dict(AfterburnerItem.TYPE_CHOICES).get(obj.item_type, obj.item_type)
-        obj.name = display
+        if obj.item_type == AfterburnerItem.TYPE_CUSTOM_SCRIPT:
+            custom_name = str(self.cleaned_data.get("item_custom_name") or "").strip()
+            obj.name = custom_name or display
+        else:
+            obj.name = display
         obj.description = ""
         obj.config = self.cleaned_data.get("item_config") or {}
         if commit:

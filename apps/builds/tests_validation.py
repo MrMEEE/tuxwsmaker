@@ -11,6 +11,7 @@ from apps.builds.models import BuildDefinition, BuildMachineConfig
 from apps.builds.services.kickstart import calculate_layout_disk_size_gib
 from apps.catalog.models import ISOImage, OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
+from apps.playbooks.models import Playbook, PlaybookRepository
 from apps.repositories.models import PackageRepository, RedHatRepositoryCatalog
 from apps.serverconfig.models import ServerConfiguration
 
@@ -114,6 +115,56 @@ class BuildDefinitionFormAfterburnerTests(TestCase):
 
         self.assertTrue(form.is_valid(), form.errors.as_text())
         self.assertEqual(form.cleaned_data["ordered_afterburner_ids"], [second.id, first.id])
+
+    def test_playbook_order_payload_always_normalizes_to_non_chroot(self):
+        repo = PlaybookRepository.objects.create(
+            name="repo-a",
+            repo_url="https://example.invalid/repo-a.git",
+            default_branch="main",
+        )
+        playbook = Playbook.objects.create(
+            repository=repo,
+            branch="main",
+            path="site.yml",
+            is_active=True,
+        )
+        data = self._form_data()
+        data["playbook_order_json"] = json.dumps([
+            {"id": playbook.id, "run_mode": "chroot"},
+        ])
+
+        form = BuildDefinitionForm(data=data)
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        self.assertEqual(
+            form.cleaned_data["ordered_playbook_payload"],
+            [{"id": playbook.id, "run_mode": "non_chroot"}],
+        )
+
+    def test_playbook_order_payload_ignores_invalid_run_mode(self):
+        repo = PlaybookRepository.objects.create(
+            name="repo-b",
+            repo_url="https://example.invalid/repo-b.git",
+            default_branch="main",
+        )
+        playbook = Playbook.objects.create(
+            repository=repo,
+            branch="main",
+            path="site.yml",
+            is_active=True,
+        )
+        data = self._form_data()
+        data["playbook_order_json"] = json.dumps([
+            {"id": playbook.id, "run_mode": "bad_mode"},
+        ])
+
+        form = BuildDefinitionForm(data=data)
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        self.assertEqual(
+            form.cleaned_data["ordered_playbook_payload"],
+            [{"id": playbook.id, "run_mode": "non_chroot"}],
+        )
 
     def test_rejects_unknown_afterburner_id_in_order_payload(self):
         data = self._form_data()

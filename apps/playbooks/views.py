@@ -135,11 +135,12 @@ class PlaybookRepositoryDetailView(LoginRequiredMixin, DetailView):
 
 
 class PlaybookRepositoryInspectView(LoginRequiredMixin, View):
-    def post(self, request):
-        repo_url = (request.POST.get("repo_url") or "").strip()
-        branch = (request.POST.get("branch") or "").strip() or None
-        ssh_key_id = (request.POST.get("ssh_key") or "").strip()
-        api_key = request.POST.get("api_key") or ""
+    def _handle(self, request):
+        payload = request.POST if request.method == "POST" else request.GET
+        repo_url = (payload.get("repo_url") or "").strip()
+        branch = (payload.get("branch") or "").strip() or None
+        ssh_key_id = (payload.get("ssh_key") or "").strip()
+        api_key = payload.get("api_key") or ""
         if not repo_url:
             return JsonResponse({"ok": False, "error": "repo_url is required"}, status=400)
 
@@ -152,6 +153,12 @@ class PlaybookRepositoryInspectView(LoginRequiredMixin, View):
             return JsonResponse({"ok": False, "error": str(exc)}, status=400)
         return JsonResponse({"ok": True, **data})
 
+    def get(self, request):
+        return self._handle(request)
+
+    def post(self, request):
+        return self._handle(request)
+
 
 class PlaybookRepositorySyncBranchesView(LoginRequiredMixin, View):
     def post(self, request, pk):
@@ -162,6 +169,30 @@ class PlaybookRepositorySyncBranchesView(LoginRequiredMixin, View):
             publish_event("playbooks", "branches-synced", {"repo_id": repo.id, "count": len(branches)})
         except PlaybookSyncError as exc:
             messages.error(request, f"Branch sync failed: {exc}")
+        return redirect("playbooks:repo-detail", pk=repo.pk)
+
+
+class PlaybookRepositoryRefreshView(LoginRequiredMixin, View):
+    def post(self, request, pk):
+        repo = get_object_or_404(PlaybookRepository, pk=pk)
+        requested_branch = (request.POST.get("branch") or repo.default_branch).strip()
+        try:
+            branches = sync_branches(repo)
+            branch = requested_branch if requested_branch in branches else repo.default_branch
+            if branch not in branches and branches:
+                branch = branches[0]
+            playbooks = sync_playbooks(repo, branch)
+            messages.success(
+                request,
+                f"Repository updated: {len(branches)} branch(es), {len(playbooks)} playbook(s) in '{branch}'",
+            )
+            publish_event(
+                "playbooks",
+                "repository-refreshed",
+                {"repo_id": repo.id, "branch_count": len(branches), "playbook_count": len(playbooks), "branch": branch},
+            )
+        except PlaybookSyncError as exc:
+            messages.error(request, f"Repository update failed: {exc}")
         return redirect("playbooks:repo-detail", pk=repo.pk)
 
 

@@ -4,11 +4,14 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
+import math
 from datetime import datetime
 import subprocess
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 
 from apps.afterburners.services import RHSM_REPO_IDS_FILENAME, render_afterburner_script
@@ -25,6 +28,26 @@ class ArtifactExportError(RuntimeError):
 
 
 DEPLOY_MANIFEST_VERSION = 1
+
+
+def _iso_has_rr_path(*, iso_path: Path, rr_path: str) -> bool:
+    try:
+        import pycdlib  # type: ignore
+    except Exception:
+        return False
+
+    iso = pycdlib.PyCdlib()
+    try:
+        iso.open(str(iso_path))
+        iso.get_record(rr_path=rr_path)
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            iso.close()
+        except Exception:
+            pass
 
 
 def _write_default_afterburner_script(*, build: BuildDefinition, output_dir: Path) -> Path:
@@ -75,49 +98,12 @@ def _write_usb_image_from_bundle(
         cfg_path.write_text(grub_cfg, encoding="utf-8")
 
     if build_boot_mode == BuildMachineConfig.BOOT_UEFI:
-        if not source_iso_path or not source_iso_path.exists():
-            raise ArtifactExportError(
-                "UEFI Secure Boot artifact generation requires a source ISO to preserve the signed UEFI boot chain"
-            )
-        if shutil.which("xorriso") is None:
-            raise ArtifactExportError(
-                "UEFI Secure Boot artifact generation requires xorriso to preserve the signed UEFI boot chain"
-            )
-
-        try:
-            cmd = [
-                "xorriso",
-                "-indev",
-                str(source_iso_path),
-                "-outdev",
-                str(output_path),
-                "-boot_image",
-                "any",
-                "replay",
-                "-volid",
-                "TUXWSDEPLOY",
-                "-map",
-                str(bundle_dir),
-                "/",
-            ]
-
-            # Keep the signed UEFI boot chain from the source ISO but drop large
-            # distro package trees so usb.img remains close to payload size.
-            if "rhel" in source_iso_path.name.lower():
-                cmd.extend([
-                    "-rm_r",
-                    "/BaseOS",
-                    "/AppStream",
-                    "--",
-                ])
-
-            cmd.append("-commit")
-            _run_checked(cmd)
-            return output_path
-        except Exception as exc:
-            raise ArtifactExportError(
-                f"UEFI Secure Boot artifact generation requires a signed-boot-chain-preserving ISO overlay, but xorriso failed: {exc}"
-            ) from exc
+        return _write_uefi_gpt_usb_image_from_bundle(
+            bundle_dir=bundle_dir,
+            output_path=output_path,
+            build_name=build_name,
+            source_iso_path=source_iso_path,
+        )
 
     if shutil.which("grub-mkrescue") is None:
         raise ArtifactExportError(
@@ -137,6 +123,217 @@ def _write_usb_image_from_bundle(
         ],
         env=env,
     )
+
+    return output_path
+
+
+def _directory_size_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        root_path = Path(root)
+        for name in files:
+            file_path = root_path / name
+            try:
+                total += file_path.stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
+def _parse_parted_partition_map(*, disk_image: Path) -> dict[int, dict[str, int]]:
+    proc = _run_checked(["parted", "-s", "-m", str(disk_image), "unit", "B", "print"])
+    partitions: dict[int, dict[str, int]] = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip().rstrip(";")
+        if not line or not line[0].isdigit():
+            continue
+        parts = line.split(":")
+        if len(parts) < 4:
+            continue
+        number = int(parts[0])
+        start_byte = int(parts[1].rstrip("B") or "0")
+        size_bytes = int(parts[3].rstrip("B") or "0")
+        partitions[number] = {
+            "start_byte": start_byte,
+            "size_bytes": size_bytes,
+        }
+    if 1 not in partitions or 2 not in partitions:
+        raise ArtifactExportError("Failed to discover expected GPT partitions for USB image")
+    return partitions
+
+
+def _copy_tree_to_fat_image(*, source_dir: Path, fat_image: Path) -> None:
+    # Create directories first, then copy files so mcopy does not fail on deep paths.
+    rel_dirs: set[Path] = set()
+    rel_files: list[Path] = []
+    for root, dirs, files in os.walk(source_dir):
+        root_path = Path(root)
+        rel_root = root_path.relative_to(source_dir)
+        for dirname in dirs:
+            rel_dirs.add(rel_root / dirname)
+        for filename in files:
+            rel_files.append(rel_root / filename)
+
+    for rel_dir in sorted(rel_dirs):
+        target = "::/" + rel_dir.as_posix()
+        _run_checked(["mmd", "-i", str(fat_image), "-D", "s", target])
+
+    for rel_file in sorted(rel_files):
+        src = source_dir / rel_file
+        dst = "::/" + rel_file.as_posix()
+        _run_checked(["mcopy", "-i", str(fat_image), "-D", "o", str(src), dst])
+
+
+def _copy_partition_image_into_disk(*, disk_path: Path, partition_image_path: Path, offset_bytes: int) -> None:
+    with disk_path.open("r+b") as disk_f, partition_image_path.open("rb") as part_f:
+        disk_f.seek(offset_bytes)
+        shutil.copyfileobj(part_f, disk_f, length=1024 * 1024)
+
+
+def _prepare_efi_boot_tree(*, source_iso_path: Path, build_name: str, output_dir: Path) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    efi_boot_dir = output_dir / "EFI" / "BOOT"
+    efi_boot_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _extract_iso_efi_tree(iso_path=source_iso_path, output_dir=output_dir)
+    except ArtifactExportError:
+        # Fallback to legacy extraction when full tree extraction is unavailable.
+        extracted_assets = _extract_uefi_boot_assets_from_iso(iso_path=source_iso_path, output_dir=output_dir / "assets")
+        if not extracted_assets:
+            raise ArtifactExportError("Could not extract UEFI boot assets from source ISO")
+        for asset in extracted_assets:
+            target = efi_boot_dir / asset.name
+            if target.resolve() != asset.resolve():
+                shutil.copy2(asset, target)
+
+    if not (efi_boot_dir / "BOOTX64.EFI").exists():
+        boot_sources = [
+            output_dir / "EFI" / "BOOT" / "shimx64.efi",
+            output_dir / "EFI" / "BOOT" / "grubx64.efi",
+            output_dir / "EFI" / "redhat" / "shimx64.efi",
+            output_dir / "EFI" / "redhat" / "grubx64.efi",
+            output_dir / "EFI" / "centos" / "shimx64.efi",
+            output_dir / "EFI" / "centos" / "grubx64.efi",
+        ]
+        bootx64_src = next((path for path in boot_sources if path.exists()), None)
+        if bootx64_src is None:
+            raise ArtifactExportError("Source ISO does not provide BOOTX64.EFI, shimx64.efi, or grubx64.efi")
+        shutil.copy2(bootx64_src, efi_boot_dir / "BOOTX64.EFI")
+
+    # Keep shim companion binaries in removable-media path when available.
+    for helper_name in ("mmx64.efi", "fbx64.efi"):
+        helper_target = efi_boot_dir / helper_name
+        if helper_target.exists():
+            continue
+        helper_sources = [
+            output_dir / "EFI" / "BOOT" / helper_name,
+            output_dir / "EFI" / "redhat" / helper_name,
+            output_dir / "EFI" / "centos" / helper_name,
+        ]
+        helper_src = next((path for path in helper_sources if path.exists()), None)
+        if helper_src is not None:
+            shutil.copy2(helper_src, helper_target)
+
+    grub_cfg = (
+        "set timeout=5\n"
+        "set default=0\n"
+        "search --no-floppy --label TUXWSDEPLOY --set=root\n"
+        "menuentry 'TuxWSMaker Deploy USB' {\n"
+        f"  linux /boot/vmlinuz inst.stage2=hd:LABEL=TUXWSDEPLOY:/stage2 inst.repo=hd:LABEL=TUXWSDEPLOY:/ inst.ks=hd:LABEL=TUXWSDEPLOY:/deploy/{build_name}-deploy.cfg ip=dhcp console=ttyS0,115200n8 console=tty0\n"
+        "  initrd /boot/initrd.img\n"
+        "}\n"
+    )
+    (efi_boot_dir / "grub.cfg").write_text(grub_cfg, encoding="utf-8")
+    return output_dir
+
+
+def _write_uefi_gpt_usb_image_from_bundle(
+    *,
+    bundle_dir: Path,
+    output_path: Path,
+    build_name: str,
+    source_iso_path: Path | None,
+) -> Path:
+    if not source_iso_path or not source_iso_path.exists():
+        raise ArtifactExportError(
+            "UEFI USB artifact generation requires a source ISO to preserve UEFI boot binaries"
+        )
+
+    required_tools = ["parted", "mkfs.vfat", "mkfs.ext4", "mmd", "mcopy"]
+    missing_tools = [tool for tool in required_tools if shutil.which(tool) is None]
+    if missing_tools:
+        raise ArtifactExportError(
+            "UEFI USB artifact generation requires additional host tools: " + ", ".join(missing_tools)
+        )
+
+    esp_size_bytes = 512 * 1024 * 1024
+    bundle_size_bytes = _directory_size_bytes(bundle_dir)
+    data_size_bytes = max(int(math.ceil(bundle_size_bytes * 1.15)), 1024 * 1024 * 1024)
+    total_size_bytes = 1024 * 1024 + esp_size_bytes + 1024 * 1024 + data_size_bytes + 1024 * 1024
+
+    if output_path.exists():
+        output_path.unlink()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("wb") as f:
+        f.truncate(total_size_bytes)
+
+    _run_checked(
+        [
+            "parted",
+            "-s",
+            str(output_path),
+            "mklabel",
+            "gpt",
+            "mkpart",
+            "EFI",
+            "fat32",
+            "1MiB",
+            "513MiB",
+            "set",
+            "1",
+            "esp",
+            "on",
+            "mkpart",
+            "DATA",
+            "ext4",
+            "513MiB",
+            "100%",
+        ]
+    )
+
+    partition_map = _parse_parted_partition_map(disk_image=output_path)
+
+    with tempfile.TemporaryDirectory(prefix="tuxwsmaker-uefi-usb-", dir=str(output_path.parent)) as tmp:
+        tmp_dir = Path(tmp)
+        esp_image = tmp_dir / "esp.img"
+        data_image = tmp_dir / "data.img"
+
+        with esp_image.open("wb") as f:
+            f.truncate(partition_map[1]["size_bytes"])
+        _run_checked(["mkfs.vfat", "-F", "32", "-n", "TUXWSEFI", str(esp_image)])
+
+        efi_tree = _prepare_efi_boot_tree(
+            source_iso_path=source_iso_path,
+            build_name=build_name,
+            output_dir=tmp_dir / "efi-tree",
+        )
+        _copy_tree_to_fat_image(source_dir=efi_tree, fat_image=esp_image)
+
+        with data_image.open("wb") as f:
+            f.truncate(partition_map[2]["size_bytes"])
+        _run_checked(["mkfs.ext4", "-F", "-L", "TUXWSDEPLOY", "-d", str(bundle_dir), str(data_image)])
+
+        _copy_partition_image_into_disk(
+            disk_path=output_path,
+            partition_image_path=esp_image,
+            offset_bytes=partition_map[1]["start_byte"],
+        )
+        _copy_partition_image_into_disk(
+            disk_path=output_path,
+            partition_image_path=data_image,
+            offset_bytes=partition_map[2]["start_byte"],
+        )
 
     return output_path
 
@@ -284,6 +481,7 @@ def _layout_entries_payload(build: BuildDefinition) -> list[dict[str, object]]:
     return [
         {
             "order": entry.order,
+            "partition_number": entry.partition_number,
             "name": entry.name,
             "entry_role": entry.entry_role,
             "mount_point": entry.mount_point,
@@ -303,10 +501,11 @@ def _layout_entries_payload(build: BuildDefinition) -> list[dict[str, object]]:
 
 def _deploy_payload_metadata(*, build: BuildDefinition) -> dict[str, object]:
     layout_entries = _layout_entries_payload(build)
-    boot_entries = [entry["order"] for entry in layout_entries if entry["is_boot"]]
+    boot_entries = [entry["partition_number"] for entry in layout_entries if entry["is_boot"]]
     mount_map = [
         {
             "order": entry["order"],
+            "partition_number": entry["partition_number"],
             "mount_point": entry["mount_point"],
             "filesystem": entry["filesystem"],
             "luks_enabled": entry["luks_enabled"],
@@ -384,6 +583,48 @@ def _extract_uefi_boot_assets_from_iso(*, iso_path: Path, output_dir: Path) -> l
             pass
 
     return copied
+
+
+def _extract_iso_efi_tree(*, iso_path: Path, output_dir: Path) -> Path:
+    try:
+        import pycdlib  # type: ignore
+    except Exception as exc:
+        raise ArtifactExportError("pycdlib is required for extracting UEFI boot assets from ISO") from exc
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    efi_root = output_dir / "EFI"
+    iso = pycdlib.PyCdlib()
+    extracted_any = False
+    try:
+        iso.open(str(iso_path))
+        # Preserve the complete EFI tree from the original ISO so shim/grub
+        # binaries remain vendor-signed and Secure Boot compatible.
+        for root, dirs, files in iso.walk(rr_path="/EFI"):
+            root_rel = root.lstrip("/")
+            root_dir = output_dir / root_rel
+            root_dir.mkdir(parents=True, exist_ok=True)
+
+            for directory in dirs:
+                dirname = str(directory).strip("/")
+                if dirname:
+                    (root_dir / dirname).mkdir(parents=True, exist_ok=True)
+
+            for file_item in files:
+                filename = str(file_item)
+                rr_path = f"{root.rstrip('/')}/{filename}" if root != "/" else f"/{filename}"
+                target = output_dir / rr_path.lstrip("/")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                iso.get_file_from_iso(local_path=str(target), rr_path=rr_path)
+                extracted_any = True
+    finally:
+        try:
+            iso.close()
+        except Exception:
+            pass
+
+    if not extracted_any or not efi_root.exists():
+        raise ArtifactExportError("Could not extract EFI tree from source ISO")
+    return efi_root
 
 
 def _write_pxe_tree(*, iso_path: Path, out_dir: Path, boot_mode: str | None = None) -> Path:
@@ -531,30 +772,97 @@ def _run_checked(args: list[str], *, env: dict[str, str] | None = None) -> subpr
     return proc
 
 
-def _convert_qcow2_to_raw(*, qcow2_path: Path, raw_path: Path) -> None:
-    if shutil.which("qemu-img") is None:
-        raise ArtifactExportError("qemu-img is required to export clone partition images")
-    _run_checked([
-        "qemu-img",
-        "convert",
-        "-f",
-        "qcow2",
-        "-O",
-        "raw",
-        "-S",
-        "4k",
-        str(qcow2_path),
-        str(raw_path),
-    ])
+def _nbd_sysfs_path(device: Path) -> Path:
+    return Path("/sys/class/block") / device.name
 
 
-def _partition_table_from_raw(raw_path: Path) -> dict:
+def _nbd_device_is_free(device: Path) -> bool:
+    sysfs_path = _nbd_sysfs_path(device)
+    if not sysfs_path.exists():
+        return False
+    pid_path = sysfs_path / "pid"
+    size_path = sysfs_path / "size"
+    try:
+        pid_value = int((pid_path.read_text(encoding="utf-8").strip() or "0"))
+    except Exception:
+        pid_value = 0
+    try:
+        size_value = int((size_path.read_text(encoding="utf-8").strip() or "0"))
+    except Exception:
+        size_value = 0
+    return pid_value == 0 and size_value == 0
+
+
+def _nbd_device_candidates() -> list[Path]:
+    candidates = []
+    for sysfs_path in sorted(
+        (path for path in Path("/sys/class/block").glob("nbd*") if re.fullmatch(r"nbd\d+", path.name)),
+        key=lambda path: int(path.name[3:]),
+    ):
+        device = Path("/dev") / sysfs_path.name
+        if device.exists():
+            candidates.append(device)
+    return candidates
+
+
+def _attach_qcow2_to_nbd(*, qcow2_path: Path) -> Path:
+    if shutil.which("qemu-nbd") is None:
+        raise ArtifactExportError("qemu-nbd is required to export clone partition images")
+
+    candidates = [device for device in _nbd_device_candidates() if _nbd_device_is_free(device)]
+    if not candidates and shutil.which("modprobe") is not None:
+        _run_checked(["modprobe", "nbd", "max_part=16"])
+        candidates = [device for device in _nbd_device_candidates() if _nbd_device_is_free(device)]
+
+    if not candidates:
+        raise ArtifactExportError("No free nbd devices are available for clone export")
+
+    last_error = ""
+    for device in candidates:
+        try:
+            _run_checked([
+                "qemu-nbd",
+                "-r",
+                "-f",
+                "qcow2",
+                "-c",
+                str(device),
+                str(qcow2_path),
+            ])
+            return device
+        except ArtifactExportError as exc:
+            last_error = str(exc)
+            if "busy" not in last_error.lower() and "in use" not in last_error.lower():
+                raise
+
+    raise ArtifactExportError(f"Failed to attach qcow2 image to nbd device: {last_error or 'no free device found'}")
+
+
+def _detach_nbd(device: Path) -> None:
+    if shutil.which("qemu-nbd") is None:
+        return
+
+    last_error = ""
+    for _ in range(5):
+        try:
+            _run_checked(["qemu-nbd", "-d", str(device)])
+            return
+        except ArtifactExportError as exc:
+            last_error = str(exc)
+            if "busy" not in last_error.lower() and "in use" not in last_error.lower():
+                return
+            time.sleep(0.2)
+    raise ArtifactExportError(f"Failed to detach nbd device {device}: {last_error or 'device remained busy'}")
+
+
+def _partition_table_from_device(device_path: Path) -> dict:
     if shutil.which("parted") is None:
         raise ArtifactExportError("parted is required to inspect disk partitions for clone export")
-    proc = _run_checked(["parted", "-s", "-m", str(raw_path), "unit", "B", "print"])
+    proc = _run_checked(["parted", "-s", "-m", str(device_path), "unit", "B", "print"])
     lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
     if len(lines) < 2:
         raise ArtifactExportError("parted did not return a usable partition table")
+
 
     disk_parts = lines[1].split(":")
     table_type = disk_parts[5] if len(disk_parts) > 5 else ""
@@ -604,17 +912,13 @@ def dump_clone_partitions(
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     sparse_chunk_size = 1024 * 1024
-    tmp_dir = output_dir.parent / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=tmp_dir, prefix=f"build-{build.id}-", suffix=".raw", delete=False) as raw_tmp:
-        raw_path = Path(raw_tmp.name)
+    nbd_device = _attach_qcow2_to_nbd(qcow2_path=qcow2_disk_path)
 
     try:
-        _convert_qcow2_to_raw(qcow2_path=qcow2_disk_path, raw_path=raw_path)
-        table = _partition_table_from_raw(raw_path)
+        table = _partition_table_from_device(nbd_device)
         partition_manifest: list[dict[str, object]] = []
 
-        with raw_path.open("rb") as raw_handle:
+        with nbd_device.open("rb") as raw_handle:
             for partition in table["partitions"]:
                 number = int(partition["number"])
                 start = int(partition["start_byte"])
@@ -691,7 +995,7 @@ def dump_clone_partitions(
         (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         return output_dir
     finally:
-        raw_path.unlink(missing_ok=True)
+        _detach_nbd(nbd_device)
 
 
 def save_clone_release(*, dump_dir: Path, output_path: Path) -> Path:
@@ -898,15 +1202,6 @@ def generate_artifacts(
     while f"{build.created_at.strftime('%Y-%m-%d') if build.created_at else 'unknown'}-build-{build.id}-{generation}" in existing_batches:
         generation += 1
     release_group, release_label = _artifact_release_metadata(build=build, generation=generation)
-    if build.output_pxe:
-        pxe_dir = _write_pxe_bundle(
-            build=build,
-            out_dir=build_dir / "pxe",
-            clone_payload_dir=build_dir / "clone-release",
-        )
-        pxe_tar = _archive_directory(source_dir=pxe_dir, output_path=build_dir / "pxe.tar.gz")
-        created.append((BuildArtifact.TYPE_PXE, pxe_tar))
-
     if build.output_usb_img:
         usb_bundle_path = build_dir / "usb"
         _write_usb_bundle(
@@ -924,12 +1219,21 @@ def generate_artifacts(
         )
         created.append((BuildArtifact.TYPE_USB, usb_image_path))
 
+    if build.output_pxe:
+        pxe_dir = _write_pxe_bundle(
+            build=build,
+            out_dir=build_dir / "pxe",
+            clone_payload_dir=build_dir / "clone-release",
+        )
+        pxe_tar = _archive_directory(source_dir=pxe_dir, output_path=build_dir / "pxe.tar.gz")
+        created.append((BuildArtifact.TYPE_PXE, pxe_tar))
+
     for artifact_type, file_path in created:
         compressed = False
         actual_path = file_path
         checksum_path = file_path / "manifest.json" if file_path.is_dir() else file_path
 
-        if compress:
+        if compress and artifact_type != BuildArtifact.TYPE_USB:
             if file_path.is_file():
                 file_name = file_path.name.lower()
                 already_compressed = file_name.endswith((".gz", ".tgz", ".xz", ".bz2", ".zip"))

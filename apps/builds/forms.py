@@ -364,6 +364,7 @@ class BuildDefinitionForm(forms.ModelForm):
 
         order_json = (cleaned.get("playbook_order_json") or "").strip()
         cleaned["ordered_playbook_ids"] = []
+        cleaned["ordered_playbook_payload"] = []
         if order_json:
             try:
                 payload = json.loads(order_json)
@@ -373,13 +374,16 @@ class BuildDefinitionForm(forms.ModelForm):
                 raise forms.ValidationError("Playbook ordering payload must be a list")
 
             ids: list[int] = []
+            rows: list[dict[str, object]] = []
             for item in payload:
                 if not isinstance(item, dict) or "id" not in item:
                     raise forms.ValidationError("Playbook ordering payload is malformed")
                 try:
-                    ids.append(int(item["id"]))
+                    playbook_id = int(item["id"])
                 except (TypeError, ValueError):
                     raise forms.ValidationError("Playbook ordering payload contains invalid IDs")
+                ids.append(playbook_id)
+                rows.append({"id": playbook_id, "run_mode": BuildPlaybookSelection.RUN_MODE_NON_CHROOT})
 
             existing = set(Playbook.objects.filter(id__in=ids, is_active=True).values_list("id", flat=True))
             missing = [str(v) for v in ids if v not in existing]
@@ -387,6 +391,7 @@ class BuildDefinitionForm(forms.ModelForm):
                 raise forms.ValidationError(f"Unknown playbook IDs in ordering payload: {', '.join(missing)}")
 
             cleaned["ordered_playbook_ids"] = ids
+            cleaned["ordered_playbook_payload"] = rows
 
         afterburner_json = (cleaned.get("afterburner_order_json") or "").strip()
         cleaned["ordered_afterburner_ids"] = []

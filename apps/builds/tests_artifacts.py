@@ -8,7 +8,7 @@ from unittest.mock import patch
 from django.test import TestCase
 
 from apps.afterburners.models import AfterburnerItem, AfterburnerProfile, AfterburnerScriptInput
-from apps.builds.models import BuildDefinition, BuildMachineConfig
+from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
 from apps.builds.services.artifacts import (
     ArtifactExportError,
     dump_clone_partitions,
@@ -185,7 +185,9 @@ class ArtifactGenerationTests(TestCase):
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
         self.assertIn("wait for enter", script)
         self.assertIn("Press Enter to continue", script)
-        self.assertIn("read -r _ < /dev/console || true", script)
+        self.assertIn("wait_for_enter()", script)
+        self.assertIn("DEPLOY_INPUT_TTY", script)
+        self.assertIn("Press Enter to continue and reboot the restored system.", script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
     @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
@@ -223,6 +225,40 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn('grub2-mkpasswd-pbkdf2', script)
         self.assertIn('password_pbkdf2 $GRUB_USER $GRUB_PW_HASH', script)
         self.assertIn('chmod 600 "$GRUB_USER_CFG"', script)
+
+    @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
+    @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
+    @patch("apps.builds.services.artifacts._write_usb_image_from_bundle")
+    @patch("apps.builds.services.artifacts._extract_boot_assets_from_iso")
+    def test_generate_artifacts_leaves_usb_uncompressed(self, mock_extract, _mock_write_usb, _mock_iso_tree, mock_uefi):
+        self.build.output_usb_img = True
+        self.build.save(update_fields=["output_usb_img"])
+
+        root = Path("/tmp/tuxwsmaker-test-usb-no-second-compress")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        kernel = root / "fake-vmlinuz"
+        initrd = root / "fake-initrd"
+        kernel.write_text("k", encoding="utf-8")
+        initrd.write_text("i", encoding="utf-8")
+        mock_extract.return_value = (kernel, initrd)
+        shim_path = root / "shimx64.efi"
+        shim_path.write_bytes(b"shim")
+        mock_uefi.return_value = [shim_path]
+
+        def fake_usb_image(*, bundle_dir, output_path, build_name, source_iso_path=None, build_boot_mode=None):
+            output_path.write_bytes(b"usb-image")
+            return output_path
+
+        _mock_write_usb.side_effect = fake_usb_image
+
+        generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=True)
+
+        usb_artifact = BuildArtifact.objects.get(build=self.build, artifact_type=BuildArtifact.TYPE_USB)
+        self.assertTrue(usb_artifact.file_path.endswith("usb.img"))
+        self.assertFalse(usb_artifact.compressed)
+        self.assertTrue(Path(usb_artifact.file_path).exists())
 
     def test_deploy_restore_script_includes_temporary_repository_hooks_before_afterburner(self):
         repo = PackageRepository.objects.create(
@@ -467,15 +503,19 @@ class ArtifactGenerationTests(TestCase):
         generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
 
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
-        self.assertIn('TPM2_POLICY_B64=', script)
-        self.assertIn('TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"', script)
         self.assertIn("discover_tpm_luks_devices", script)
         self.assertIn('"$TARGET_ROOT/etc/crypttab"', script)
         self.assertIn("TPM LUKS autodetect is ambiguous", script)
         self.assertIn("TPM_AUTODETECT_OUTPUT", script)
-        self.assertIn('clevis luks bind -y -k - -d "$container_dev" tpm2 "$TPM2_POLICY"', script)
-        self.assertIn('clevis luks list -d "$container_dev"', script)
+        self.assertIn('TPM2_POLICY_B64_CANDIDATES=(', script)
+        self.assertIn('for TPM2_POLICY_B64 in "${TPM2_POLICY_B64_CANDIDATES[@]}"; do', script)
+        self.assertIn('TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"', script)
+        self.assertIn('run_chroot command -v clevis-pin-tpm2 >/dev/null 2>&1', script)
+        self.assertIn('_clevis_tmpkey_chroot="/tmp/${_clevis_tmpkey##*/}"', script)
+        self.assertIn('run_chroot clevis luks bind -y -k "$_clevis_tmpkey_chroot" -d "$container_dev" tpm2 "$TPM2_POLICY"', script)
+        self.assertIn('run_chroot clevis luks list -d "$container_dev"', script)
         self.assertIn('cryptsetup luksRemoveKey "$container_dev" -', script)
+        self.assertIn('No TPM device found (/dev/tpmrm0 or /dev/tpm0); skipping TPM integration', script)
         self.assertIn('run_chroot dracut -q -f --regenerate-all', script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
@@ -515,8 +555,7 @@ class ArtifactGenerationTests(TestCase):
         generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
 
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
-        self.assertIn('TPM2_POLICY_B64=', script)
-        self.assertIn('TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"', script)
+        self.assertIn('TPM2_POLICY_B64_CANDIDATES=(', script)
         self.assertNotIn('"pcr_ids":', script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
@@ -579,6 +618,11 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("MBR boot code area is empty", restore_script)
         self.assertIn("Source image boot mode", restore_script)
         self.assertIn("does not match target firmware mode", restore_script)
+        self.assertIn('REQUIRED_SECTORS="$(python3 - "$WORK_DIR/clone-manifest.json" <<\'PY\'', restore_script)
+        self.assertIn('awk -v required="$REQUIRED_SECTORS"', restore_script)
+        self.assertIn('Could not find target disk large enough for restore', restore_script)
+        self.assertIn('prompt_write "[deploy] Multiple candidate disks detected for restore. Choose the target disk:"', restore_script)
+        self.assertIn('Selected disk is too small for restore', restore_script)
         self.assertIn("afterburner.sh", restore_script)
         self.assertIn("DEPLOY_MANIFEST_URL=file:///run/install/repo/deploy.json", deploy_kickstart)
         self.assertIn("%pre --erroronfail", deploy_kickstart)
@@ -747,9 +791,10 @@ class ArtifactGenerationTests(TestCase):
 
         mock_run_checked.assert_not_called()
 
-    @patch("apps.builds.services.artifacts._partition_table_from_raw")
-    @patch("apps.builds.services.artifacts._convert_qcow2_to_raw")
-    def test_dump_clone_partitions_writes_deploy_metadata(self, mock_convert, mock_table):
+    @patch("apps.builds.services.artifacts._detach_nbd")
+    @patch("apps.builds.services.artifacts._partition_table_from_device")
+    @patch("apps.builds.services.artifacts._attach_qcow2_to_nbd")
+    def test_dump_clone_partitions_writes_deploy_metadata(self, mock_attach, mock_table, mock_detach):
         root = Path("/tmp/tuxwsmaker-test-clone-release")
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
@@ -757,6 +802,7 @@ class ArtifactGenerationTests(TestCase):
         PartitionEntry.objects.create(
             layout=self.build.partition_layout,
             order=1,
+            partition_number=3,
             name="EFI",
             mount_point="/boot/efi",
             filesystem="efi",
@@ -767,6 +813,7 @@ class ArtifactGenerationTests(TestCase):
         PartitionEntry.objects.create(
             layout=self.build.partition_layout,
             order=2,
+            partition_number=4,
             name="root",
             mount_point="/",
             filesystem="xfs",
@@ -775,10 +822,9 @@ class ArtifactGenerationTests(TestCase):
             luks_name="rootfs",
         )
 
-        def fake_convert(*, qcow2_path, raw_path):
-            raw_path.write_bytes(b"ABCDEFGH")
-
-        mock_convert.side_effect = fake_convert
+        fake_device = root / "nbd0"
+        fake_device.write_bytes(b"ABCDEFGH")
+        mock_attach.return_value = fake_device
         mock_table.return_value = {
             "table_type": "gpt",
             "disk_size_bytes": 8,
@@ -800,12 +846,33 @@ class ArtifactGenerationTests(TestCase):
         self.assertEqual(manifest["operating_system"]["family"], OperatingSystem.FAMILY_RHEL)
         self.assertEqual(manifest["deploy"]["strategy"], "partition_restore")
         self.assertEqual(manifest["deploy"]["advanced_layout_mode"], "safe-resize-only")
-        self.assertEqual(manifest["deploy"]["boot"]["boot_entry_orders"], [1])
+        self.assertEqual(manifest["deploy"]["boot"]["boot_entry_orders"], [3])
         self.assertEqual(manifest["deploy"]["mount_map"][0]["mount_point"], "/boot/efi")
+        self.assertEqual(manifest["deploy"]["mount_map"][0]["partition_number"], 3)
         self.assertTrue(manifest["deploy"]["mount_map"][1]["luks_enabled"])
         self.assertEqual(manifest["partitions"][0]["payload_format"], "sparse-extents-v1")
         self.assertIn("extents_file", manifest["partitions"][0])
         self.assertIn("payload_size_bytes", manifest["partitions"][0])
+        mock_detach.assert_called_once_with(fake_device)
+
+    def test_nbd_device_candidates_ignore_partition_nodes(self):
+        root = Path("/tmp/tuxwsmaker-test-nbd-candidates")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        with patch("apps.builds.services.artifacts.Path.glob") as mock_glob, patch("apps.builds.services.artifacts.Path.exists") as mock_exists:
+            mock_glob.return_value = [
+                Path("/sys/class/block/nbd0"),
+                Path("/sys/class/block/nbd0p4"),
+                Path("/sys/class/block/nbd12"),
+            ]
+            mock_exists.return_value = True
+
+            from apps.builds.services.artifacts import _nbd_device_candidates
+
+            candidates = _nbd_device_candidates()
+
+        self.assertEqual([str(path) for path in candidates], ["/dev/nbd0", "/dev/nbd12"])
 
     def test_render_deploy_restore_script_handles_encrypted_pv_and_lv_mounts(self):
         root = Path("/tmp/tuxwsmaker-test-restore-script-lvm")
@@ -820,19 +887,45 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn('ROOT_DEV="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"', script)
         self.assertIn('source_dev="$(resolve_lv_path "$volume_group" "$logical_volume" || true)"', script)
         self.assertIn('resolve_lv_path() {', script)
+        self.assertIn('dmsetup mknodes >/dev/null 2>&1 || true', script)
+        self.assertIn('mapper_path="/dev/mapper/${mapper_vg}-${mapper_lv}"', script)
+        self.assertIn('ROOT_ENTRY_FOUND=0', script)
+        self.assertIn('ERROR: Root device could not be resolved from deploy metadata', script)
         self.assertIn('str(entry.get("size_mode") or "fixed")', script)
         self.assertIn('DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"', script)
         self.assertIn('cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -', script)
-        self.assertIn('restore_target="/dev/mapper/$map_name"', script)
+        self.assertIn('restore_partition_payload_to "/dev/mapper/$map_name"', script)
+        self.assertIn('restore_target="$part_dev"', script)
+        self.assertIn('No LUKS header detected on $part_dev; bootstrapping LUKS and replaying payload', script)
+        self.assertIn('restore_partition_payload_to() {', script)
+        self.assertIn('sgdisk -e "$TARGET_DEV" >/dev/null 2>&1 || true', script)
+        self.assertIn('TARGET_SECTORS="$(blockdev --getsz "$TARGET_DEV"', script)
+        self.assertIn('disk_total = max(default_total, int((clone.get("disk_size_bytes") or 0) // sector), target_sectors)', script)
+        self.assertIn('REQUIRED_SECTORS="$(python3 - "$WORK_DIR/clone-manifest.json" <<\'PY\'', script)
+        self.assertIn('prompt_for_install_disk() {', script)
+        self.assertIn('if [[ ${#disk_rows[@]} -eq 1 ]]; then', script)
+        self.assertIn('Multiple candidate disks detected for restore', script)
+        self.assertIn('prompt_read_line "[deploy] Select a disk number: " 300 choice', script)
+        self.assertIn('TARGET_DISK="${TARGET_DISK#/dev/}"', script)
+        self.assertIn('status "Expanding remainder PV containers"', script)
+        self.assertIn('[[ "$entry_role" == "pv" && "$size_mode" == "remainder" ]]', script)
+        self.assertIn('cryptsetup resize "$map_name" >/dev/null 2>&1 || true', script)
+        self.assertIn('pvresize "$pv_target" >/dev/null 2>&1 || true', script)
         self.assertIn('[[ "$entry_role" == "lv" && "$size_mode" == "remainder" ]]', script)
         self.assertIn('lvextend -l +100%FREE "$lv_path"', script)
         self.assertIn('case "$fs_type" in', script)
         self.assertIn('xfs_growfs "$grow_target"', script)
 
+    @patch("apps.builds.services.artifacts._iso_has_rr_path")
     @patch("apps.builds.services.artifacts._run_checked")
     @patch("apps.builds.services.artifacts.shutil.which")
-    def test_write_usb_image_uses_xorriso_replay_for_uefi(self, mock_which, mock_run_checked):
+    def test_write_usb_image_uses_xorriso_replay_for_uefi(self, mock_which, mock_run_checked, mock_iso_has_rr_path):
         mock_which.side_effect = lambda tool: "/usr/bin/xorriso" if tool == "xorriso" else "/usr/bin/grub-mkrescue"
+        mock_iso_has_rr_path.side_effect = lambda *, iso_path, rr_path: rr_path in {
+            "/BaseOS",
+            "/AppStream",
+            "/images/install.img",
+        }
 
         root = Path("/tmp/tuxwsmaker-test-usb-uefi-xorriso")
         shutil.rmtree(root, ignore_errors=True)
@@ -870,7 +963,39 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("-rm_r", cmd)
         self.assertIn("/BaseOS", cmd)
         self.assertIn("/AppStream", cmd)
+        self.assertIn("-rm", cmd)
+        self.assertIn("/images/install.img", cmd)
+        self.assertNotIn("/images/product.img", cmd)
+        self.assertNotIn("/images/updates.img", cmd)
         self.assertIn("--", cmd)
+
+    @patch("apps.builds.services.artifacts._iso_has_rr_path")
+    @patch("apps.builds.services.artifacts._run_checked")
+    @patch("apps.builds.services.artifacts.shutil.which")
+    def test_write_usb_image_recreates_existing_outdev_for_uefi(self, mock_which, mock_run_checked, mock_iso_has_rr_path):
+        mock_which.side_effect = lambda tool: "/usr/bin/xorriso" if tool == "xorriso" else "/usr/bin/grub-mkrescue"
+        mock_iso_has_rr_path.return_value = False
+
+        root = Path("/tmp/tuxwsmaker-test-usb-uefi-recreate-outdev")
+        shutil.rmtree(root, ignore_errors=True)
+        bundle_dir = root / "usb"
+        (bundle_dir / "boot").mkdir(parents=True, exist_ok=True)
+        output_path = root / "usb.img"
+        output_path.write_bytes(b"stale-image")
+        source_iso_path = root / "rhel-10.2-x86_64-dvd.iso"
+        source_iso_path.write_bytes(b"iso")
+
+        _write_usb_image_from_bundle(
+            bundle_dir=bundle_dir,
+            output_path=output_path,
+            build_name=self.build.name,
+            source_iso_path=source_iso_path,
+            build_boot_mode="uefi",
+        )
+
+        self.assertFalse(output_path.exists())
+        cmd = mock_run_checked.call_args.args[0]
+        self.assertIn(str(output_path), cmd)
 
     @patch("apps.builds.services.artifacts._run_checked")
     @patch("apps.builds.services.artifacts.shutil.which")

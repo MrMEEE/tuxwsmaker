@@ -55,6 +55,29 @@
   .tpm-pcr-row select {
     max-width: 140px;
   }
+
+  .question-drag-handle {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid #cfd6df;
+    border-radius: 6px;
+    background: linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%);
+    cursor: grab;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .question-drag-handle:active {
+    cursor: grabbing;
+  }
+
+  .question-row-dragging {
+    opacity: 0.75;
+    border-color: #6ea8fe;
+    background: #f8fbff;
+  }
 </style>
 
 <div class="d-flex justify-content-between align-items-center mb-3">
@@ -91,57 +114,19 @@
             <button class="drag-handle" type="button" title="Drag to reorder" aria-label="Drag to reorder" data-drag-handle draggable="true"><span class="drag-handle-dots" aria-hidden="true"></span></button>
           </td>
           <td data-order-cell>{{ item.order }}</td>
-          <td><span class="badge text-bg-light border">{{ item.get_item_type_display }}</span></td>
+          <td>
+            <span class="badge text-bg-light border">{{ item.get_item_type_display }}</span>
+            {% if item.item_type == 'custom_script' and item.name and item.name != item.get_item_type_display %}
+            <span class="ms-2 text-muted">{{ item.name }}</span>
+            {% endif %}
+          </td>
           <td class="text-end">
             <div class="d-inline-flex gap-2">
                 <button class="btn btn-sm btn-outline-primary" type="button" data-bs-toggle="modal" data-bs-target="#editItemModal-{{ item.id }}">Edit</button>
-              {% if item.item_type == 'custom_script' %}
-              <a class="btn btn-sm btn-outline-info" href="{% url 'afterburners:input-create' item.pk %}">Add Input</a>
-              {% endif %}
               <form method="post" action="{% url 'afterburners:item-delete' item.pk %}" data-confirm-message="Delete this afterburner item?" data-confirm-title="Delete Item" data-confirm-accept="Delete" data-confirm-class="btn-danger">{% csrf_token %}<button class="btn btn-sm btn-outline-danger" type="submit">Delete</button></form>
             </div>
           </td>
         </tr>
-        {% if item.item_type == 'custom_script' %}
-        <tr>
-          <td></td>
-          <td colspan="3">
-            <div class="small text-muted mb-2">Custom Inputs</div>
-            <div class="script-inputs-container" data-script-input-container>
-              <form method="post" action="{% url 'afterburners:input-reorder' item.pk %}" class="d-none" data-script-input-reorder-form>
-                {% csrf_token %}
-                <input type="hidden" name="ordered_ids" value="" data-script-input-ordered-ids>
-              </form>
-            <table class="table table-sm table-bordered" data-script-input-table>
-              <thead>
-                <tr><th style="width: 70px">Drag</th><th>Order</th><th>Key</th><th>Label</th><th>Type</th><th>Required</th><th>Default</th><th class="text-end">Actions</th></tr>
-              </thead>
-              <tbody>
-                {% for row in item.script_inputs.all %}
-                <tr class="script-input-row" data-input-id="{{ row.id }}">
-                  <td class="text-center"><button class="drag-handle" type="button" title="Drag to reorder" aria-label="Drag to reorder" data-input-drag-handle draggable="true"><span class="drag-handle-dots" aria-hidden="true"></span></button></td>
-                  <td data-input-order-cell>{{ row.order }}</td>
-                  <td><code>{{ row.key }}</code></td>
-                  <td>{{ row.label }}</td>
-                  <td>{{ row.get_input_type_display }}</td>
-                  <td>{% if row.required %}Yes{% else %}No{% endif %}</td>
-                  <td>{{ row.default_value|default:'-' }}</td>
-                  <td class="text-end">
-                    <div class="d-inline-flex gap-1">
-                      <a class="btn btn-sm btn-outline-primary" href="{% url 'afterburners:input-edit' row.pk %}">Edit</a>
-                      <form method="post" action="{% url 'afterburners:input-delete' row.pk %}" data-confirm-message="Delete this script input?" data-confirm-title="Delete Script Input" data-confirm-accept="Delete" data-confirm-class="btn-danger">{% csrf_token %}<button class="btn btn-sm btn-outline-danger" type="submit">Delete</button></form>
-                    </div>
-                  </td>
-                </tr>
-                {% empty %}
-                <tr><td colspan="8" class="text-muted">No custom inputs configured.</td></tr>
-                {% endfor %}
-              </tbody>
-            </table>
-            </div>
-          </td>
-        </tr>
-        {% endif %}
       </tbody>
       {% empty %}
       <tbody>
@@ -243,6 +228,15 @@
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="custom_script">
+            <div class="col-md-6">{{ item.edit_form.custom_name.label_tag }}{{ item.edit_form.custom_name }}</div>
+            <div class="col-md-6">{{ item.edit_form.script_run_mode.label_tag }}{{ item.edit_form.script_run_mode }}</div>
+            <div class="col-12">
+              {{ item.edit_form.script_questions_json }}
+              <label class="form-label">Questions</label>
+              <div class="d-grid gap-2" data-script-questions-container></div>
+              <button type="button" class="btn btn-sm btn-outline-secondary mt-2" data-script-question-add>Add Question</button>
+              <div class="form-text">Each question asks the operator and exports an environment variable for your script.</div>
+            </div>
             <div class="col-12">{{ item.edit_form.script_body.label_tag }}{{ item.edit_form.script_body }}</div>
             <div class="col-12"><div class="form-text">The script runs on the target system during restore. Any custom script inputs become environment variables you can read in your shell script.</div></div>
             <div class="col-12">
@@ -355,6 +349,15 @@
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="custom_script">
+            <div class="col-md-6">{{ item_create_form.custom_name.label_tag }}{{ item_create_form.custom_name }}</div>
+            <div class="col-md-6">{{ item_create_form.script_run_mode.label_tag }}{{ item_create_form.script_run_mode }}</div>
+            <div class="col-12">
+              {{ item_create_form.script_questions_json }}
+              <label class="form-label">Questions</label>
+              <div class="d-grid gap-2" data-script-questions-container></div>
+              <button type="button" class="btn btn-sm btn-outline-secondary mt-2" data-script-question-add>Add Question</button>
+              <div class="form-text">Each question asks the operator and exports an environment variable for your script.</div>
+            </div>
             <div class="col-12">{{ item_create_form.script_body.label_tag }}{{ item_create_form.script_body }}</div>
             <div class="col-12"><div class="form-text">The script runs on the target system during restore. Any custom script inputs become environment variables you can read in your shell script.</div></div>
             <div class="col-12">
@@ -482,6 +485,139 @@
       });
     }
 
+    function initCustomScriptQuestions(form) {
+      const hiddenField = form.querySelector('input[name$="script_questions_json"]');
+      const container = form.querySelector('[data-script-questions-container]');
+      const addButton = form.querySelector('[data-script-question-add]');
+      if (!hiddenField || !container || !addButton) {
+        return;
+      }
+
+      function safeParse(value) {
+        if (!value) {
+          return [];
+        }
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (_error) {
+          return [];
+        }
+      }
+
+      function syncHiddenField() {
+        const rows = Array.from(container.querySelectorAll('[data-script-question-row]')).map((row) => {
+          const name = row.querySelector('[data-question-name]')?.value?.trim() || '';
+          const question = row.querySelector('[data-question-text]')?.value?.trim() || '';
+          const envVar = row.querySelector('[data-question-env]')?.value?.trim() || '';
+          return { name, question, env_var: envVar };
+        }).filter((row) => row.name || row.question || row.env_var);
+        hiddenField.value = JSON.stringify(rows);
+      }
+
+      function buildQuestionRow(initial) {
+        const row = document.createElement('div');
+        row.className = 'border rounded p-2';
+        row.setAttribute('data-script-question-row', 'true');
+        row.setAttribute('draggable', 'true');
+
+        const rowInner = document.createElement('div');
+        rowInner.className = 'row g-2 align-items-end';
+
+        const colDrag = document.createElement('div');
+        colDrag.className = 'col-md-1';
+        colDrag.innerHTML = '<label class="form-label mb-1">Order</label><div><button type="button" class="question-drag-handle" title="Drag to reorder" aria-label="Drag to reorder"><span class="drag-handle-dots" aria-hidden="true"></span></button></div>';
+
+        const colName = document.createElement('div');
+        colName.className = 'col-md-3';
+        colName.innerHTML = '<label class="form-label mb-1">Name</label><input type="text" class="form-control" data-question-name>'; 
+
+        const colQuestion = document.createElement('div');
+        colQuestion.className = 'col-md-5';
+        colQuestion.innerHTML = '<label class="form-label mb-1">Question</label><input type="text" class="form-control" data-question-text>'; 
+
+        const colEnv = document.createElement('div');
+        colEnv.className = 'col-md-3';
+        colEnv.innerHTML = '<label class="form-label mb-1">Environment Variable Name</label><input type="text" class="form-control" data-question-env placeholder="TEAM_NAME">';
+
+        const colActions = document.createElement('div');
+        colActions.className = 'col-12 text-end';
+        const removeButton = document.createElement('button');
+        removeButton.type = 'button';
+        removeButton.className = 'btn btn-sm btn-outline-danger';
+        removeButton.textContent = 'Remove';
+        removeButton.addEventListener('click', () => {
+          row.remove();
+          syncHiddenField();
+        });
+        colActions.appendChild(removeButton);
+
+        rowInner.appendChild(colDrag);
+        rowInner.appendChild(colName);
+        rowInner.appendChild(colQuestion);
+        rowInner.appendChild(colEnv);
+        rowInner.appendChild(colActions);
+        row.appendChild(rowInner);
+
+        const nameInput = row.querySelector('[data-question-name]');
+        const questionInput = row.querySelector('[data-question-text]');
+        const envInput = row.querySelector('[data-question-env]');
+        nameInput.value = initial?.name || '';
+        questionInput.value = initial?.question || '';
+        envInput.value = initial?.env_var || '';
+
+        [nameInput, questionInput, envInput].forEach((input) => {
+          input.addEventListener('input', syncHiddenField);
+        });
+
+        return row;
+      }
+
+      function attachDragHandlers(row) {
+        row.addEventListener('dragstart', () => {
+          row.classList.add('question-row-dragging');
+        });
+
+        row.addEventListener('dragend', () => {
+          row.classList.remove('question-row-dragging');
+          syncHiddenField();
+        });
+
+        row.addEventListener('dragover', (event) => {
+          event.preventDefault();
+          const dragging = container.querySelector('.question-row-dragging');
+          if (!dragging || dragging === row) {
+            return;
+          }
+          const rect = row.getBoundingClientRect();
+          const before = (event.clientY - rect.top) < (rect.height / 2);
+          container.insertBefore(dragging, before ? row : row.nextElementSibling);
+        });
+
+        return row;
+      }
+
+      const initialRows = safeParse(hiddenField.value);
+      initialRows.forEach((row) => {
+        const rowEl = buildQuestionRow(row);
+        attachDragHandlers(rowEl);
+        container.appendChild(rowEl);
+      });
+
+      addButton.addEventListener('click', () => {
+        const rowEl = buildQuestionRow({ name: '', question: '', env_var: '' });
+        attachDragHandlers(rowEl);
+        container.appendChild(rowEl);
+        syncHiddenField();
+      });
+
+      form.addEventListener('submit', () => {
+        syncHiddenField();
+      });
+
+      syncHiddenField();
+    }
+
     forms.forEach((form) => {
       const typeSelect = form.querySelector('select[name$="item_type"]');
       if (!typeSelect) {
@@ -515,6 +651,7 @@
         });
       }
       initTpmPcrEditor(form);
+      initCustomScriptQuestions(form);
       updateTypeSections();
     });
 
@@ -601,80 +738,6 @@
       });
     });
 
-    const inputContainers = Array.from(document.querySelectorAll('[data-script-input-container]'));
-    inputContainers.forEach((container) => {
-      const reorderFormEl = container.querySelector('[data-script-input-reorder-form]');
-      const orderedIdsEl = container.querySelector('[data-script-input-ordered-ids]');
-      const rows = Array.from(container.querySelectorAll('tr.script-input-row[data-input-id]'));
-      let draggingRow = null;
-      let moved = false;
-
-      function refreshInputOrderNumbers() {
-        const activeRows = Array.from(container.querySelectorAll('tr.script-input-row[data-input-id]'));
-        activeRows.forEach((row, idx) => {
-          const orderCell = row.querySelector('[data-input-order-cell]');
-          if (orderCell) {
-            orderCell.textContent = String(idx + 1);
-          }
-        });
-      }
-
-      function submitInputReorder() {
-        if (!reorderFormEl || !orderedIdsEl) {
-          return;
-        }
-        const ids = Array.from(container.querySelectorAll('tr.script-input-row[data-input-id]'))
-          .map((row) => row.dataset.inputId)
-          .filter((value) => value);
-        orderedIdsEl.value = ids.join(',');
-        reorderFormEl.submit();
-      }
-
-      function moveRowFromPointer(event, targetRow) {
-        if (!draggingRow || !targetRow || draggingRow === targetRow) {
-          return;
-        }
-        const tbody = targetRow.closest('tbody');
-        const rect = targetRow.getBoundingClientRect();
-        const insertBefore = (event.clientY - rect.top) < (rect.height / 2);
-        tbody.insertBefore(draggingRow, insertBefore ? targetRow : targetRow.nextElementSibling);
-        moved = true;
-        refreshInputOrderNumbers();
-      }
-
-      rows.forEach((row) => {
-        const handle = row.querySelector('[data-input-drag-handle]');
-        if (!handle) {
-          return;
-        }
-
-        handle.addEventListener('dragstart', () => {
-          draggingRow = row;
-          moved = false;
-          row.classList.add('table-active');
-        });
-
-        handle.addEventListener('dragend', () => {
-          if (draggingRow) {
-            draggingRow.classList.remove('table-active');
-          }
-          draggingRow = null;
-          if (moved) {
-            submitInputReorder();
-          }
-        });
-
-        row.addEventListener('dragover', (event) => {
-          event.preventDefault();
-          moveRowFromPointer(event, row);
-        });
-
-        row.addEventListener('drop', (event) => {
-          event.preventDefault();
-          moveRowFromPointer(event, row);
-        });
-      });
-    });
   })();
 </script>
 {% endblock %}
