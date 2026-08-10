@@ -329,24 +329,31 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         prompt_repositories = bool(cfg.get("prompt_repositories") or False)
         if prompt_credentials:
             credentials_block = (
-                "prompt_bool RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\"\n"
-                "if [[ \"$RHSM_USE_ACTIVATION_KEY\" == \"yes\" ]]; then\n"
-                "  prompt_text RHSM_ORG_ID \"Organization ID\" \"\"\n"
-                "  prompt_text RHSM_ACTIVATION_KEY \"Activation key\" \"\"\n"
-                "  if [[ -z \"${RHSM_ORG_ID:-}\" || -z \"${RHSM_ACTIVATION_KEY:-}\" ]]; then\n"
-                "    echo \"Org ID and activation key are required\" >&2\n"
-                "    exit 1\n"
+                "while true; do\n"
+                "  prompt_bool RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\"\n"
+                "  if [[ \"$RHSM_USE_ACTIVATION_KEY\" == \"yes\" ]]; then\n"
+                "    prompt_text RHSM_ORG_ID \"Organization ID\" \"\"\n"
+                "    prompt_text RHSM_ACTIVATION_KEY \"Activation key\" \"\"\n"
+                "    if [[ -z \"${RHSM_ORG_ID:-}\" || -z \"${RHSM_ACTIVATION_KEY:-}\" ]]; then\n"
+                "      echo \"Org ID and activation key are required\" >&2\n"
+                "      continue\n"
+                "    fi\n"
+                "    if run_chroot subscription-manager register --force --org \"$RHSM_ORG_ID\" --activationkey \"$RHSM_ACTIVATION_KEY\"; then\n"
+                "      break\n"
+                "    fi\n"
+                "  else\n"
+                "    prompt_text RHSM_USERNAME \"Red Hat username\" \"\"\n"
+                "    prompt_password RHSM_PASSWORD \"Red Hat password\"\n"
+                "    if [[ -z \"${RHSM_USERNAME:-}\" || -z \"${RHSM_PASSWORD:-}\" ]]; then\n"
+                "      echo \"Username and password are required\" >&2\n"
+                "      continue\n"
+                "    fi\n"
+                "    if run_chroot subscription-manager register --force --username \"$RHSM_USERNAME\" --password \"$RHSM_PASSWORD\"; then\n"
+                "      break\n"
+                "    fi\n"
                 "  fi\n"
-                "  run_chroot subscription-manager register --force --org \"$RHSM_ORG_ID\" --activationkey \"$RHSM_ACTIVATION_KEY\"\n"
-                "else\n"
-                "  prompt_text RHSM_USERNAME \"Red Hat username\" \"\"\n"
-                "  prompt_password RHSM_PASSWORD \"Red Hat password\"\n"
-                "  if [[ -z \"${RHSM_USERNAME:-}\" || -z \"${RHSM_PASSWORD:-}\" ]]; then\n"
-                "    echo \"Username and password are required\" >&2\n"
-                "    exit 1\n"
-                "  fi\n"
-                "  run_chroot subscription-manager register --force --username \"$RHSM_USERNAME\" --password \"$RHSM_PASSWORD\"\n"
-                "fi\n"
+                "  echo \"Red Hat registration failed. Try again.\" >&2\n"
+                "done\n"
             )
         elif default_org_id and default_activation_key:
             credentials_block = (
@@ -424,21 +431,47 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         if pcr_ids:
             tpm_policy_payload["pcr_ids"] = ",".join(pcr_ids)
 
-        tpm_policy = json.dumps(tpm_policy_payload, separators=(",", ":"))
-        tpm_policy_b64 = base64.b64encode(tpm_policy.encode("utf-8")).decode("ascii")
+        policy_candidates: list[dict[str, str]] = [tpm_policy_payload]
+        relaxed_policy: dict[str, str] = {}
+        if tpm_pcr_bank:
+            relaxed_policy["pcr_bank"] = tpm_pcr_bank
+        if pcr_ids:
+            relaxed_policy["pcr_ids"] = ",".join(pcr_ids)
+        if relaxed_policy:
+            policy_candidates.append(relaxed_policy)
+        policy_candidates.append({})
+
+        serialized_candidates: list[str] = []
+        for payload in policy_candidates:
+            encoded = json.dumps(payload, separators=(",", ":"))
+            if encoded not in serialized_candidates:
+                serialized_candidates.append(encoded)
+
+        tpm_policy_candidates_b64 = [
+            base64.b64encode(policy.encode("utf-8")).decode("ascii")
+            for policy in serialized_candidates
+        ]
+        tpm_policy_candidates_shell = " ".join(_shell_quote(value) for value in tpm_policy_candidates_b64)
 
         return (
             f'echo "[afterburner] {label}: tpm integration"\n'
-            'if ! command -v clevis >/dev/null 2>&1; then\n'
-            '  echo "clevis is not available; skipping TPM integration" >&2\n'
+            'if ! run_chroot command -v clevis >/dev/null 2>&1; then\n'
+            '  echo "clevis is not available in target OS; skipping TPM integration" >&2\n'
+            '  exit 1\n'
+            'fi\n'
+            'if ! run_chroot command -v clevis-pin-tpm2 >/dev/null 2>&1; then\n'
+            '  echo "clevis tpm2 pin is unavailable in target OS; install clevis-pin-tpm2 in the restored image" >&2\n'
             '  exit 1\n'
             'fi\n'
             'if ! command -v cryptsetup >/dev/null 2>&1; then\n'
             '  echo "cryptsetup is not available; skipping TPM integration" >&2\n'
             '  exit 1\n'
             'fi\n'
-            'TPM2_POLICY_B64=' + _shell_quote(tpm_policy_b64) + '\n'
-            'TPM2_POLICY="$(printf %s "$TPM2_POLICY_B64" | base64 -d)"\n'
+            'if [[ ! -c /dev/tpmrm0 && ! -c /dev/tpm0 ]]; then\n'
+            '  echo "No TPM device found (/dev/tpmrm0 or /dev/tpm0); skipping TPM integration"\n'
+            '  exit 0\n'
+            'fi\n'
+            'TPM2_POLICY_B64_CANDIDATES=(' + tpm_policy_candidates_shell + ')\n'
             "discover_tpm_luks_devices() {\n"
             "  resolve_crypttab_source() {\n"
             "    local source_spec=\"$1\"\n"
@@ -523,12 +556,28 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             + "      echo \"Incorrect LUKS password — try again\" >&2\n"
             + "    done\n"
             + "    echo \"Binding clevis TPM2 to: $container_dev\"\n"
-            + "    printf '%s' \"$luks_tpm_pass\" | clevis luks bind -y -k - -d \"$container_dev\" tpm2 \"$TPM2_POLICY\" || {\n"
+            + "    mkdir -p \"$TARGET_ROOT/tmp\"\n"
+            + "    _clevis_tmpkey=$(mktemp \"$TARGET_ROOT/tmp/clevis-key-XXXXXX\")\n"
+            + "    _clevis_tmpkey_chroot=\"/tmp/${_clevis_tmpkey##*/}\"\n"
+            + "    chmod 600 \"$_clevis_tmpkey\"\n"
+            + "    printf '%s' \"$luks_tpm_pass\" > \"$_clevis_tmpkey\"\n"
+            + "    tpm_bind_ok=0\n"
+            + "    for TPM2_POLICY_B64 in \"${TPM2_POLICY_B64_CANDIDATES[@]}\"; do\n"
+            + "      TPM2_POLICY=\"$(printf %s \"$TPM2_POLICY_B64\" | base64 -d)\"\n"
+            + "      if run_chroot clevis luks bind -y -k \"$_clevis_tmpkey_chroot\" -d \"$container_dev\" tpm2 \"$TPM2_POLICY\"; then\n"
+            + "        tpm_bind_ok=1\n"
+            + "        break\n"
+            + "      fi\n"
+            + "      echo \"[afterburner] TPM2 bind attempt failed for policy: $TPM2_POLICY\" >&2\n"
+            + "    done\n"
+            + "    if [[ $tpm_bind_ok -ne 1 ]]; then\n"
             + "      echo \"[afterburner] ERROR: clevis TPM2 bind failed on $container_dev\" >&2\n"
+            + "      rm -f \"$_clevis_tmpkey\"\n"
             + "      continue\n"
-            + "    }\n"
+            + "    fi\n"
+            + "    rm -f \"$_clevis_tmpkey\"\n"
             + "    echo \"Clevis bindings on $container_dev:\"\n"
-            + "    clevis luks list -d \"$container_dev\"\n"
+            + "    run_chroot clevis luks list -d \"$container_dev\"\n"
             + "    printf '%s' \"$luks_tpm_pass\" | cryptsetup luksRemoveKey \"$container_dev\" -\n"
             + "  done\n"
             + "  if run_chroot command -v dracut >/dev/null 2>&1; then\n"
@@ -547,13 +596,17 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         return (
             f'echo "[afterburner] {label}: wait for enter"\n'
             f'printf "%s\\n" {_shell_quote(message)}\n'
-            'read -r _ < /dev/console || true\n'
+            'wait_for_enter "Press Enter to continue and reboot the restored system."\n'
         )
 
     if item.item_type == AfterburnerItem.TYPE_CUSTOM_SCRIPT:
-        script_body = str(cfg.get("script_body") or "").strip()
+        script_body = str(cfg.get("script_body") or "")
+        script_body = script_body.replace("\r\n", "\n").replace("\r", "\n").strip()
+        run_mode = str(cfg.get("run_mode") or "non_chroot").strip().lower()
+        if run_mode not in {"non_chroot", "chroot"}:
+            run_mode = "non_chroot"
         lines = [
-            f'echo "[afterburner] {label}: custom script"',
+            f'echo "[afterburner] {label}: custom script ({run_mode})"',
         ]
         for input_row in item.script_inputs.all().order_by("order", "id"):
             key = input_row.key
@@ -585,15 +638,30 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
                 lines.append(f'if [[ -z "${{{key}:-}}" ]]; then echo "{key} is required" >&2; exit 1; fi')
 
         if script_body:
-            lines.append("cat <<'TUXWS_AFTERBURNER_SCRIPT' > /tmp/tuxws-afterburner-custom.sh")
+            if run_mode == "chroot":
+                script_path = "$TARGET_ROOT/tmp/tuxws-afterburner-custom.sh"
+                invoke_path = "/tmp/tuxws-afterburner-custom.sh"
+            else:
+                script_path = "/tmp/tuxws-afterburner-custom.sh"
+                invoke_path = "/tmp/tuxws-afterburner-custom.sh"
+
+            lines.append(f"cat <<'TUXWS_AFTERBURNER_SCRIPT' > {script_path}")
             lines.append(script_body)
             lines.append("TUXWS_AFTERBURNER_SCRIPT")
-            lines.append("chmod 700 /tmp/tuxws-afterburner-custom.sh")
+            lines.append(f"chmod 700 {script_path}")
             env_export = " ".join([f'{row.key}=\"${{{row.key}:-}}\"' for row in item.script_inputs.all().order_by("order", "id")])
-            if env_export:
-                lines.append(f"env {env_export} bash /tmp/tuxws-afterburner-custom.sh")
+            if run_mode == "chroot":
+                if env_export:
+                    lines.append(f"run_chroot {env_export} bash {invoke_path}")
+                else:
+                    lines.append(f"run_chroot bash {invoke_path}")
+                lines.append(f"rm -f {script_path}")
             else:
-                lines.append("bash /tmp/tuxws-afterburner-custom.sh")
+                if env_export:
+                    lines.append(f"env {env_export} bash {invoke_path}")
+                else:
+                    lines.append(f"bash {invoke_path}")
+                lines.append(f"rm -f {script_path}")
         else:
             lines.append("echo 'No custom script body configured; skipping.'")
 
@@ -660,6 +728,27 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "    *) value=\"no\" ;;",
         "  esac",
         "  printf -v \"$var_name\" '%s' \"$value\"",
+        "}",
+        "",
+        "wait_for_enter() {",
+        "  local prompt=\"${1:-Press Enter to continue.}\"",
+        "  if [[ -n \"${DEPLOY_INPUT_TTY:-}\" && -c \"${DEPLOY_INPUT_TTY}\" ]]; then",
+        "    read -r -p \"$prompt \" _ < \"${DEPLOY_INPUT_TTY}\" > \"${DEPLOY_INPUT_TTY}\" 2>&1 || true",
+        "    return",
+        "  fi",
+        "  if [[ -t 0 ]]; then",
+        "    read -r -p \"$prompt \" _ || true",
+        "    return",
+        "  fi",
+        "  if [[ -c /dev/tty ]]; then",
+        "    read -r -p \"$prompt \" _ < /dev/tty > /dev/tty 2>&1 || true",
+        "    return",
+        "  fi",
+        "  if [[ -c /dev/console ]]; then",
+        "    read -r -p \"$prompt \" _ < /dev/console > /dev/console 2>&1 || true",
+        "    return",
+        "  fi",
+        "  echo \"$prompt\"",
         "}",
         "",
         "if [[ ! -t 0 ]]; then",

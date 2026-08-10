@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from django.core.exceptions import ValidationError
 from django.contrib.auth import get_user_model
 from django.test import TestCase
@@ -258,6 +260,81 @@ class AfterburnerItemFormTests(TestCase):
 
         self.assertTrue(form.is_valid(), form.errors.as_text())
 
+    def test_custom_script_run_mode_defaults_to_non_chroot(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+                "custom_name": "Update Packages",
+                "script_body": "echo ok",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        item = form.save(commit=False)
+        item.profile = self.profile
+        item.order = 1
+        item.save()
+        self.assertEqual(item.config.get("run_mode"), "non_chroot")
+
+    def test_custom_script_run_mode_can_be_chroot(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+                "custom_name": "Update Packages",
+                "script_body": "echo ok",
+                "script_run_mode": "chroot",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        item = form.save(commit=False)
+        item.profile = self.profile
+        item.order = 1
+        item.save()
+        self.assertEqual(item.config.get("run_mode"), "chroot")
+
+    def test_custom_script_questions_json_builds_input_payload(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+                "custom_name": "Update Packages",
+                "script_body": "#!/bin/bash\necho ok\n",
+                "script_questions_json": json.dumps([
+                    {
+                        "name": "Repo channel",
+                        "question": "Which channel should be used?",
+                        "env_var": "REPO_CHANNEL",
+                    }
+                ]),
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        payload = form.cleaned_data["item_script_inputs_payload"]
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["description"], "Repo channel")
+        self.assertEqual(payload[0]["label"], "Which channel should be used?")
+        self.assertEqual(payload[0]["key"], "REPO_CHANNEL")
+
+    def test_custom_script_questions_json_requires_required_fields(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+                "custom_name": "Update Packages",
+                "script_body": "echo ok",
+                "script_questions_json": json.dumps([
+                    {
+                        "name": "",
+                        "question": "",
+                        "env_var": "",
+                    }
+                ]),
+            }
+        )
+
+        self.assertFalse(form.is_valid())
+        self.assertIn("Question 1: Name is required", form.errors.as_text())
+
 
 class AfterburnerRedHatRegistrationSnippetTests(TestCase):
     def test_snippet_prompts_for_credentials_when_enabled(self):
@@ -276,6 +353,10 @@ class AfterburnerRedHatRegistrationSnippetTests(TestCase):
 
         snippet = _build_item_snippet(item)
         self.assertIn("prompt_bool RHSM_USE_ACTIVATION_KEY", snippet)
+        self.assertIn("while true; do", snippet)
+        self.assertIn("Red Hat registration failed. Try again.", snippet)
+        self.assertIn("if run_chroot subscription-manager register --force --org", snippet)
+        self.assertIn("if run_chroot subscription-manager register --force --username", snippet)
         self.assertIn("prompt_password RHSM_PASSWORD", snippet)
         self.assertIn("prompt_text RHSM_REPO_IDS_USER", snippet)
         self.assertIn("subscription-manager repos --enable=", snippet)
@@ -335,6 +416,23 @@ class AfterburnerCustomScriptExampleTests(TestCase):
         self.assertIn(': "${API_TOKEN:?API_TOKEN is required}"', lines)
         self.assertIn('echo "Using ${ENVIRONMENT}"', lines)
         self.assertNotIn('echo "Using ${API_TOKEN}"', lines)
+
+
+class AfterburnerCustomScriptRunModeSnippetTests(TestCase):
+    def test_chroot_custom_script_uses_run_chroot(self):
+        profile = AfterburnerProfile.objects.create(name="snippet-mode", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="custom",
+            item_type=AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+            config={"script_body": "echo ok", "run_mode": "chroot"},
+        )
+
+        snippet = _build_item_snippet(item)
+
+        self.assertIn("run_chroot bash /tmp/tuxws-afterburner-custom.sh", snippet)
+        self.assertIn("$TARGET_ROOT/tmp/tuxws-afterburner-custom.sh", snippet)
 
 
 class AfterburnerOrderingViewsTests(TestCase):
