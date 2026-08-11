@@ -182,6 +182,16 @@
             <div class="col-md-6">{{ item.edit_form.bootloader_user.label_tag }}{{ item.edit_form.bootloader_user }}</div>
           </div>
 
+          <div class="item-fields-section row g-3 d-none" data-item-section="local_user">
+            <div class="col-12">{{ item.edit_form.local_user_groups.label_tag }}{{ item.edit_form.local_user_groups }}</div>
+            <div class="col-12">
+              <div class="form-check mt-2">
+                {{ item.edit_form.local_user_prompt_groups }}
+                {{ item.edit_form.local_user_prompt_groups.label_tag }}
+              </div>
+            </div>
+          </div>
+
           <div class="item-fields-section row g-3 d-none" data-item-section="redhat_registration">
             <div class="col-12"><div class="form-text">Either preconfigure credentials below or enable prompting to ask during afterburner execution.</div></div>
             <div class="col-md-6">{{ item.edit_form.rhsm_username.label_tag }}{{ item.edit_form.rhsm_username }}</div>
@@ -246,7 +256,7 @@
           </div>
 
           <div class="alert alert-info mt-3 mb-0 small">
-            Hostname and Local user items use built-in prompts and do not require extra configuration here.
+            Hostname items use built-in prompts and do not require extra configuration here.
           </div>
         </div>
         <div class="modal-footer">
@@ -301,6 +311,16 @@
 
           <div class="item-fields-section row g-3 d-none" data-item-section="bootloader_password">
             <div class="col-md-6">{{ item_create_form.bootloader_user.label_tag }}{{ item_create_form.bootloader_user }}</div>
+          </div>
+
+          <div class="item-fields-section row g-3 d-none" data-item-section="local_user">
+            <div class="col-12">{{ item_create_form.local_user_groups.label_tag }}{{ item_create_form.local_user_groups }}</div>
+            <div class="col-12">
+              <div class="form-check mt-2">
+                {{ item_create_form.local_user_prompt_groups }}
+                {{ item_create_form.local_user_prompt_groups.label_tag }}
+              </div>
+            </div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="redhat_registration">
@@ -367,7 +387,7 @@
           </div>
 
           <div class="alert alert-info mt-3 mb-0 small">
-            Hostname and Local user items use built-in prompts and do not require extra configuration here.
+            Hostname items use built-in prompts and do not require extra configuration here.
           </div>
         </div>
         <div class="modal-footer">

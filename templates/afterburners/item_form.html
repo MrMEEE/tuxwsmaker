@@ -69,6 +69,16 @@
           <div class="col-md-6">{{ form.bootloader_user.label_tag }} {{ form.bootloader_user }}</div>
         </div>
 
+        <div id="item-fields-local_user" class="row g-3 d-none">
+          <div class="col-12">{{ form.local_user_groups.label_tag }} {{ form.local_user_groups }}</div>
+          <div class="col-12">
+            <div class="form-check mt-2">
+              {{ form.local_user_prompt_groups }}
+              {{ form.local_user_prompt_groups.label_tag }}
+            </div>
+          </div>
+        </div>
+
         <div id="item-fields-redhat_registration" class="row g-3 d-none">
           <div class="col-12"><div class="form-text">Either preconfigure credentials below or enable prompting to ask during afterburner execution.</div></div>
           <div class="col-md-6">{{ form.rhsm_username.label_tag }} {{ form.rhsm_username }}</div>
@@ -124,7 +134,7 @@
         </div>
       </div>
       <div class="alert alert-info mt-3 mb-0 small">
-        Hostname and Local user items use built-in prompts and do not require extra configuration here.
+        Hostname items use built-in prompts and do not require extra configuration here.
       </div>
       <div class="d-flex gap-2 mt-3">
         <button class="btn btn-primary" type="submit">Save</button>
@@ -141,7 +151,7 @@
       return;
     }
 
-    const sectionIds = ['ad_join', 'static_ip', 'luks_rotate', 'bootloader_password', 'redhat_registration', 'tpm_integration', 'wait_for_enter', 'custom_script'];
+    const sectionIds = ['ad_join', 'static_ip', 'luks_rotate', 'bootloader_password', 'local_user', 'redhat_registration', 'tpm_integration', 'wait_for_enter', 'custom_script'];
     const autodetectCheckbox = document.querySelector('input[name="luks_autodetect"]');
     const luksDeviceField = document.querySelector('[data-luks-device-field]');
 

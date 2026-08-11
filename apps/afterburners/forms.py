@@ -90,6 +90,11 @@ class AfterburnerItemForm(forms.ModelForm):
     )
 
     bootloader_user = forms.CharField(required=False, label="Default GRUB username")
+    local_user_groups = forms.CharField(required=False, label="Default groups (comma-separated)")
+    local_user_prompt_groups = forms.BooleanField(
+        required=False,
+        label="Ask for groups during afterburner",
+    )
     rhsm_username = forms.CharField(required=False, label="Red Hat username")
     rhsm_password = forms.CharField(required=False, label="Red Hat password", widget=forms.PasswordInput(render_value=True))
     rhsm_org_id = forms.CharField(required=False, label="Organization ID")
@@ -193,6 +198,8 @@ class AfterburnerItemForm(forms.ModelForm):
             self.initial["tpm_pcr_ids"] = tpm_pcr_ids
 
             self.initial["bootloader_user"] = str(cfg.get("grub_user") or "")
+            self.initial["local_user_groups"] = str(cfg.get("groups") or "")
+            self.initial["local_user_prompt_groups"] = bool(cfg.get("prompt_groups") or False)
             self.initial["rhsm_username"] = str(cfg.get("username") or "")
             self.initial["rhsm_password"] = str(cfg.get("password") or "")
             self.initial["rhsm_org_id"] = str(cfg.get("org_id") or "")
@@ -281,7 +288,7 @@ class AfterburnerItemForm(forms.ModelForm):
     def clean(self):
         cleaned = super().clean()
         item_type = cleaned.get("item_type")
-        config: dict[str, str] = {}
+        config: dict[str, object] = {}
 
         if item_type == AfterburnerItem.TYPE_AD_JOIN:
             domain = str(cleaned.get("ad_domain") or "").strip()
@@ -347,6 +354,13 @@ class AfterburnerItemForm(forms.ModelForm):
             grub_user = str(cleaned.get("bootloader_user") or "").strip()
             config = {
                 "grub_user": grub_user,
+            }
+        elif item_type == AfterburnerItem.TYPE_LOCAL_USER:
+            groups = str(cleaned.get("local_user_groups") or "").strip()
+            prompt_groups = bool(cleaned.get("local_user_prompt_groups"))
+            config = {
+                "groups": groups,
+                "prompt_groups": prompt_groups,
             }
         elif item_type == AfterburnerItem.TYPE_REDHAT_REGISTRATION:
             username = str(cleaned.get("rhsm_username") or "").strip()

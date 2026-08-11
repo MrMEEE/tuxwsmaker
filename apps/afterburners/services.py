@@ -35,6 +35,15 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         )
 
     if item.item_type == AfterburnerItem.TYPE_LOCAL_USER:
+        default_groups = str(cfg.get("groups") or "")
+        prompt_groups = bool(cfg.get("prompt_groups") or False)
+        group_prompt_block = (
+            '  prompt_text LOCAL_USER_GROUPS "Additional groups (comma-separated; blank to skip)" '
+            + _shell_quote(default_groups)
+            + "\n"
+            if prompt_groups
+            else "  LOCAL_USER_GROUPS=" + _shell_quote(default_groups) + "\n"
+        )
         return (
             f'echo "[afterburner] {label}: local user"\n'
             "while true; do\n"
@@ -70,6 +79,18 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "      continue\n"
             "    fi\n"
             "  fi\n"
+            + group_prompt_block
+            + "  if [[ -n \"${LOCAL_USER_GROUPS//[[:space:],]/}\" ]]; then\n"
+            + "    declare -A LOCAL_USER_GROUP_SEEN=()\n"
+            + "    while IFS= read -r LOCAL_USER_GROUP; do\n"
+            + "      LOCAL_USER_GROUP=\"$(echo \"$LOCAL_USER_GROUP\" | xargs)\"\n"
+            + "      [[ -n \"$LOCAL_USER_GROUP\" ]] || continue\n"
+            + "      [[ -z \"${LOCAL_USER_GROUP_SEEN[$LOCAL_USER_GROUP]:-}\" ]] || continue\n"
+            + "      LOCAL_USER_GROUP_SEEN[$LOCAL_USER_GROUP]=1\n"
+            + "      run_chroot groupadd -f \"$LOCAL_USER_GROUP\" >/dev/null 2>&1 || true\n"
+            + "      run_chroot usermod -aG \"$LOCAL_USER_GROUP\" \"$LOCAL_USER_USERNAME\"\n"
+            + "    done < <(printf '%s\\n' \"$LOCAL_USER_GROUPS\" | tr ',' '\\n')\n"
+            + "  fi\n"
             "  FULL_NAME=\"$LOCAL_USER_FIRSTNAME $LOCAL_USER_LASTNAME\"\n"
             "  FULL_NAME=\"${FULL_NAME## }\"\n"
             "  FULL_NAME=\"${FULL_NAME%% }\"\n"

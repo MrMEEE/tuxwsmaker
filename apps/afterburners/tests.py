@@ -164,6 +164,39 @@ class AfterburnerItemFormTests(TestCase):
         item.save()
         self.assertEqual(item.config["grub_user"], "admin")
 
+    def test_local_user_supports_preset_groups(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_LOCAL_USER,
+                "local_user_groups": "wheel, developers, qa",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        item = form.save(commit=False)
+        item.profile = self.profile
+        item.order = 1
+        item.save()
+        self.assertEqual(item.config["groups"], "wheel, developers, qa")
+        self.assertFalse(item.config["prompt_groups"])
+
+    def test_local_user_supports_prompt_for_groups(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_LOCAL_USER,
+                "local_user_prompt_groups": "on",
+                "local_user_groups": "wheel",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        item = form.save(commit=False)
+        item.profile = self.profile
+        item.order = 1
+        item.save()
+        self.assertTrue(item.config["prompt_groups"])
+        self.assertEqual(item.config["groups"], "wheel")
+
     def test_tpm_integration_requires_device_or_autodetect(self):
         form = AfterburnerItemForm(
             data={
@@ -382,6 +415,43 @@ class AfterburnerRedHatRegistrationSnippetTests(TestCase):
         self.assertIn("register --force --username", snippet)
         self.assertIn("RHSM_REPO_IDS_CONFIG=rhel-10-baseos-rpms", snippet)
         self.assertIn("RHSM_REPO_IDS_MERGED", snippet)
+
+
+class AfterburnerLocalUserSnippetTests(TestCase):
+    def test_snippet_uses_prompted_groups_when_enabled(self):
+        profile = AfterburnerProfile.objects.create(name="local-user-groups", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="local user",
+            item_type=AfterburnerItem.TYPE_LOCAL_USER,
+            config={
+                "groups": "wheel,developers",
+                "prompt_groups": True,
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn("prompt_text LOCAL_USER_GROUPS", snippet)
+        self.assertIn("run_chroot groupadd -f", snippet)
+        self.assertIn("run_chroot usermod -aG \"$LOCAL_USER_GROUP\"", snippet)
+
+    def test_snippet_uses_preset_groups_when_prompt_disabled(self):
+        profile = AfterburnerProfile.objects.create(name="local-user-static-groups", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="local user",
+            item_type=AfterburnerItem.TYPE_LOCAL_USER,
+            config={
+                "groups": "ops,qa",
+                "prompt_groups": False,
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn("LOCAL_USER_GROUPS=ops,qa", snippet)
+        self.assertIn("LOCAL_USER_GROUP_SEEN", snippet)
 
 
 class AfterburnerCustomScriptExampleTests(TestCase):
