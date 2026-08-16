@@ -418,6 +418,32 @@ class AfterburnerRedHatRegistrationSnippetTests(TestCase):
         self.assertIn("RHSM_REPO_IDS_CONFIG=rhel-10-baseos-rpms", snippet)
         self.assertIn("RHSM_REPO_IDS_MERGED", snippet)
 
+    def test_snippet_prefers_answers_file_credentials_without_prompting_for_mode(self):
+        profile = AfterburnerProfile.objects.create(name="rhsm-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="rhsm answers",
+            item_type=AfterburnerItem.TYPE_REDHAT_REGISTRATION,
+            config={
+                "prompt_credentials": True,
+                "rhsm_username_answer_key": "RHSM_USER",
+                "rhsm_password_answer_key": "RHSM_PASS",
+                "rhsm_org_id_answer_key": "RHSM_ORG",
+                "rhsm_activation_key_answer_key": "RHSM_ACT_KEY",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn("RHSM_MODE_FROM_ANSWERS=\"\"", snippet)
+        self.assertIn("lookup_answer RHSM_ORG RHSM_ANSWERS_ORG_ID", snippet)
+        self.assertIn("lookup_answer RHSM_ACT_KEY RHSM_ANSWERS_ACTIVATION_KEY", snippet)
+        self.assertIn("lookup_answer RHSM_USER RHSM_ANSWERS_USERNAME", snippet)
+        self.assertIn("lookup_answer RHSM_PASS RHSM_ANSWERS_PASSWORD", snippet)
+        self.assertIn("Red Hat registration failed using org/activation key from answers file.", snippet)
+        self.assertIn("Red Hat registration failed using username/password from answers file.", snippet)
+        self.assertIn("prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY", snippet)
+
 
 class AfterburnerLocalUserSnippetTests(TestCase):
     def test_snippet_uses_prompted_groups_when_enabled(self):

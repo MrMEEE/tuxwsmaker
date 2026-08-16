@@ -453,16 +453,47 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         if prompt_credentials:
             credentials_block = (
                 "while true; do\n"
-            "  prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\" "
-            + _shell_quote(use_activation_key_answer_key)
-            + "\n"
+                "  RHSM_MODE_FROM_ANSWERS=\"\"\n"
+                "  RHSM_ANSWERS_ORG_ID=\"\"\n"
+                "  RHSM_ANSWERS_ACTIVATION_KEY=\"\"\n"
+                "  RHSM_ANSWERS_USERNAME=\"\"\n"
+                "  RHSM_ANSWERS_PASSWORD=\"\"\n"
+                "  if lookup_answer "
+                + _shell_quote(org_id_answer_key)
+                + " RHSM_ANSWERS_ORG_ID && lookup_answer "
+                + _shell_quote(activation_key_answer_key)
+                + " RHSM_ANSWERS_ACTIVATION_KEY && [[ -n \"${RHSM_ANSWERS_ORG_ID:-}\" && -n \"${RHSM_ANSWERS_ACTIVATION_KEY:-}\" ]]; then\n"
+                "    RHSM_MODE_FROM_ANSWERS=\"activation\"\n"
+                "  elif lookup_answer "
+                + _shell_quote(username_answer_key)
+                + " RHSM_ANSWERS_USERNAME && lookup_answer "
+                + _shell_quote(password_answer_key)
+                + " RHSM_ANSWERS_PASSWORD && [[ -n \"${RHSM_ANSWERS_USERNAME:-}\" && -n \"${RHSM_ANSWERS_PASSWORD:-}\" ]]; then\n"
+                "    RHSM_MODE_FROM_ANSWERS=\"userpass\"\n"
+                "  fi\n"
+                "  if [[ \"$RHSM_MODE_FROM_ANSWERS\" == \"activation\" ]]; then\n"
+                "    if run_chroot subscription-manager register --force --org \"$RHSM_ANSWERS_ORG_ID\" --activationkey \"$RHSM_ANSWERS_ACTIVATION_KEY\"; then\n"
+                "      break\n"
+                "    fi\n"
+                "    echo \"Red Hat registration failed using org/activation key from answers file.\" >&2\n"
+                "    exit 1\n"
+                "  elif [[ \"$RHSM_MODE_FROM_ANSWERS\" == \"userpass\" ]]; then\n"
+                "    if run_chroot subscription-manager register --force --username \"$RHSM_ANSWERS_USERNAME\" --password \"$RHSM_ANSWERS_PASSWORD\"; then\n"
+                "      break\n"
+                "    fi\n"
+                "    echo \"Red Hat registration failed using username/password from answers file.\" >&2\n"
+                "    exit 1\n"
+                "  fi\n"
+                "  prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\" "
+                + _shell_quote(use_activation_key_answer_key)
+                + "\n"
                 "  if [[ \"$RHSM_USE_ACTIVATION_KEY\" == \"yes\" ]]; then\n"
-            "    prompt_text_with_answer RHSM_ORG_ID \"Organization ID\" \"\" "
-            + _shell_quote(org_id_answer_key)
-            + "\n"
-            "    prompt_text_with_answer RHSM_ACTIVATION_KEY \"Activation key\" \"\" "
-            + _shell_quote(activation_key_answer_key)
-            + "\n"
+                "    prompt_text_with_answer RHSM_ORG_ID \"Organization ID\" \"\" "
+                + _shell_quote(org_id_answer_key)
+                + "\n"
+                "    prompt_text_with_answer RHSM_ACTIVATION_KEY \"Activation key\" \"\" "
+                + _shell_quote(activation_key_answer_key)
+                + "\n"
                 "    if [[ -z \"${RHSM_ORG_ID:-}\" || -z \"${RHSM_ACTIVATION_KEY:-}\" ]]; then\n"
                 "      echo \"Org ID and activation key are required\" >&2\n"
                 "      continue\n"
