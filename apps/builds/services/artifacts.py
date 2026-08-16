@@ -14,6 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from apps.afterburners.models import AfterburnerItem
 from apps.afterburners.services import RHSM_REPO_IDS_FILENAME, render_afterburner_script
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
 from apps.builds.services.kickstart import (
@@ -30,6 +31,60 @@ class ArtifactExportError(RuntimeError):
 DEPLOY_MANIFEST_VERSION = 1
 ANSWERS_PARTITION_LABEL = "TUXWSANSWERS"
 ANSWERS_PARTITION_SIZE_BYTES = 100 * 1024 * 1024
+
+
+def _collect_build_answer_keys(*, build: BuildDefinition) -> list[str]:
+    keys: set[str] = set()
+    profile_ids = [sel.afterburner_id for sel in build.ordered_afterburner_selections()]
+    if not profile_ids:
+        return []
+
+    items = (
+        AfterburnerItem.objects.filter(profile_id__in=profile_ids)
+        .prefetch_related("script_inputs")
+        .order_by("profile_id", "order", "id")
+    )
+    for item in items:
+        cfg = item.config if isinstance(item.config, dict) else {}
+        for field_name, raw_value in cfg.items():
+            if not str(field_name).endswith("_answer_key"):
+                continue
+            value = str(raw_value or "").strip()
+            if value:
+                keys.add(value)
+
+        if item.item_type == AfterburnerItem.TYPE_CUSTOM_SCRIPT:
+            for input_row in item.script_inputs.all().order_by("order", "id"):
+                value = str(input_row.answer_key or "").strip()
+                if value:
+                    keys.add(value)
+
+    return sorted(keys)
+
+
+def _yaml_key(key: str) -> str:
+    if re.match(r"^[A-Za-z0-9_]+$", key):
+        return key
+    return "'" + key.replace("'", "''") + "'"
+
+
+def _render_answers_yaml_template(*, keys: list[str]) -> str:
+    lines = [
+        "# TuxWSMaker answers file",
+        "# Fill values for afterburner answer keys.",
+        "# Example: HOSTNAME: \"node01\"",
+        "",
+    ]
+    for key in keys:
+        lines.append(f"{_yaml_key(key)}: \"\"")
+    return "\n".join(lines) + "\n"
+
+
+def _write_answers_yaml_to_fat_image(*, fat_image: Path, answers_yaml: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="tuxwsmaker-answers-yaml-") as tmp:
+        tmp_dir = Path(tmp)
+        (tmp_dir / "answers.yaml").write_text(answers_yaml, encoding="utf-8")
+        _copy_tree_to_fat_image(source_dir=tmp_dir, fat_image=fat_image)
 
 
 def _iso_has_rr_path(*, iso_path: Path, rr_path: str) -> bool:
@@ -77,6 +132,7 @@ def _write_usb_image_from_bundle(
     source_iso_path: Path | None = None,
     build_boot_mode: str | None = None,
     enable_answers_file_support: bool = False,
+    answers_file_content: str | None = None,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -107,6 +163,7 @@ def _write_usb_image_from_bundle(
             build_name=build_name,
             source_iso_path=source_iso_path,
             enable_answers_file_support=enable_answers_file_support,
+            answers_file_content=answers_file_content,
         )
 
     if shutil.which("grub-mkrescue") is None:
@@ -129,7 +186,7 @@ def _write_usb_image_from_bundle(
     )
 
     if enable_answers_file_support:
-        _append_answers_partition_if_supported(output_path=output_path)
+        _append_answers_partition_if_supported(output_path=output_path, answers_file_content=answers_file_content)
 
     return output_path
 
@@ -189,8 +246,8 @@ def _parse_any_parted_partition_map(*, disk_image: Path) -> dict[int, dict[str, 
     return partitions
 
 
-def _append_answers_partition_if_supported(*, output_path: Path) -> None:
-    required_tools = ["parted", "mkfs.vfat"]
+def _append_answers_partition_if_supported(*, output_path: Path, answers_file_content: str | None = None) -> None:
+    required_tools = ["parted", "mkfs.vfat", "mmd", "mcopy"]
     missing_tools = [tool for tool in required_tools if shutil.which(tool) is None]
     if missing_tools:
         raise ArtifactExportError(
@@ -229,6 +286,8 @@ def _append_answers_partition_if_supported(*, output_path: Path) -> None:
         with answers_image.open("wb") as f:
             f.truncate(partition_map[answers_partition_number]["size_bytes"])
         _run_checked(["mkfs.vfat", "-F", "32", "-n", ANSWERS_PARTITION_LABEL, str(answers_image)])
+        if answers_file_content:
+            _write_answers_yaml_to_fat_image(fat_image=answers_image, answers_yaml=answers_file_content)
         _copy_partition_image_into_disk(
             disk_path=output_path,
             partition_image_path=answers_image,
@@ -329,6 +388,7 @@ def _write_uefi_gpt_usb_image_from_bundle(
     build_name: str,
     source_iso_path: Path | None,
     enable_answers_file_support: bool = False,
+    answers_file_content: str | None = None,
 ) -> Path:
     if not source_iso_path or not source_iso_path.exists():
         raise ArtifactExportError(
@@ -428,6 +488,8 @@ def _write_uefi_gpt_usb_image_from_bundle(
             with answers_image.open("wb") as f:
                 f.truncate(partition_map[3]["size_bytes"])
             _run_checked(["mkfs.vfat", "-F", "32", "-n", ANSWERS_PARTITION_LABEL, str(answers_image)])
+            if answers_file_content:
+                _write_answers_yaml_to_fat_image(fat_image=answers_image, answers_yaml=answers_file_content)
             _copy_partition_image_into_disk(
                 disk_path=output_path,
                 partition_image_path=answers_image,
@@ -1312,6 +1374,9 @@ def generate_artifacts(
     build_dir.mkdir(parents=True, exist_ok=True)
 
     created = []
+    answers_yaml_content: str | None = None
+    if bool(build.enable_answers_file_support):
+        answers_yaml_content = _render_answers_yaml_template(keys=_collect_build_answer_keys(build=build))
     existing_batches = BuildArtifact.objects.filter(build=build).values_list("release_group", flat=True)
     generation = 1
     while f"{build.created_at.strftime('%Y-%m-%d') if build.created_at else 'unknown'}-build-{build.id}-{generation}" in existing_batches:
@@ -1331,7 +1396,14 @@ def generate_artifacts(
             build_name=build.name,
             source_iso_path=Path(build.iso_image.iso_file.path),
             build_boot_mode=build.machine_config.boot_mode,
-            **({"enable_answers_file_support": True} if bool(build.enable_answers_file_support) else {}),
+            **(
+                {
+                    "enable_answers_file_support": True,
+                    "answers_file_content": answers_yaml_content,
+                }
+                if bool(build.enable_answers_file_support)
+                else {}
+            ),
         )
         created.append((BuildArtifact.TYPE_USB, usb_image_path))
 

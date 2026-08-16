@@ -10,9 +10,13 @@ from django.test import TestCase
 from apps.afterburners.models import AfterburnerItem, AfterburnerProfile, AfterburnerScriptInput
 from apps.builds.models import BuildArtifact, BuildDefinition, BuildMachineConfig
 from apps.builds.services.artifacts import (
+    ANSWERS_PARTITION_LABEL,
     ArtifactExportError,
     dump_clone_partitions,
     generate_artifacts,
+    _append_answers_partition_if_supported,
+    _collect_build_answer_keys,
+    _render_answers_yaml_template,
     _write_usb_image_from_bundle,
 )
 from apps.builds.services.kickstart import render_deploy_restore_script
@@ -22,6 +26,86 @@ from apps.repositories.models import PackageRepository, RedHatRepositoryCatalog
 
 
 class ArtifactGenerationTests(TestCase):
+    def test_collect_build_answer_keys_includes_item_and_custom_input_keys(self):
+        profile = AfterburnerProfile.objects.create(name="answer-keys")
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="hostname",
+            item_type=AfterburnerItem.TYPE_HOSTNAME,
+            config={
+                "hostname_value_answer_key": "HOSTNAME",
+                "hostname_domain_answer_key": "DOMAIN",
+                "ignored_field": "x",
+            },
+        )
+        custom_item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=2,
+            name="custom",
+            item_type=AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+            config={"script_body": "echo ok"},
+        )
+        AfterburnerScriptInput.objects.create(
+            item=custom_item,
+            order=1,
+            key="TEAM",
+            label="Team",
+            input_type=AfterburnerScriptInput.TYPE_STRING,
+            answer_key="TEAM_NAME",
+        )
+        AfterburnerScriptInput.objects.create(
+            item=custom_item,
+            order=2,
+            key="EMPTY",
+            label="Empty",
+            input_type=AfterburnerScriptInput.TYPE_STRING,
+            answer_key="",
+        )
+        self.build.afterburner_selections.create(afterburner=profile, order=1)
+
+        keys = _collect_build_answer_keys(build=self.build)
+
+        self.assertEqual(keys, ["DOMAIN", "HOSTNAME", "TEAM_NAME"])
+        yaml_content = _render_answers_yaml_template(keys=keys)
+        self.assertIn('HOSTNAME: ""', yaml_content)
+        self.assertIn('DOMAIN: ""', yaml_content)
+        self.assertIn('TEAM_NAME: ""', yaml_content)
+
+    @patch("apps.builds.services.artifacts._copy_partition_image_into_disk")
+    @patch("apps.builds.services.artifacts._parse_any_parted_partition_map")
+    @patch("apps.builds.services.artifacts._run_checked")
+    @patch("apps.builds.services.artifacts.shutil.which")
+    def test_append_answers_partition_writes_answers_yaml_template(
+        self,
+        mock_which,
+        mock_run_checked,
+        mock_partition_map,
+        _mock_copy_partition,
+    ):
+        mock_which.return_value = "/usr/bin/tool"
+        mock_partition_map.return_value = {
+            1: {
+                "start_byte": 1024 * 1024,
+                "size_bytes": 8 * 1024 * 1024,
+            }
+        }
+
+        root = Path("/tmp/tuxwsmaker-test-answers-partition")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+        output_path = root / "usb.img"
+        output_path.write_bytes(b"seed")
+
+        _append_answers_partition_if_supported(
+            output_path=output_path,
+            answers_file_content='HOSTNAME: ""\n',
+        )
+
+        commands = [call.args[0] for call in mock_run_checked.call_args_list]
+        self.assertTrue(any(cmd[0] == "mkfs.vfat" and ANSWERS_PARTITION_LABEL in cmd for cmd in commands))
+        self.assertTrue(any(cmd[0] == "mcopy" and "::/answers.yaml" in cmd for cmd in commands))
+
     def setUp(self):
         os_obj = OperatingSystem.objects.create(name="RHEL-ART", family=OperatingSystem.FAMILY_RHEL)
         layout = PartitionLayout.objects.create(name="layout-art")
@@ -255,6 +339,7 @@ class ArtifactGenerationTests(TestCase):
             source_iso_path=None,
             build_boot_mode=None,
             enable_answers_file_support=False,
+            answers_file_content=None,
         ):
             output_path.write_bytes(b"usb-image")
             return output_path
@@ -736,6 +821,7 @@ class ArtifactGenerationTests(TestCase):
             source_iso_path=None,
             build_boot_mode=None,
             enable_answers_file_support=False,
+            answers_file_content=None,
         ):
             output_path.write_bytes(b"usb-image")
             grub_dir = bundle_dir / "boot" / "grub"
