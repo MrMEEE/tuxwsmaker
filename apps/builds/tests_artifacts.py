@@ -220,7 +220,7 @@ class ArtifactGenerationTests(TestCase):
         generate_artifacts(build=self.build, root=root, qcow2_disk_path=root / "disk.qcow2", compress=False)
 
         script = (root / f"build-{self.build.id}" / "pxe" / "deploy" / "afterburner.sh").read_text(encoding="utf-8")
-        self.assertIn('prompt_text GRUB_USER "GRUB superuser"', script)
+        self.assertIn('prompt_text_with_answer GRUB_USER "GRUB superuser"', script)
         self.assertIn('GRUB_MKPASSWD_BIN', script)
         self.assertIn('grub2-mkpasswd-pbkdf2', script)
         self.assertIn('password_pbkdf2 $GRUB_USER $GRUB_PW_HASH', script)
@@ -247,7 +247,15 @@ class ArtifactGenerationTests(TestCase):
         shim_path.write_bytes(b"shim")
         mock_uefi.return_value = [shim_path]
 
-        def fake_usb_image(*, bundle_dir, output_path, build_name, source_iso_path=None, build_boot_mode=None):
+        def fake_usb_image(
+            *,
+            bundle_dir,
+            output_path,
+            build_name,
+            source_iso_path=None,
+            build_boot_mode=None,
+            enable_answers_file_support=False,
+        ):
             output_path.write_bytes(b"usb-image")
             return output_path
 
@@ -619,7 +627,7 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("Source image boot mode", restore_script)
         self.assertIn("does not match target firmware mode", restore_script)
         self.assertIn('REQUIRED_SECTORS="$(python3 - "$WORK_DIR/clone-manifest.json" <<\'PY\'', restore_script)
-        self.assertIn('awk -v required="$REQUIRED_SECTORS"', restore_script)
+        self.assertIn('if (( selected_sectors < REQUIRED_SECTORS )); then', restore_script)
         self.assertIn('Could not find target disk large enough for restore', restore_script)
         self.assertIn('prompt_write "[deploy] Multiple candidate disks detected for restore. Choose the target disk:"', restore_script)
         self.assertIn('Selected disk is too small for restore', restore_script)
@@ -720,7 +728,15 @@ class ArtifactGenerationTests(TestCase):
         initrd.write_text("i", encoding="utf-8")
         mock_extract.return_value = (kernel, initrd)
 
-        def fake_usb_image(*, bundle_dir, output_path, build_name, source_iso_path=None, build_boot_mode=None):
+        def fake_usb_image(
+            *,
+            bundle_dir,
+            output_path,
+            build_name,
+            source_iso_path=None,
+            build_boot_mode=None,
+            enable_answers_file_support=False,
+        ):
             output_path.write_bytes(b"usb-image")
             grub_dir = bundle_dir / "boot" / "grub"
             grub_dir.mkdir(parents=True, exist_ok=True)
@@ -780,7 +796,7 @@ class ArtifactGenerationTests(TestCase):
         source_iso_path = root / "rhel-10.2-x86_64-dvd.iso"
         source_iso_path.write_bytes(b"iso")
 
-        with self.assertRaisesRegex(ArtifactExportError, "requires xorriso"):
+        with self.assertRaisesRegex(ArtifactExportError, "requires xorriso|requires additional host tools"):
             _write_usb_image_from_bundle(
                 bundle_dir=bundle_dir,
                 output_path=output_path,
@@ -916,15 +932,36 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn('case "$fs_type" in', script)
         self.assertIn('xfs_growfs "$grow_target"', script)
 
-    @patch("apps.builds.services.artifacts._iso_has_rr_path")
+    def test_render_deploy_restore_script_enables_answers_support_when_flag_set(self):
+        root = Path("/tmp/tuxwsmaker-test-restore-script-answers")
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir(parents=True, exist_ok=True)
+
+        self.build.enable_answers_file_support = True
+        self.build.save(update_fields=["enable_answers_file_support"])
+
+        render_deploy_restore_script(
+            output_dir=root / "deploy",
+            os_family=OperatingSystem.FAMILY_RHEL,
+            build=self.build,
+        )
+        script = (root / "deploy" / "restore.sh").read_text(encoding="utf-8")
+
+        self.assertIn('ANSWERS_SUPPORT="yes"', script)
+        self.assertIn('setup_answers_support', script)
+        self.assertIn('answers.yaml', script)
+        self.assertIn('answers.yml', script)
+        self.assertIn('ANSWERS_FILE="$ANSWERS_FILE" bash "$AFTERBURNER_RUN"', script)
+
+    @patch("apps.builds.services.artifacts._parse_parted_partition_map")
+    @patch("apps.builds.services.artifacts._prepare_efi_boot_tree")
     @patch("apps.builds.services.artifacts._run_checked")
     @patch("apps.builds.services.artifacts.shutil.which")
-    def test_write_usb_image_uses_xorriso_replay_for_uefi(self, mock_which, mock_run_checked, mock_iso_has_rr_path):
-        mock_which.side_effect = lambda tool: "/usr/bin/xorriso" if tool == "xorriso" else "/usr/bin/grub-mkrescue"
-        mock_iso_has_rr_path.side_effect = lambda *, iso_path, rr_path: rr_path in {
-            "/BaseOS",
-            "/AppStream",
-            "/images/install.img",
+    def test_write_usb_image_uses_xorriso_replay_for_uefi(self, mock_which, mock_run_checked, mock_prepare_efi_tree, mock_parse_partitions):
+        mock_which.return_value = "/usr/bin/tool"
+        mock_parse_partitions.return_value = {
+            1: {"start_byte": 1048576, "size_bytes": 64 * 1024 * 1024},
+            2: {"start_byte": 80 * 1024 * 1024, "size_bytes": 256 * 1024 * 1024},
         }
 
         root = Path("/tmp/tuxwsmaker-test-usb-uefi-xorriso")
@@ -934,6 +971,15 @@ class ArtifactGenerationTests(TestCase):
         output_path = root / "usb.img"
         source_iso_path = root / "rhel-10.2-x86_64-dvd.iso"
         source_iso_path.write_bytes(b"iso")
+
+        def fake_prepare(*, source_iso_path, build_name, output_dir):
+            efi_boot_dir = output_dir / "EFI" / "BOOT"
+            efi_boot_dir.mkdir(parents=True, exist_ok=True)
+            (efi_boot_dir / "BOOTX64.EFI").write_bytes(b"uefi")
+            (efi_boot_dir / "grub.cfg").write_text("menuentry 'TuxWSMaker Deploy USB' {}\n", encoding="utf-8")
+            return output_dir
+
+        mock_prepare_efi_tree.side_effect = fake_prepare
 
         _write_usb_image_from_bundle(
             bundle_dir=bundle_dir,
@@ -949,32 +995,23 @@ class ArtifactGenerationTests(TestCase):
         efi_grub_cfg = (bundle_dir / "EFI" / "BOOT" / "grub.cfg").read_text(encoding="utf-8")
         self.assertIn("menuentry 'TuxWSMaker Deploy USB'", efi_grub_cfg)
         self.assertIn("inst.ks=hd:LABEL=TUXWSDEPLOY:/deploy/", efi_grub_cfg)
+        self.assertTrue(output_path.exists())
 
-        cmd = mock_run_checked.call_args.args[0]
-        self.assertEqual(cmd[0], "xorriso")
-        self.assertIn("-boot_image", cmd)
-        boot_index = cmd.index("-boot_image")
-        self.assertEqual(cmd[boot_index + 1], "any")
-        self.assertEqual(cmd[boot_index + 2], "replay")
-        self.assertIn("-volid", cmd)
-        self.assertIn("TUXWSDEPLOY", cmd)
-        self.assertIn("-map", cmd)
-        self.assertIn(str(bundle_dir), cmd)
-        self.assertIn("-rm_r", cmd)
-        self.assertIn("/BaseOS", cmd)
-        self.assertIn("/AppStream", cmd)
-        self.assertIn("-rm", cmd)
-        self.assertIn("/images/install.img", cmd)
-        self.assertNotIn("/images/product.img", cmd)
-        self.assertNotIn("/images/updates.img", cmd)
-        self.assertIn("--", cmd)
+        commands = [call.args[0] for call in mock_run_checked.call_args_list]
+        self.assertTrue(any(cmd[0] == "parted" and "mklabel" in cmd and "gpt" in cmd for cmd in commands))
+        self.assertTrue(any(cmd[0] == "mkfs.vfat" and "TUXWSEFI" in cmd for cmd in commands))
+        self.assertTrue(any(cmd[0] == "mkfs.ext4" and "TUXWSDEPLOY" in cmd for cmd in commands))
 
-    @patch("apps.builds.services.artifacts._iso_has_rr_path")
+    @patch("apps.builds.services.artifacts._parse_parted_partition_map")
+    @patch("apps.builds.services.artifacts._prepare_efi_boot_tree")
     @patch("apps.builds.services.artifacts._run_checked")
     @patch("apps.builds.services.artifacts.shutil.which")
-    def test_write_usb_image_recreates_existing_outdev_for_uefi(self, mock_which, mock_run_checked, mock_iso_has_rr_path):
-        mock_which.side_effect = lambda tool: "/usr/bin/xorriso" if tool == "xorriso" else "/usr/bin/grub-mkrescue"
-        mock_iso_has_rr_path.return_value = False
+    def test_write_usb_image_recreates_existing_outdev_for_uefi(self, mock_which, mock_run_checked, mock_prepare_efi_tree, mock_parse_partitions):
+        mock_which.return_value = "/usr/bin/tool"
+        mock_parse_partitions.return_value = {
+            1: {"start_byte": 1048576, "size_bytes": 64 * 1024 * 1024},
+            2: {"start_byte": 80 * 1024 * 1024, "size_bytes": 256 * 1024 * 1024},
+        }
 
         root = Path("/tmp/tuxwsmaker-test-usb-uefi-recreate-outdev")
         shutil.rmtree(root, ignore_errors=True)
@@ -985,6 +1022,14 @@ class ArtifactGenerationTests(TestCase):
         source_iso_path = root / "rhel-10.2-x86_64-dvd.iso"
         source_iso_path.write_bytes(b"iso")
 
+        def fake_prepare(*, source_iso_path, build_name, output_dir):
+            efi_boot_dir = output_dir / "EFI" / "BOOT"
+            efi_boot_dir.mkdir(parents=True, exist_ok=True)
+            (efi_boot_dir / "BOOTX64.EFI").write_bytes(b"uefi")
+            return output_dir
+
+        mock_prepare_efi_tree.side_effect = fake_prepare
+
         _write_usb_image_from_bundle(
             bundle_dir=bundle_dir,
             output_path=output_path,
@@ -993,9 +1038,10 @@ class ArtifactGenerationTests(TestCase):
             build_boot_mode="uefi",
         )
 
-        self.assertFalse(output_path.exists())
-        cmd = mock_run_checked.call_args.args[0]
-        self.assertIn(str(output_path), cmd)
+        self.assertTrue(output_path.exists())
+        self.assertGreater(output_path.stat().st_size, len(b"stale-image"))
+        commands = [call.args[0] for call in mock_run_checked.call_args_list]
+        self.assertTrue(any(str(output_path) in cmd for cmd in commands))
 
     @patch("apps.builds.services.artifacts._run_checked")
     @patch("apps.builds.services.artifacts.shutil.which")

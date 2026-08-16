@@ -20,11 +20,17 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
     label = item.name or item.get_item_type_display()
 
     if item.item_type == AfterburnerItem.TYPE_HOSTNAME:
+        hostname_value_answer_key = str(cfg.get("hostname_value_answer_key") or "")
+        hostname_domain_answer_key = str(cfg.get("hostname_domain_answer_key") or "")
         return (
             f'echo "[afterburner] {label}: hostname"\n'
-            "prompt_text HOSTNAME_VALUE \"Hostname (short name)\" \"\"\n"
+            "prompt_text_with_answer HOSTNAME_VALUE \"Hostname (short name)\" \"\" "
+            + _shell_quote(hostname_value_answer_key)
+            + "\n"
             "if [[ -n \"${HOSTNAME_VALUE:-}\" ]]; then\n"
-            "  prompt_text HOSTNAME_DOMAIN \"Domain name (optional)\" \"\"\n"
+            "  prompt_text_with_answer HOSTNAME_DOMAIN \"Domain name (optional)\" \"\" "
+            + _shell_quote(hostname_domain_answer_key)
+            + "\n"
             "  FQDN_VALUE=\"$HOSTNAME_VALUE\"\n"
             "  if [[ -n \"${HOSTNAME_DOMAIN:-}\" ]]; then\n"
             "    FQDN_VALUE=\"$HOSTNAME_VALUE.$HOSTNAME_DOMAIN\"\n"
@@ -37,9 +43,17 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
     if item.item_type == AfterburnerItem.TYPE_LOCAL_USER:
         default_groups = str(cfg.get("groups") or "")
         prompt_groups = bool(cfg.get("prompt_groups") or False)
+        username_answer_key = str(cfg.get("local_user_username_answer_key") or "")
+        firstname_answer_key = str(cfg.get("local_user_firstname_answer_key") or "")
+        lastname_answer_key = str(cfg.get("local_user_lastname_answer_key") or "")
+        password_answer_key = str(cfg.get("local_user_password_answer_key") or "")
+        admin_answer_key = str(cfg.get("local_user_admin_answer_key") or "")
+        groups_answer_key = str(cfg.get("local_user_groups_answer_key") or "")
         group_prompt_block = (
-            '  prompt_text LOCAL_USER_GROUPS "Additional groups (comma-separated; blank to skip)" '
+            '  prompt_text_with_answer LOCAL_USER_GROUPS "Additional groups (comma-separated; blank to skip)" '
             + _shell_quote(default_groups)
+            + " "
+            + _shell_quote(groups_answer_key)
             + "\n"
             if prompt_groups
             else "  LOCAL_USER_GROUPS=" + _shell_quote(default_groups) + "\n"
@@ -47,15 +61,25 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         return (
             f'echo "[afterburner] {label}: local user"\n'
             "while true; do\n"
-            "  prompt_text LOCAL_USER_USERNAME \"Username (blank to skip)\" \"\"\n"
+            "  prompt_text_with_answer LOCAL_USER_USERNAME \"Username (blank to skip)\" \"\" "
+            + _shell_quote(username_answer_key)
+            + "\n"
             "  if [[ -z \"${LOCAL_USER_USERNAME:-}\" ]]; then\n"
             "    break\n"
             "  fi\n"
-            "  prompt_text LOCAL_USER_FIRSTNAME \"First name\" \"\"\n"
-            "  prompt_text LOCAL_USER_LASTNAME \"Last name\" \"\"\n"
+            "  prompt_text_with_answer LOCAL_USER_FIRSTNAME \"First name\" \"\" "
+            + _shell_quote(firstname_answer_key)
+            + "\n"
+            "  prompt_text_with_answer LOCAL_USER_LASTNAME \"Last name\" \"\" "
+            + _shell_quote(lastname_answer_key)
+            + "\n"
             "  while true; do\n"
-            "    prompt_password LOCAL_USER_PASS_1 \"Password\"\n"
-            "    prompt_password LOCAL_USER_PASS_2 \"Confirm password\"\n"
+            "    prompt_password_with_answer LOCAL_USER_PASS_1 \"Password\" "
+            + _shell_quote(password_answer_key)
+            + "\n"
+            "    prompt_password_with_answer LOCAL_USER_PASS_2 \"Confirm password\" "
+            + _shell_quote(password_answer_key)
+            + "\n"
             "    if [[ \"${LOCAL_USER_PASS_1:-}\" != \"${LOCAL_USER_PASS_2:-}\" ]]; then\n"
             "      echo \"Passwords do not match. Try again.\" >&2\n"
             "      continue\n"
@@ -66,7 +90,9 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "    fi\n"
             "    break\n"
             "  done\n"
-            "  prompt_bool LOCAL_USER_ADMIN \"Grant sudo (wheel) access\" \"no\"\n"
+            "  prompt_bool_with_answer LOCAL_USER_ADMIN \"Grant sudo (wheel) access\" \"no\" "
+            + _shell_quote(admin_answer_key)
+            + "\n"
             "  if run_chroot id \"$LOCAL_USER_USERNAME\" >/dev/null 2>&1; then\n"
             "    echo \"User $LOCAL_USER_USERNAME already exists; updating.\"\n"
             "    _useradd_ok=1\n"
@@ -111,13 +137,31 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         default_domain = str(cfg.get("domain") or "")
         default_ou = str(cfg.get("computer_ou") or "")
         default_join_user = str(cfg.get("join_user") or "")
+        domain_answer_key = str(cfg.get("ad_domain_answer_key") or "")
+        computer_ou_answer_key = str(cfg.get("ad_computer_ou_answer_key") or "")
+        join_user_answer_key = str(cfg.get("ad_join_user_answer_key") or "")
+        join_password_answer_key = str(cfg.get("ad_join_password_answer_key") or "")
         return (
             f'echo "[afterburner] {label}: AD join"\n'
-            f'prompt_text AD_DOMAIN "Active Directory domain (blank to skip)" {_shell_quote(default_domain)}\n'
+            "prompt_text_with_answer AD_DOMAIN \"Active Directory domain (blank to skip)\" "
+            + _shell_quote(default_domain)
+            + " "
+            + _shell_quote(domain_answer_key)
+            + "\n"
             "if [[ -n \"${AD_DOMAIN:-}\" ]]; then\n"
-            f'  prompt_text AD_JOIN_USER "AD join username" {_shell_quote(default_join_user)}\n'
-            "  prompt_password AD_JOIN_PASS \"AD join password\"\n"
-            f'  prompt_text AD_COMPUTER_OU "Computer OU (optional)" {_shell_quote(default_ou)}\n'
+            "  prompt_text_with_answer AD_JOIN_USER \"AD join username\" "
+            + _shell_quote(default_join_user)
+            + " "
+            + _shell_quote(join_user_answer_key)
+            + "\n"
+            "  prompt_password_with_answer AD_JOIN_PASS \"AD join password\" "
+            + _shell_quote(join_password_answer_key)
+            + "\n"
+            "  prompt_text_with_answer AD_COMPUTER_OU \"Computer OU (optional)\" "
+            + _shell_quote(default_ou)
+            + " "
+            + _shell_quote(computer_ou_answer_key)
+            + "\n"
             "  if [[ -z \"${AD_JOIN_USER:-}\" || -z \"${AD_JOIN_PASS:-}\" ]]; then\n"
             "    echo \"AD join requires user and password\" >&2\n"
             "    exit 1\n"
@@ -141,14 +185,39 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         default_prefix = str(cfg.get("prefix") or "24")
         default_gw = str(cfg.get("gateway") or "")
         default_dns = str(cfg.get("dns") or "")
+        iface_answer_key = str(cfg.get("static_interface_answer_key") or "")
+        ip_answer_key = str(cfg.get("static_ip_address_answer_key") or "")
+        prefix_answer_key = str(cfg.get("static_prefix_answer_key") or "")
+        gateway_answer_key = str(cfg.get("static_gateway_answer_key") or "")
+        dns_answer_key = str(cfg.get("static_dns_answer_key") or "")
         return (
             f'echo "[afterburner] {label}: static ip"\n'
-            f'prompt_text STATIC_IFACE "Interface (blank to skip)" {_shell_quote(default_iface)}\n'
+            "prompt_text_with_answer STATIC_IFACE \"Interface (blank to skip)\" "
+            + _shell_quote(default_iface)
+            + " "
+            + _shell_quote(iface_answer_key)
+            + "\n"
             "if [[ -n \"${STATIC_IFACE:-}\" ]]; then\n"
-            f'  prompt_text STATIC_IP "IPv4 address" {_shell_quote(default_ip)}\n'
-            f'  prompt_text STATIC_PREFIX "Prefix" {_shell_quote(default_prefix)}\n'
-            f'  prompt_text STATIC_GW "Gateway" {_shell_quote(default_gw)}\n'
-            f'  prompt_text STATIC_DNS "DNS (comma separated)" {_shell_quote(default_dns)}\n'
+            "  prompt_text_with_answer STATIC_IP \"IPv4 address\" "
+            + _shell_quote(default_ip)
+            + " "
+            + _shell_quote(ip_answer_key)
+            + "\n"
+            "  prompt_text_with_answer STATIC_PREFIX \"Prefix\" "
+            + _shell_quote(default_prefix)
+            + " "
+            + _shell_quote(prefix_answer_key)
+            + "\n"
+            "  prompt_text_with_answer STATIC_GW \"Gateway\" "
+            + _shell_quote(default_gw)
+            + " "
+            + _shell_quote(gateway_answer_key)
+            + "\n"
+            "  prompt_text_with_answer STATIC_DNS \"DNS (comma separated)\" "
+            + _shell_quote(default_dns)
+            + " "
+            + _shell_quote(dns_answer_key)
+            + "\n"
             "  if [[ -z \"${STATIC_IP:-}\" ]]; then\n"
             "    echo \"Static IP requires an address\" >&2\n"
             "    exit 1\n"
@@ -172,6 +241,9 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
     if item.item_type == AfterburnerItem.TYPE_LUKS_ROTATE:
         default_device = str(cfg.get("device") or "")
         autodetect = bool(cfg.get("autodetect") or False)
+        device_answer_key = str(cfg.get("luks_device_answer_key") or "")
+        current_password_answer_key = str(cfg.get("luks_current_password_answer_key") or "")
+        new_password_answer_key = str(cfg.get("luks_new_password_answer_key") or "")
         return (
             f'echo "[afterburner] {label}: rotate LUKS password"\n'
             "rotate_luks_container() {\n"
@@ -182,7 +254,9 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "  if ! printf '%s' \"$luks_current\" | cryptsetup open --test-passphrase \"$luks_dev\" 2>/dev/null; then\n"
             "    echo \"[afterburner] Build-time passphrase did not match $luks_dev — please enter the current LUKS password.\"\n"
             "    while true; do\n"
-            "      prompt_password luks_current \"Current LUKS password for $luks_dev\"\n"
+            "      prompt_password_with_answer luks_current \"Current LUKS password for $luks_dev\" "
+            + _shell_quote(current_password_answer_key)
+            + "\n"
             "      if [[ -z \"${luks_current:-}\" ]]; then\n"
             "        echo \"Password cannot be empty\" >&2; continue\n"
             "      fi\n"
@@ -193,8 +267,12 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "    done\n"
             "  fi\n"
             "  while true; do\n"
-            "    prompt_password LUKS_NEW \"New LUKS password for $luks_dev\"\n"
-            "    prompt_password LUKS_NEW_CONFIRM \"Confirm new LUKS password for $luks_dev\"\n"
+            "    prompt_password_with_answer LUKS_NEW \"New LUKS password for $luks_dev\" "
+            + _shell_quote(new_password_answer_key)
+            + "\n"
+            "    prompt_password_with_answer LUKS_NEW_CONFIRM \"Confirm new LUKS password for $luks_dev\" "
+            + _shell_quote(new_password_answer_key)
+            + "\n"
             "    if [[ -z \"${LUKS_NEW:-}\" ]]; then\n"
             "      echo \"New LUKS password cannot be empty\" >&2\n"
             "      continue\n"
@@ -273,7 +351,15 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "    LUKS_TARGETS+=(\"$luks_dev\")\n"
             "  fi\n"
             "}\n"
-            f'add_luks_target {_shell_quote(default_device)}\n'
+            + "LUKS_DEVICE_VALUE="
+            + _shell_quote(default_device)
+            + "\n"
+            + "if [[ -n \"$LUKS_DEVICE_VALUE\" ]]; then\n"
+            + "  prompt_text_with_answer LUKS_DEVICE_VALUE \"LUKS device path (optional when autodetect is enabled)\" \"$LUKS_DEVICE_VALUE\" "
+            + _shell_quote(device_answer_key)
+            + "\n"
+            + "fi\n"
+            + "add_luks_target \"$LUKS_DEVICE_VALUE\"\n"
             + (
                 "LUKS_AUTODETECT_OUTPUT=\"$(discover_luks_devices)\"; LUKS_AUTODETECT_RC=$?\n"
                 "if [[ $LUKS_AUTODETECT_RC -ne 0 ]]; then\n"
@@ -297,13 +383,23 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
 
     if item.item_type == AfterburnerItem.TYPE_BOOTLOADER_PASSWORD:
         default_grub_user = str(cfg.get("grub_user") or "")
+        user_answer_key = str(cfg.get("bootloader_user_answer_key") or "")
+        password_answer_key = str(cfg.get("bootloader_password_answer_key") or "")
         return (
             f'echo "[afterburner] {label}: set bootloader password"\n'
-            f'prompt_text GRUB_USER "GRUB superuser" {_shell_quote(default_grub_user)}\n'
+            "prompt_text_with_answer GRUB_USER \"GRUB superuser\" "
+            + _shell_quote(default_grub_user)
+            + " "
+            + _shell_quote(user_answer_key)
+            + "\n"
             'if [[ -n "${GRUB_USER:-}" ]]; then\n'
             '  while true; do\n'
-            '    prompt_password GRUB_PW_1 "GRUB password"\n'
-            '    prompt_password GRUB_PW_2 "Confirm GRUB password"\n'
+            '    prompt_password_with_answer GRUB_PW_1 "GRUB password" '
+            + _shell_quote(password_answer_key)
+            + '\n'
+            '    prompt_password_with_answer GRUB_PW_2 "Confirm GRUB password" '
+            + _shell_quote(password_answer_key)
+            + '\n'
             '    if [[ -z "${GRUB_PW_1:-}" ]]; then\n'
             '      echo "GRUB password cannot be empty" >&2\n'
             '      continue\n'
@@ -348,13 +444,25 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         default_repo_ids = str(cfg.get("repo_ids") or "")
         prompt_credentials = bool(cfg.get("prompt_credentials") or False)
         prompt_repositories = bool(cfg.get("prompt_repositories") or False)
+        use_activation_key_answer_key = str(cfg.get("rhsm_use_activation_key_answer_key") or "")
+        username_answer_key = str(cfg.get("rhsm_username_answer_key") or "")
+        password_answer_key = str(cfg.get("rhsm_password_answer_key") or "")
+        org_id_answer_key = str(cfg.get("rhsm_org_id_answer_key") or "")
+        activation_key_answer_key = str(cfg.get("rhsm_activation_key_answer_key") or "")
+        repo_ids_answer_key = str(cfg.get("rhsm_repo_ids_answer_key") or "")
         if prompt_credentials:
             credentials_block = (
                 "while true; do\n"
-                "  prompt_bool RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\"\n"
+            "  prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\" "
+            + _shell_quote(use_activation_key_answer_key)
+            + "\n"
                 "  if [[ \"$RHSM_USE_ACTIVATION_KEY\" == \"yes\" ]]; then\n"
-                "    prompt_text RHSM_ORG_ID \"Organization ID\" \"\"\n"
-                "    prompt_text RHSM_ACTIVATION_KEY \"Activation key\" \"\"\n"
+            "    prompt_text_with_answer RHSM_ORG_ID \"Organization ID\" \"\" "
+            + _shell_quote(org_id_answer_key)
+            + "\n"
+            "    prompt_text_with_answer RHSM_ACTIVATION_KEY \"Activation key\" \"\" "
+            + _shell_quote(activation_key_answer_key)
+            + "\n"
                 "    if [[ -z \"${RHSM_ORG_ID:-}\" || -z \"${RHSM_ACTIVATION_KEY:-}\" ]]; then\n"
                 "      echo \"Org ID and activation key are required\" >&2\n"
                 "      continue\n"
@@ -363,8 +471,12 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
                 "      break\n"
                 "    fi\n"
                 "  else\n"
-                "    prompt_text RHSM_USERNAME \"Red Hat username\" \"\"\n"
-                "    prompt_password RHSM_PASSWORD \"Red Hat password\"\n"
+                "    prompt_text_with_answer RHSM_USERNAME \"Red Hat username\" \"\" "
+                + _shell_quote(username_answer_key)
+                + "\n"
+                "    prompt_password_with_answer RHSM_PASSWORD \"Red Hat password\" "
+                + _shell_quote(password_answer_key)
+                + "\n"
                 "    if [[ -z \"${RHSM_USERNAME:-}\" || -z \"${RHSM_PASSWORD:-}\" ]]; then\n"
                 "      echo \"Username and password are required\" >&2\n"
                 "      continue\n"
@@ -394,8 +506,10 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             )
 
         repo_assignment_block = (
-            "prompt_text RHSM_REPO_IDS_USER \"Repository IDs (comma-separated; blank to skip)\" "
+            "prompt_text_with_answer RHSM_REPO_IDS_USER \"Repository IDs (comma-separated; blank to skip)\" "
             + _shell_quote(default_repo_ids)
+            + " "
+            + _shell_quote(repo_ids_answer_key)
             + "\n"
             if prompt_repositories
             else "RHSM_REPO_IDS_USER=\"\"\n"
@@ -435,6 +549,8 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         tpm_hash = str(cfg.get("hash") or "sha256").strip() or "sha256"
         tpm_key = str(cfg.get("key") or "ecc").strip() or "ecc"
         tpm_pcr_bank = str(cfg.get("pcr_bank") or "sha256").strip() or "sha256"
+        device_answer_key = str(cfg.get("tpm_device_answer_key") or "")
+        password_answer_key = str(cfg.get("tpm_password_answer_key") or "")
 
         raw_pcr_ids = cfg.get("pcr_ids")
         if isinstance(raw_pcr_ids, str):
@@ -544,7 +660,15 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "    TPM_TARGETS+=(\"$luks_dev\")\n"
             "  fi\n"
             "}\n"
-            f'add_tpm_target {_shell_quote(default_device)}\n'
+            + "TPM_DEVICE_VALUE="
+            + _shell_quote(default_device)
+            + "\n"
+            + "if [[ -n \"$TPM_DEVICE_VALUE\" ]]; then\n"
+            + "  prompt_text_with_answer TPM_DEVICE_VALUE \"LUKS device path (optional when autodetect is enabled)\" \"$TPM_DEVICE_VALUE\" "
+            + _shell_quote(device_answer_key)
+            + "\n"
+            + "fi\n"
+            + "add_tpm_target \"$TPM_DEVICE_VALUE\"\n"
             + (
                 "TPM_AUTODETECT_OUTPUT=\"$(discover_tpm_luks_devices)\"; TPM_AUTODETECT_RC=$?\n"
                 "if [[ $TPM_AUTODETECT_RC -ne 0 ]]; then\n"
@@ -567,7 +691,9 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             + "    fi\n"
             + "    luks_tpm_pass=''\n"
             + "    while true; do\n"
-            + "      prompt_password luks_tpm_pass \"Current LUKS password for $container_dev\"\n"
+            + "      prompt_password_with_answer luks_tpm_pass \"Current LUKS password for $container_dev\" "
+            + _shell_quote(password_answer_key)
+            + "\n"
             + "      if [[ -z \"${luks_tpm_pass:-}\" ]]; then\n"
             + "        echo \"Password cannot be empty\" >&2; continue\n"
             + "      fi\n"
@@ -633,14 +759,15 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             key = input_row.key
             label_text = input_row.label
             default_value = input_row.default_value or ""
+            answer_key = str(input_row.answer_key or "").strip()
             if input_row.input_type == AfterburnerScriptInput.TYPE_PASSWORD:
-                lines.append(f'prompt_password {key} {_shell_quote(label_text)}')
+                lines.append(f'prompt_password_with_answer {key} {_shell_quote(label_text)} {_shell_quote(answer_key)}')
             elif input_row.input_type == AfterburnerScriptInput.TYPE_BOOL:
                 default_bool = "yes" if str(default_value).strip().lower() in {"1", "true", "yes", "y"} else "no"
-                lines.append(f'prompt_bool {key} {_shell_quote(label_text)} {_shell_quote(default_bool)}')
+                lines.append(f'prompt_bool_with_answer {key} {_shell_quote(label_text)} {_shell_quote(default_bool)} {_shell_quote(answer_key)}')
             elif input_row.input_type == AfterburnerScriptInput.TYPE_SELECT:
                 options = [str(v) for v in (input_row.select_options or []) if str(v).strip()]
-                lines.append(f'prompt_text {key} {_shell_quote(label_text)} {_shell_quote(default_value)}')
+                lines.append(f'prompt_text_with_answer {key} {_shell_quote(label_text)} {_shell_quote(default_value)} {_shell_quote(answer_key)}')
                 if options:
                     lines.append(f'if [[ -n "${{{key}:-}}" ]]; then')
                     lines.append(f'  case "${{{key}}}" in')
@@ -650,10 +777,10 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
                     lines.append("  esac")
                     lines.append("fi")
             elif input_row.input_type == AfterburnerScriptInput.TYPE_INT:
-                lines.append(f'prompt_text {key} {_shell_quote(label_text)} {_shell_quote(default_value)}')
+                lines.append(f'prompt_text_with_answer {key} {_shell_quote(label_text)} {_shell_quote(default_value)} {_shell_quote(answer_key)}')
                 lines.append(f'if [[ -n "${{{key}:-}}" ]] && ! [[ "${{{key}}}" =~ ^[0-9]+$ ]]; then echo "{key} must be an integer" >&2; exit 1; fi')
             else:
-                lines.append(f'prompt_text {key} {_shell_quote(label_text)} {_shell_quote(default_value)}')
+                lines.append(f'prompt_text_with_answer {key} {_shell_quote(label_text)} {_shell_quote(default_value)} {_shell_quote(answer_key)}')
 
             if input_row.required:
                 lines.append(f'if [[ -z "${{{key}:-}}" ]]; then echo "{key} is required" >&2; exit 1; fi')
@@ -749,6 +876,111 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "    *) value=\"no\" ;;",
         "  esac",
         "  printf -v \"$var_name\" '%s' \"$value\"",
+        "}",
+        "",
+        "declare -A ANSWERS_VALUES=()",
+        "ANSWERS_LOADED=0",
+        "ANSWERS_PATH=\"${ANSWERS_FILE:-}\"",
+        "",
+        "load_answers_file() {",
+        "  [[ \"$ANSWERS_LOADED\" == \"1\" ]] && return 0",
+        "  ANSWERS_LOADED=1",
+        "  [[ -n \"$ANSWERS_PATH\" ]] || return 0",
+        "  [[ -f \"$ANSWERS_PATH\" ]] || return 0",
+        "",
+        "  if command -v python3 >/dev/null 2>&1; then",
+        "    while IFS=$'\\t' read -r answer_key answer_value; do",
+        "      [[ -n \"${answer_key:-}\" ]] || continue",
+        "      ANSWERS_VALUES[$answer_key]=\"$answer_value\"",
+        "    done < <(python3 - \"$ANSWERS_PATH\" <<'PY'",
+        "import sys",
+        "from pathlib import Path",
+        "",
+        "path = Path(sys.argv[1])",
+        "for raw in path.read_text(encoding='utf-8', errors='ignore').splitlines():",
+        "    line = raw.strip()",
+        "    if not line or line.startswith('#'):",
+        "        continue",
+        "    if ':' not in line:",
+        "        continue",
+        "    key, value = line.split(':', 1)",
+        "    key = key.strip()",
+        "    value = value.strip()",
+        "    if not key:",
+        "        continue",
+        "    if len(value) >= 2 and ((value[0] == value[-1] == '\"') or (value[0] == value[-1] == \"'\")):",
+        "        value = value[1:-1]",
+        "    print(f\"{key}\\t{value}\")",
+        "PY",
+        "    )",
+        "    return 0",
+        "  fi",
+        "",
+        "  while IFS= read -r raw_line; do",
+        "    line=\"${raw_line%%#*}\"",
+        "    line=\"${line//$'\\r'/}\"",
+        "    [[ \"$line\" == *:* ]] || continue",
+        "    answer_key=\"${line%%:*}\"",
+        "    answer_value=\"${line#*:}\"",
+        "    answer_key=\"$(echo \"$answer_key\" | xargs)\"",
+        "    answer_value=\"$(echo \"$answer_value\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')\"",
+        "    [[ -n \"$answer_key\" ]] || continue",
+        "    ANSWERS_VALUES[$answer_key]=\"$answer_value\"",
+        "  done < \"$ANSWERS_PATH\"",
+        "}",
+        "",
+        "lookup_answer() {",
+        "  local answer_key=\"$1\"",
+        "  local out_var=\"$2\"",
+        "  [[ -n \"$answer_key\" ]] || return 1",
+        "  load_answers_file",
+        "  if [[ -v ANSWERS_VALUES[$answer_key] ]]; then",
+        "    printf -v \"$out_var\" '%s' \"${ANSWERS_VALUES[$answer_key]}\"",
+        "    return 0",
+        "  fi",
+        "  return 1",
+        "}",
+        "",
+        "prompt_text_with_answer() {",
+        "  local var_name=\"$1\"",
+        "  local label=\"$2\"",
+        "  local default_value=\"${3:-}\"",
+        "  local answer_key=\"${4:-}\"",
+        "  local value=\"\"",
+        "  if lookup_answer \"$answer_key\" value; then",
+        "    printf -v \"$var_name\" '%s' \"$value\"",
+        "    return 0",
+        "  fi",
+        "  prompt_text \"$var_name\" \"$label\" \"$default_value\"",
+        "}",
+        "",
+        "prompt_password_with_answer() {",
+        "  local var_name=\"$1\"",
+        "  local label=\"$2\"",
+        "  local answer_key=\"${3:-}\"",
+        "  local value=\"\"",
+        "  if lookup_answer \"$answer_key\" value; then",
+        "    printf -v \"$var_name\" '%s' \"$value\"",
+        "    return 0",
+        "  fi",
+        "  prompt_password \"$var_name\" \"$label\"",
+        "}",
+        "",
+        "prompt_bool_with_answer() {",
+        "  local var_name=\"$1\"",
+        "  local label=\"$2\"",
+        "  local default_value=\"${3:-no}\"",
+        "  local answer_key=\"${4:-}\"",
+        "  local value=\"\"",
+        "  if lookup_answer \"$answer_key\" value; then",
+        "    case \"${value,,}\" in",
+        "      y|yes|true|1) value=\"yes\" ;;",
+        "      *) value=\"no\" ;;",
+        "    esac",
+        "    printf -v \"$var_name\" '%s' \"$value\"",
+        "    return 0",
+        "  fi",
+        "  prompt_bool \"$var_name\" \"$label\" \"$default_value\"",
         "}",
         "",
         "wait_for_enter() {",

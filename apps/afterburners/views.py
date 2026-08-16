@@ -29,6 +29,7 @@ def _sync_custom_script_inputs(*, item: AfterburnerItem, payload: list[dict[str,
                     input_type=str(row.get("input_type") or AfterburnerScriptInput.TYPE_STRING).strip(),
                     required=bool(row.get("required")),
                     default_value=str(row.get("default_value") or ""),
+                    answer_key=str(row.get("answer_key") or "").strip(),
                     select_options=list(row.get("select_options") or []),
                     description=str(row.get("description") or "").strip(),
                 )

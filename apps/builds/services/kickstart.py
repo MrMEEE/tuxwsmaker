@@ -5,7 +5,7 @@ from textwrap import dedent
 
 from apps.catalog.models import OperatingSystem
 from apps.layouts.models import PartitionEntry, PartitionLayout
-from apps.repositories.services import render_repository_activation_snippet
+from apps.repositories.services import render_repository_activation_snippet, render_repository_cleanup_snippet
 
 
 def calculate_layout_disk_size_gib(layout: PartitionLayout) -> int:
@@ -180,9 +180,16 @@ def render_deploy_restore_script(*, output_dir: Path, os_family: str, build=None
         finish_step = "status 'Debian-family finish adapter: restore path complete'"
 
     repo_setup = ""
+    repo_cleanup = ""
     if build is not None:
       selections = [sel for sel in build.ordered_repository_selections() if sel.enable_before_afterburner]
       repo_setup = render_repository_activation_snippet(
+        selections=selections,
+        os_family=os_family,
+        root_expression='"$MOUNT_ROOT"',
+        phase_label="deploy/afterburner",
+      )
+      repo_cleanup = render_repository_cleanup_snippet(
         selections=selections,
         os_family=os_family,
         root_expression='"$MOUNT_ROOT"',
@@ -201,6 +208,10 @@ MOUNT_ROOT="/mnt/sysimage"
 TARGET_HOSTNAME="${TARGET_HOSTNAME:-}"
 DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"
 RESTORE_LOG="${RESTORE_LOG:-/tmp/tuxwsmaker-restore.log}"
+ANSWERS_SUPPORT="__ANSWERS_SUPPORT__"
+ANSWERS_MOUNT=""
+ANSWERS_FILE=""
+RESTORE_LOG_MIRROR=""
 CURRENT_PHASE="bootstrap"
 INPUT_TTY="${DEPLOY_INPUT_TTY:-}"
 
@@ -226,6 +237,7 @@ fi
 
 hold_on_error() {
   local exit_code="$1"
+  sync_answers_restore_log || true
   echo
   echo "[deploy] Restore failed with exit code ${exit_code}" >&2
   echo "[deploy] Failing phase: ${CURRENT_PHASE}" >&2
@@ -238,6 +250,60 @@ hold_on_error() {
   else
     read -r -t 900 _ || true
   fi
+}
+
+setup_answers_support() {
+  [[ "$ANSWERS_SUPPORT" == "yes" ]] || return 0
+
+  local mount_root="/run/tuxwsmaker-answers"
+  local by_label="/dev/disk/by-label/TUXWSANSWERS"
+  local part_dev=""
+
+  if [[ -e "$by_label" ]]; then
+    part_dev="$by_label"
+  else
+    while IFS= read -r dev_path; do
+      [[ -n "$dev_path" ]] || continue
+      if [[ "$(blkid -s LABEL -o value "$dev_path" 2>/dev/null || true)" == "TUXWSANSWERS" ]]; then
+        part_dev="$dev_path"
+        break
+      fi
+    done < <(lsblk -rpn -o PATH,TYPE | awk '$2 == "part" {print $1}')
+  fi
+
+  if [[ -z "$part_dev" ]]; then
+    status "Answers partition label TUXWSANSWERS not found; continuing without answers file"
+    return 0
+  fi
+
+  mkdir -p "$mount_root"
+  if ! mount -t vfat "$part_dev" "$mount_root" >/dev/null 2>&1; then
+    status "Could not mount answers partition at $part_dev; continuing without answers file"
+    return 0
+  fi
+
+  ANSWERS_MOUNT="$mount_root"
+  RESTORE_LOG_MIRROR="$ANSWERS_MOUNT/deploy-restore.log"
+
+  if [[ -f "$ANSWERS_MOUNT/answers.yaml" ]]; then
+    ANSWERS_FILE="$ANSWERS_MOUNT/answers.yaml"
+  elif [[ -f "$ANSWERS_MOUNT/answers.yml" ]]; then
+    ANSWERS_FILE="$ANSWERS_MOUNT/answers.yml"
+  elif [[ -f "$ANSWERS_MOUNT/answers" ]]; then
+    ANSWERS_FILE="$ANSWERS_MOUNT/answers"
+  fi
+
+  if [[ -n "$ANSWERS_FILE" ]]; then
+    status "Answers file detected: $ANSWERS_FILE"
+  else
+    status "Answers partition mounted but no answers file found (answers.yaml, answers.yml, answers)"
+  fi
+}
+
+sync_answers_restore_log() {
+  [[ -n "$RESTORE_LOG_MIRROR" ]] || return 0
+  [[ -f "$RESTORE_LOG" ]] || return 0
+  cp -f "$RESTORE_LOG" "$RESTORE_LOG_MIRROR" >/dev/null 2>&1 || true
 }
 
 prompt_read_line() {
@@ -419,6 +485,10 @@ with open(target_path, "r+b", buffering=0) as target_handle:
 }
 
 cleanup_mounts() {
+  sync_answers_restore_log || true
+  if [[ -n "$ANSWERS_MOUNT" ]]; then
+    umount -lf "$ANSWERS_MOUNT" >/dev/null 2>&1 || true
+  fi
   if [[ -f "$WORK_DIR/mounted.paths" ]]; then
     tac "$WORK_DIR/mounted.paths" | while read -r mp; do
       [[ -z "${mp:-}" ]] && continue
@@ -1311,6 +1381,8 @@ CHROOT
     efibootmgr -q -w -c -d "$TARGET_DEV" -p "$EFI_NUM" -L "TuxWSMaker Restored" -l "$efi_loader" || true
   fi
 
+  setup_answers_support
+
   AFTERBURNER_SRC="/run/install/repo/deploy/afterburner.sh"
   AFTERBURNER_RUN="$WORK_DIR/afterburner.sh"
   TARGET_RESOLV_BACKUP="$WORK_DIR/target-resolv.conf.before-afterburner"
@@ -1331,7 +1403,7 @@ __REPO_SETUP__
     cp "$AFTERBURNER_SRC" "$AFTERBURNER_RUN"
     chmod +x "$AFTERBURNER_RUN"
     set +e
-    MOUNT_ROOT="$MOUNT_ROOT" TARGET_DEV="$TARGET_DEV" WORK_DIR="$WORK_DIR" bash "$AFTERBURNER_RUN"
+    MOUNT_ROOT="$MOUNT_ROOT" TARGET_DEV="$TARGET_DEV" WORK_DIR="$WORK_DIR" ANSWERS_FILE="$ANSWERS_FILE" bash "$AFTERBURNER_RUN"
     afterburner_exit=$?
     set -e
 __REPO_CLEANUP__
@@ -1352,6 +1424,7 @@ __REPO_CLEANUP__
 fi
 
 CURRENT_PHASE="completed"
+sync_answers_restore_log || true
 status "Restore completed successfully"
 __FINISH_STEP__
 """
@@ -1359,7 +1432,8 @@ __FINISH_STEP__
 
     content = content.replace("__FINISH_STEP__", finish_step)
     content = content.replace("__REPO_SETUP__", repo_setup.rstrip() + ("\n" if repo_setup else ""))
-    content = content.replace("__REPO_CLEANUP__", "")
+    content = content.replace("__REPO_CLEANUP__", repo_cleanup.rstrip() + ("\n" if repo_cleanup else ""))
+    content = content.replace("__ANSWERS_SUPPORT__", "yes" if build is not None and bool(build.enable_answers_file_support) else "no")
     path.write_text(content, encoding="utf-8")
     path.chmod(0o755)
     return path

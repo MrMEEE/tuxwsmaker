@@ -153,10 +153,19 @@
             {{ item.edit_form.item_type }}
           </div>
 
+          <div class="item-fields-section row g-3 d-none" data-item-section="hostname">
+            <div class="col-md-6">{{ item.edit_form.hostname_value_answer_key.label_tag }}{{ item.edit_form.hostname_value_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.hostname_domain_answer_key.label_tag }}{{ item.edit_form.hostname_domain_answer_key }}</div>
+          </div>
+
           <div class="item-fields-section row g-3 d-none" data-item-section="ad_join">
             <div class="col-md-6">{{ item.edit_form.ad_domain.label_tag }}{{ item.edit_form.ad_domain }}</div>
             <div class="col-md-6">{{ item.edit_form.ad_join_user.label_tag }}{{ item.edit_form.ad_join_user }}</div>
             <div class="col-12">{{ item.edit_form.ad_computer_ou.label_tag }}{{ item.edit_form.ad_computer_ou }}</div>
+            <div class="col-md-6">{{ item.edit_form.ad_domain_answer_key.label_tag }}{{ item.edit_form.ad_domain_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.ad_join_user_answer_key.label_tag }}{{ item.edit_form.ad_join_user_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.ad_join_password_answer_key.label_tag }}{{ item.edit_form.ad_join_password_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.ad_computer_ou_answer_key.label_tag }}{{ item.edit_form.ad_computer_ou_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="static_ip">
@@ -165,6 +174,11 @@
             <div class="col-md-4">{{ item.edit_form.static_prefix.label_tag }}{{ item.edit_form.static_prefix }}</div>
             <div class="col-md-6">{{ item.edit_form.static_gateway.label_tag }}{{ item.edit_form.static_gateway }}</div>
             <div class="col-md-6">{{ item.edit_form.static_dns.label_tag }}{{ item.edit_form.static_dns }}</div>
+            <div class="col-md-6">{{ item.edit_form.static_interface_answer_key.label_tag }}{{ item.edit_form.static_interface_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.static_ip_address_answer_key.label_tag }}{{ item.edit_form.static_ip_address_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.static_prefix_answer_key.label_tag }}{{ item.edit_form.static_prefix_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.static_gateway_answer_key.label_tag }}{{ item.edit_form.static_gateway_answer_key }}</div>
+            <div class="col-12">{{ item.edit_form.static_dns_answer_key.label_tag }}{{ item.edit_form.static_dns_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="luks_rotate">
@@ -176,10 +190,15 @@
               </div>
               <div class="form-text">{{ item.edit_form.luks_autodetect.help_text }}</div>
             </div>
+            <div class="col-md-6">{{ item.edit_form.luks_device_answer_key.label_tag }}{{ item.edit_form.luks_device_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.luks_current_password_answer_key.label_tag }}{{ item.edit_form.luks_current_password_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.luks_new_password_answer_key.label_tag }}{{ item.edit_form.luks_new_password_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="bootloader_password">
             <div class="col-md-6">{{ item.edit_form.bootloader_user.label_tag }}{{ item.edit_form.bootloader_user }}</div>
+            <div class="col-md-6">{{ item.edit_form.bootloader_user_answer_key.label_tag }}{{ item.edit_form.bootloader_user_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.bootloader_password_answer_key.label_tag }}{{ item.edit_form.bootloader_password_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="local_user">
@@ -190,6 +209,12 @@
                 {{ item.edit_form.local_user_prompt_groups.label_tag }}
               </div>
             </div>
+            <div class="col-md-6">{{ item.edit_form.local_user_username_answer_key.label_tag }}{{ item.edit_form.local_user_username_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.local_user_firstname_answer_key.label_tag }}{{ item.edit_form.local_user_firstname_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.local_user_lastname_answer_key.label_tag }}{{ item.edit_form.local_user_lastname_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.local_user_password_answer_key.label_tag }}{{ item.edit_form.local_user_password_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.local_user_admin_answer_key.label_tag }}{{ item.edit_form.local_user_admin_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.local_user_groups_answer_key.label_tag }}{{ item.edit_form.local_user_groups_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="redhat_registration">
@@ -211,6 +236,12 @@
                 {{ item.edit_form.rhsm_prompt_repositories.label_tag }}
               </div>
             </div>
+            <div class="col-md-6">{{ item.edit_form.rhsm_use_activation_key_answer_key.label_tag }}{{ item.edit_form.rhsm_use_activation_key_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.rhsm_username_answer_key.label_tag }}{{ item.edit_form.rhsm_username_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.rhsm_password_answer_key.label_tag }}{{ item.edit_form.rhsm_password_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.rhsm_org_id_answer_key.label_tag }}{{ item.edit_form.rhsm_org_id_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.rhsm_activation_key_answer_key.label_tag }}{{ item.edit_form.rhsm_activation_key_answer_key }}</div>
+            <div class="col-12">{{ item.edit_form.rhsm_repo_ids_answer_key.label_tag }}{{ item.edit_form.rhsm_repo_ids_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="tpm_integration">
@@ -231,6 +262,8 @@
               </div>
               <div class="form-text">{{ item.edit_form.tpm_autodetect.help_text }}</div>
             </div>
+            <div class="col-md-6">{{ item.edit_form.tpm_device_answer_key.label_tag }}{{ item.edit_form.tpm_device_answer_key }}</div>
+            <div class="col-md-6">{{ item.edit_form.tpm_password_answer_key.label_tag }}{{ item.edit_form.tpm_password_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="wait_for_enter">
@@ -256,7 +289,7 @@
           </div>
 
           <div class="alert alert-info mt-3 mb-0 small">
-            Hostname items use built-in prompts and do not require extra configuration here.
+            Hostname and other prompt-driven items can optionally use answer keys for non-interactive restores.
           </div>
         </div>
         <div class="modal-footer">
@@ -284,10 +317,19 @@
             {{ item_create_form.item_type }}
           </div>
 
+          <div class="item-fields-section row g-3 d-none" data-item-section="hostname">
+            <div class="col-md-6">{{ item_create_form.hostname_value_answer_key.label_tag }}{{ item_create_form.hostname_value_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.hostname_domain_answer_key.label_tag }}{{ item_create_form.hostname_domain_answer_key }}</div>
+          </div>
+
           <div class="item-fields-section row g-3 d-none" data-item-section="ad_join">
             <div class="col-md-6">{{ item_create_form.ad_domain.label_tag }}{{ item_create_form.ad_domain }}</div>
             <div class="col-md-6">{{ item_create_form.ad_join_user.label_tag }}{{ item_create_form.ad_join_user }}</div>
             <div class="col-12">{{ item_create_form.ad_computer_ou.label_tag }}{{ item_create_form.ad_computer_ou }}</div>
+            <div class="col-md-6">{{ item_create_form.ad_domain_answer_key.label_tag }}{{ item_create_form.ad_domain_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.ad_join_user_answer_key.label_tag }}{{ item_create_form.ad_join_user_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.ad_join_password_answer_key.label_tag }}{{ item_create_form.ad_join_password_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.ad_computer_ou_answer_key.label_tag }}{{ item_create_form.ad_computer_ou_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="static_ip">
@@ -296,6 +338,11 @@
             <div class="col-md-4">{{ item_create_form.static_prefix.label_tag }}{{ item_create_form.static_prefix }}</div>
             <div class="col-md-6">{{ item_create_form.static_gateway.label_tag }}{{ item_create_form.static_gateway }}</div>
             <div class="col-md-6">{{ item_create_form.static_dns.label_tag }}{{ item_create_form.static_dns }}</div>
+            <div class="col-md-6">{{ item_create_form.static_interface_answer_key.label_tag }}{{ item_create_form.static_interface_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.static_ip_address_answer_key.label_tag }}{{ item_create_form.static_ip_address_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.static_prefix_answer_key.label_tag }}{{ item_create_form.static_prefix_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.static_gateway_answer_key.label_tag }}{{ item_create_form.static_gateway_answer_key }}</div>
+            <div class="col-12">{{ item_create_form.static_dns_answer_key.label_tag }}{{ item_create_form.static_dns_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="luks_rotate">
@@ -307,10 +354,15 @@
               </div>
               <div class="form-text">{{ item_create_form.luks_autodetect.help_text }}</div>
             </div>
+            <div class="col-md-6">{{ item_create_form.luks_device_answer_key.label_tag }}{{ item_create_form.luks_device_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.luks_current_password_answer_key.label_tag }}{{ item_create_form.luks_current_password_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.luks_new_password_answer_key.label_tag }}{{ item_create_form.luks_new_password_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="bootloader_password">
             <div class="col-md-6">{{ item_create_form.bootloader_user.label_tag }}{{ item_create_form.bootloader_user }}</div>
+            <div class="col-md-6">{{ item_create_form.bootloader_user_answer_key.label_tag }}{{ item_create_form.bootloader_user_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.bootloader_password_answer_key.label_tag }}{{ item_create_form.bootloader_password_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="local_user">
@@ -321,6 +373,12 @@
                 {{ item_create_form.local_user_prompt_groups.label_tag }}
               </div>
             </div>
+            <div class="col-md-6">{{ item_create_form.local_user_username_answer_key.label_tag }}{{ item_create_form.local_user_username_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.local_user_firstname_answer_key.label_tag }}{{ item_create_form.local_user_firstname_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.local_user_lastname_answer_key.label_tag }}{{ item_create_form.local_user_lastname_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.local_user_password_answer_key.label_tag }}{{ item_create_form.local_user_password_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.local_user_admin_answer_key.label_tag }}{{ item_create_form.local_user_admin_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.local_user_groups_answer_key.label_tag }}{{ item_create_form.local_user_groups_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="redhat_registration">
@@ -342,6 +400,12 @@
                 {{ item_create_form.rhsm_prompt_repositories.label_tag }}
               </div>
             </div>
+            <div class="col-md-6">{{ item_create_form.rhsm_use_activation_key_answer_key.label_tag }}{{ item_create_form.rhsm_use_activation_key_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.rhsm_username_answer_key.label_tag }}{{ item_create_form.rhsm_username_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.rhsm_password_answer_key.label_tag }}{{ item_create_form.rhsm_password_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.rhsm_org_id_answer_key.label_tag }}{{ item_create_form.rhsm_org_id_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.rhsm_activation_key_answer_key.label_tag }}{{ item_create_form.rhsm_activation_key_answer_key }}</div>
+            <div class="col-12">{{ item_create_form.rhsm_repo_ids_answer_key.label_tag }}{{ item_create_form.rhsm_repo_ids_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="tpm_integration">
@@ -362,6 +426,8 @@
               </div>
               <div class="form-text">{{ item_create_form.tpm_autodetect.help_text }}</div>
             </div>
+            <div class="col-md-6">{{ item_create_form.tpm_device_answer_key.label_tag }}{{ item_create_form.tpm_device_answer_key }}</div>
+            <div class="col-md-6">{{ item_create_form.tpm_password_answer_key.label_tag }}{{ item_create_form.tpm_password_answer_key }}</div>
           </div>
 
           <div class="item-fields-section row g-3 d-none" data-item-section="wait_for_enter">
@@ -387,7 +453,7 @@
           </div>
 
           <div class="alert alert-info mt-3 mb-0 small">
-            Hostname items use built-in prompts and do not require extra configuration here.
+            Hostname and other prompt-driven items can optionally use answer keys for non-interactive restores.
           </div>
         </div>
         <div class="modal-footer">
@@ -530,8 +596,9 @@
           const name = row.querySelector('[data-question-name]')?.value?.trim() || '';
           const question = row.querySelector('[data-question-text]')?.value?.trim() || '';
           const envVar = row.querySelector('[data-question-env]')?.value?.trim() || '';
-          return { name, question, env_var: envVar };
-        }).filter((row) => row.name || row.question || row.env_var);
+          const answerKey = row.querySelector('[data-question-answer-key]')?.value?.trim() || '';
+          return { name, question, env_var: envVar, answer_key: answerKey };
+        }).filter((row) => row.name || row.question || row.env_var || row.answer_key);
         hiddenField.value = JSON.stringify(rows);
       }
 
@@ -553,12 +620,16 @@
         colName.innerHTML = '<label class="form-label mb-1">Name</label><input type="text" class="form-control" data-question-name>'; 
 
         const colQuestion = document.createElement('div');
-        colQuestion.className = 'col-md-5';
+        colQuestion.className = 'col-md-4';
         colQuestion.innerHTML = '<label class="form-label mb-1">Question</label><input type="text" class="form-control" data-question-text>'; 
 
         const colEnv = document.createElement('div');
-        colEnv.className = 'col-md-3';
+        colEnv.className = 'col-md-2';
         colEnv.innerHTML = '<label class="form-label mb-1">Environment Variable Name</label><input type="text" class="form-control" data-question-env placeholder="TEAM_NAME">';
+
+        const colAnswerKey = document.createElement('div');
+        colAnswerKey.className = 'col-md-2';
+        colAnswerKey.innerHTML = '<label class="form-label mb-1">Answer Key</label><input type="text" class="form-control" data-question-answer-key placeholder="TEAM_NAME">';
 
         const colActions = document.createElement('div');
         colActions.className = 'col-12 text-end';
@@ -576,17 +647,20 @@
         rowInner.appendChild(colName);
         rowInner.appendChild(colQuestion);
         rowInner.appendChild(colEnv);
+        rowInner.appendChild(colAnswerKey);
         rowInner.appendChild(colActions);
         row.appendChild(rowInner);
 
         const nameInput = row.querySelector('[data-question-name]');
         const questionInput = row.querySelector('[data-question-text]');
         const envInput = row.querySelector('[data-question-env]');
+        const answerKeyInput = row.querySelector('[data-question-answer-key]');
         nameInput.value = initial?.name || '';
         questionInput.value = initial?.question || '';
         envInput.value = initial?.env_var || '';
+        answerKeyInput.value = initial?.answer_key || '';
 
-        [nameInput, questionInput, envInput].forEach((input) => {
+        [nameInput, questionInput, envInput, answerKeyInput].forEach((input) => {
           input.addEventListener('input', syncHiddenField);
         });
 
@@ -625,7 +699,7 @@
       });
 
       addButton.addEventListener('click', () => {
-        const rowEl = buildQuestionRow({ name: '', question: '', env_var: '' });
+        const rowEl = buildQuestionRow({ name: '', question: '', env_var: '', answer_key: '' });
         attachDragHandlers(rowEl);
         container.appendChild(rowEl);
         syncHiddenField();

@@ -131,6 +131,7 @@ class BuildDefinitionForm(forms.ModelForm):
             "rhsm_repositories",
             "output_pxe",
             "output_usb_img",
+            "enable_answers_file_support",
         ]
         widgets = {
             "package_lists": forms.CheckboxSelectMultiple,
@@ -152,6 +153,7 @@ class BuildDefinitionForm(forms.ModelForm):
         self.fields["rhsm_auth_mode"].label = "RHSM auth mode"
         self.fields["rhsm_username"].required = False
         self.fields["rhsm_org_id"].required = False
+        self.fields["enable_answers_file_support"].label = "Enable answers-file support"
 
         self.iso_major_map = {}
         for iso_item in iso_qs:

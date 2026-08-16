@@ -88,6 +88,7 @@ class AfterburnerScriptInput(models.Model):
     input_type = models.CharField(max_length=16, choices=TYPE_CHOICES, default=TYPE_STRING)
     required = models.BooleanField(default=False)
     default_value = models.CharField(max_length=255, blank=True)
+    answer_key = models.CharField(max_length=120, blank=True)
     select_options = models.JSONField(default=list, blank=True)
     description = models.TextField(blank=True)
 

@@ -37,6 +37,10 @@ class AfterburnerItemForm(forms.ModelForm):
     ad_domain = forms.CharField(required=False, label="Default AD domain")
     ad_computer_ou = forms.CharField(required=False, label="Default AD computer OU")
     ad_join_user = forms.CharField(required=False, label="Default AD join user")
+    ad_domain_answer_key = forms.CharField(required=False, label="Answer key: AD domain")
+    ad_computer_ou_answer_key = forms.CharField(required=False, label="Answer key: AD computer OU")
+    ad_join_user_answer_key = forms.CharField(required=False, label="Answer key: AD join user")
+    ad_join_password_answer_key = forms.CharField(required=False, label="Answer key: AD join password")
 
     static_interface = forms.CharField(required=False, label="Default interface")
     static_ip_address = forms.GenericIPAddressField(required=False, protocol="IPv4", label="Default IPv4 address")
@@ -48,6 +52,11 @@ class AfterburnerItemForm(forms.ModelForm):
     )
     static_gateway = forms.GenericIPAddressField(required=False, protocol="IPv4", label="Default gateway")
     static_dns = forms.CharField(required=False, label="Default DNS servers")
+    static_interface_answer_key = forms.CharField(required=False, label="Answer key: interface")
+    static_ip_address_answer_key = forms.CharField(required=False, label="Answer key: IPv4 address")
+    static_prefix_answer_key = forms.CharField(required=False, label="Answer key: prefix")
+    static_gateway_answer_key = forms.CharField(required=False, label="Answer key: gateway")
+    static_dns_answer_key = forms.CharField(required=False, label="Answer key: DNS")
 
     luks_device = forms.CharField(required=False, label="Default LUKS block device")
     luks_autodetect = forms.BooleanField(
@@ -55,6 +64,9 @@ class AfterburnerItemForm(forms.ModelForm):
         label="Autodetect LUKS containers",
         help_text="Scan the target system for LUKS containers and prompt for each one.",
     )
+    luks_device_answer_key = forms.CharField(required=False, label="Answer key: LUKS device")
+    luks_current_password_answer_key = forms.CharField(required=False, label="Answer key: current LUKS password")
+    luks_new_password_answer_key = forms.CharField(required=False, label="Answer key: new LUKS password")
 
     tpm_device = forms.CharField(required=False, label="Default LUKS block device")
     tpm_autodetect = forms.BooleanField(
@@ -88,13 +100,23 @@ class AfterburnerItemForm(forms.ModelForm):
         widget=forms.SelectMultiple(attrs={"size": 8}),
         help_text="Add zero or more PCR IDs to bind in the TPM2 policy.",
     )
+    tpm_device_answer_key = forms.CharField(required=False, label="Answer key: LUKS device")
+    tpm_password_answer_key = forms.CharField(required=False, label="Answer key: LUKS password")
 
     bootloader_user = forms.CharField(required=False, label="Default GRUB username")
+    bootloader_user_answer_key = forms.CharField(required=False, label="Answer key: GRUB username")
+    bootloader_password_answer_key = forms.CharField(required=False, label="Answer key: GRUB password")
     local_user_groups = forms.CharField(required=False, label="Default groups (comma-separated)")
     local_user_prompt_groups = forms.BooleanField(
         required=False,
         label="Ask for groups during afterburner",
     )
+    local_user_username_answer_key = forms.CharField(required=False, label="Answer key: username")
+    local_user_firstname_answer_key = forms.CharField(required=False, label="Answer key: first name")
+    local_user_lastname_answer_key = forms.CharField(required=False, label="Answer key: last name")
+    local_user_password_answer_key = forms.CharField(required=False, label="Answer key: password")
+    local_user_admin_answer_key = forms.CharField(required=False, label="Answer key: admin flag")
+    local_user_groups_answer_key = forms.CharField(required=False, label="Answer key: groups")
     rhsm_username = forms.CharField(required=False, label="Red Hat username")
     rhsm_password = forms.CharField(required=False, label="Red Hat password", widget=forms.PasswordInput(render_value=True))
     rhsm_org_id = forms.CharField(required=False, label="Organization ID")
@@ -108,7 +130,15 @@ class AfterburnerItemForm(forms.ModelForm):
         required=False,
         label="Ask for repository IDs during afterburner",
     )
+    rhsm_use_activation_key_answer_key = forms.CharField(required=False, label="Answer key: use activation key mode")
+    rhsm_username_answer_key = forms.CharField(required=False, label="Answer key: username")
+    rhsm_password_answer_key = forms.CharField(required=False, label="Answer key: password")
+    rhsm_org_id_answer_key = forms.CharField(required=False, label="Answer key: org ID")
+    rhsm_activation_key_answer_key = forms.CharField(required=False, label="Answer key: activation key")
+    rhsm_repo_ids_answer_key = forms.CharField(required=False, label="Answer key: repository IDs")
     wait_message = forms.CharField(required=False, label="Message to show")
+    hostname_value_answer_key = forms.CharField(required=False, label="Answer key: hostname")
+    hostname_domain_answer_key = forms.CharField(required=False, label="Answer key: domain")
     script_body = forms.CharField(
         required=False,
         widget=forms.Textarea(attrs={"rows": 8}),
@@ -153,21 +183,37 @@ class AfterburnerItemForm(forms.ModelForm):
 
         if self.instance and self.instance.pk:
             cfg = dict(self.instance.config or {})
+            self.initial["hostname_value_answer_key"] = str(cfg.get("hostname_value_answer_key") or "")
+            self.initial["hostname_domain_answer_key"] = str(cfg.get("hostname_domain_answer_key") or "")
             self.initial["ad_domain"] = str(cfg.get("domain") or "")
             self.initial["ad_computer_ou"] = str(cfg.get("computer_ou") or "")
             self.initial["ad_join_user"] = str(cfg.get("join_user") or "")
+            self.initial["ad_domain_answer_key"] = str(cfg.get("ad_domain_answer_key") or "")
+            self.initial["ad_computer_ou_answer_key"] = str(cfg.get("ad_computer_ou_answer_key") or "")
+            self.initial["ad_join_user_answer_key"] = str(cfg.get("ad_join_user_answer_key") or "")
+            self.initial["ad_join_password_answer_key"] = str(cfg.get("ad_join_password_answer_key") or "")
 
             self.initial["static_interface"] = str(cfg.get("interface") or "")
             self.initial["static_ip_address"] = str(cfg.get("ip_address") or "")
             self.initial["static_prefix"] = str(cfg.get("prefix") or "24")
             self.initial["static_gateway"] = str(cfg.get("gateway") or "")
             self.initial["static_dns"] = str(cfg.get("dns") or "")
+            self.initial["static_interface_answer_key"] = str(cfg.get("static_interface_answer_key") or "")
+            self.initial["static_ip_address_answer_key"] = str(cfg.get("static_ip_address_answer_key") or "")
+            self.initial["static_prefix_answer_key"] = str(cfg.get("static_prefix_answer_key") or "")
+            self.initial["static_gateway_answer_key"] = str(cfg.get("static_gateway_answer_key") or "")
+            self.initial["static_dns_answer_key"] = str(cfg.get("static_dns_answer_key") or "")
 
             self.initial["luks_device"] = str(cfg.get("device") or "")
             self.initial["luks_autodetect"] = bool(cfg.get("autodetect") or False)
+            self.initial["luks_device_answer_key"] = str(cfg.get("luks_device_answer_key") or "")
+            self.initial["luks_current_password_answer_key"] = str(cfg.get("luks_current_password_answer_key") or "")
+            self.initial["luks_new_password_answer_key"] = str(cfg.get("luks_new_password_answer_key") or "")
 
             self.initial["tpm_device"] = str(cfg.get("device") or "")
             self.initial["tpm_autodetect"] = bool(cfg.get("autodetect") or False)
+            self.initial["tpm_device_answer_key"] = str(cfg.get("tpm_device_answer_key") or "")
+            self.initial["tpm_password_answer_key"] = str(cfg.get("tpm_password_answer_key") or "")
 
             legacy_profile = str(cfg.get("policy_profile") or "").strip()
             if legacy_profile == "pcr7_11_sha256_ecc":
@@ -198,8 +244,16 @@ class AfterburnerItemForm(forms.ModelForm):
             self.initial["tpm_pcr_ids"] = tpm_pcr_ids
 
             self.initial["bootloader_user"] = str(cfg.get("grub_user") or "")
+            self.initial["bootloader_user_answer_key"] = str(cfg.get("bootloader_user_answer_key") or "")
+            self.initial["bootloader_password_answer_key"] = str(cfg.get("bootloader_password_answer_key") or "")
             self.initial["local_user_groups"] = str(cfg.get("groups") or "")
             self.initial["local_user_prompt_groups"] = bool(cfg.get("prompt_groups") or False)
+            self.initial["local_user_username_answer_key"] = str(cfg.get("local_user_username_answer_key") or "")
+            self.initial["local_user_firstname_answer_key"] = str(cfg.get("local_user_firstname_answer_key") or "")
+            self.initial["local_user_lastname_answer_key"] = str(cfg.get("local_user_lastname_answer_key") or "")
+            self.initial["local_user_password_answer_key"] = str(cfg.get("local_user_password_answer_key") or "")
+            self.initial["local_user_admin_answer_key"] = str(cfg.get("local_user_admin_answer_key") or "")
+            self.initial["local_user_groups_answer_key"] = str(cfg.get("local_user_groups_answer_key") or "")
             self.initial["rhsm_username"] = str(cfg.get("username") or "")
             self.initial["rhsm_password"] = str(cfg.get("password") or "")
             self.initial["rhsm_org_id"] = str(cfg.get("org_id") or "")
@@ -207,6 +261,12 @@ class AfterburnerItemForm(forms.ModelForm):
             self.initial["rhsm_repo_ids"] = str(cfg.get("repo_ids") or "")
             self.initial["rhsm_prompt_credentials"] = bool(cfg.get("prompt_credentials") or False)
             self.initial["rhsm_prompt_repositories"] = bool(cfg.get("prompt_repositories") or False)
+            self.initial["rhsm_use_activation_key_answer_key"] = str(cfg.get("rhsm_use_activation_key_answer_key") or "")
+            self.initial["rhsm_username_answer_key"] = str(cfg.get("rhsm_username_answer_key") or "")
+            self.initial["rhsm_password_answer_key"] = str(cfg.get("rhsm_password_answer_key") or "")
+            self.initial["rhsm_org_id_answer_key"] = str(cfg.get("rhsm_org_id_answer_key") or "")
+            self.initial["rhsm_activation_key_answer_key"] = str(cfg.get("rhsm_activation_key_answer_key") or "")
+            self.initial["rhsm_repo_ids_answer_key"] = str(cfg.get("rhsm_repo_ids_answer_key") or "")
             self.initial["wait_message"] = str(cfg.get("message") or "")
             self.initial["script_body"] = str(cfg.get("script_body") or "")
             if self.instance.item_type == AfterburnerItem.TYPE_CUSTOM_SCRIPT:
@@ -222,6 +282,7 @@ class AfterburnerItemForm(forms.ModelForm):
                             "name": str(row.description or row.label or "").strip(),
                             "question": str(row.label or "").strip(),
                             "env_var": str(row.key or "").strip(),
+                            "answer_key": str(row.answer_key or "").strip(),
                         }
                     )
                 self.initial["script_questions_json"] = json.dumps(payload)
@@ -247,6 +308,7 @@ class AfterburnerItemForm(forms.ModelForm):
             name = str(entry.get("name") or "").strip()
             label = str(entry.get("question") or "").strip()
             key = str(entry.get("env_var") or "").strip().upper()
+            answer_key = str(entry.get("answer_key") or "").strip()
 
             if not name:
                 raise ValidationError(f"Question {idx}: Name is required")
@@ -279,6 +341,7 @@ class AfterburnerItemForm(forms.ModelForm):
                     "input_type": AfterburnerScriptInput.TYPE_STRING,
                     "required": False,
                     "default_value": "",
+                    "answer_key": answer_key,
                     "select_options": [],
                     "description": name,
                 }
@@ -290,7 +353,16 @@ class AfterburnerItemForm(forms.ModelForm):
         item_type = cleaned.get("item_type")
         config: dict[str, object] = {}
 
-        if item_type == AfterburnerItem.TYPE_AD_JOIN:
+        def key(name: str) -> str:
+            return str(cleaned.get(name) or "").strip()
+
+        if item_type == AfterburnerItem.TYPE_HOSTNAME:
+            config = {
+                "hostname_value_answer_key": key("hostname_value_answer_key"),
+                "hostname_domain_answer_key": key("hostname_domain_answer_key"),
+            }
+
+        elif item_type == AfterburnerItem.TYPE_AD_JOIN:
             domain = str(cleaned.get("ad_domain") or "").strip()
             computer_ou = str(cleaned.get("ad_computer_ou") or "").strip()
             join_user = str(cleaned.get("ad_join_user") or "").strip()
@@ -302,6 +374,10 @@ class AfterburnerItemForm(forms.ModelForm):
                 "domain": domain,
                 "computer_ou": computer_ou,
                 "join_user": join_user,
+                "ad_domain_answer_key": key("ad_domain_answer_key"),
+                "ad_computer_ou_answer_key": key("ad_computer_ou_answer_key"),
+                "ad_join_user_answer_key": key("ad_join_user_answer_key"),
+                "ad_join_password_answer_key": key("ad_join_password_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_STATIC_IP:
             interface = str(cleaned.get("static_interface") or "").strip()
@@ -338,6 +414,11 @@ class AfterburnerItemForm(forms.ModelForm):
                 "prefix": prefix,
                 "gateway": gateway,
                 "dns": dns_raw,
+                "static_interface_answer_key": key("static_interface_answer_key"),
+                "static_ip_address_answer_key": key("static_ip_address_answer_key"),
+                "static_prefix_answer_key": key("static_prefix_answer_key"),
+                "static_gateway_answer_key": key("static_gateway_answer_key"),
+                "static_dns_answer_key": key("static_dns_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_LUKS_ROTATE:
             device = str(cleaned.get("luks_device") or "").strip()
@@ -349,11 +430,16 @@ class AfterburnerItemForm(forms.ModelForm):
             config = {
                 "device": device,
                 "autodetect": autodetect,
+                "luks_device_answer_key": key("luks_device_answer_key"),
+                "luks_current_password_answer_key": key("luks_current_password_answer_key"),
+                "luks_new_password_answer_key": key("luks_new_password_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_BOOTLOADER_PASSWORD:
             grub_user = str(cleaned.get("bootloader_user") or "").strip()
             config = {
                 "grub_user": grub_user,
+                "bootloader_user_answer_key": key("bootloader_user_answer_key"),
+                "bootloader_password_answer_key": key("bootloader_password_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_LOCAL_USER:
             groups = str(cleaned.get("local_user_groups") or "").strip()
@@ -361,6 +447,12 @@ class AfterburnerItemForm(forms.ModelForm):
             config = {
                 "groups": groups,
                 "prompt_groups": prompt_groups,
+                "local_user_username_answer_key": key("local_user_username_answer_key"),
+                "local_user_firstname_answer_key": key("local_user_firstname_answer_key"),
+                "local_user_lastname_answer_key": key("local_user_lastname_answer_key"),
+                "local_user_password_answer_key": key("local_user_password_answer_key"),
+                "local_user_admin_answer_key": key("local_user_admin_answer_key"),
+                "local_user_groups_answer_key": key("local_user_groups_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_REDHAT_REGISTRATION:
             username = str(cleaned.get("rhsm_username") or "").strip()
@@ -399,6 +491,12 @@ class AfterburnerItemForm(forms.ModelForm):
                 "repo_ids": repo_ids,
                 "prompt_credentials": prompt_credentials,
                 "prompt_repositories": prompt_repositories,
+                "rhsm_use_activation_key_answer_key": key("rhsm_use_activation_key_answer_key"),
+                "rhsm_username_answer_key": key("rhsm_username_answer_key"),
+                "rhsm_password_answer_key": key("rhsm_password_answer_key"),
+                "rhsm_org_id_answer_key": key("rhsm_org_id_answer_key"),
+                "rhsm_activation_key_answer_key": key("rhsm_activation_key_answer_key"),
+                "rhsm_repo_ids_answer_key": key("rhsm_repo_ids_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_TPM_INTEGRATION:
             device = str(cleaned.get("tpm_device") or "").strip()
@@ -432,6 +530,8 @@ class AfterburnerItemForm(forms.ModelForm):
                 "pcr_bank": tpm_pcr_bank,
                 "key": tpm_key,
                 "pcr_ids": pcr_ids,
+                "tpm_device_answer_key": key("tpm_device_answer_key"),
+                "tpm_password_answer_key": key("tpm_password_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_WAIT_FOR_ENTER:
             message = str(cleaned.get("wait_message") or "").strip()

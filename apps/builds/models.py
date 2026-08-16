@@ -129,6 +129,7 @@ class BuildDefinition(models.Model):
 	rhsm_activation_key_encrypted = models.TextField(blank=True)
 	output_pxe = models.BooleanField(default=True)
 	output_usb_img = models.BooleanField(default=True)
+	enable_answers_file_support = models.BooleanField(default=False)
 	status = models.CharField(max_length=16, choices=STATUS_CHOICES, default=STATUS_DRAFT)
 	run_mode = models.CharField(max_length=16, choices=RUN_MODE_CHOICES, default=RUN_MODE_AUTO)
 	current_step = models.CharField(max_length=32, choices=STEP_CHOICES, default=STEP_PENDING)

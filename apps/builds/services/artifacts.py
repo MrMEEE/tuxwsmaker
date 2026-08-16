@@ -28,6 +28,8 @@ class ArtifactExportError(RuntimeError):
 
 
 DEPLOY_MANIFEST_VERSION = 1
+ANSWERS_PARTITION_LABEL = "TUXWSANSWERS"
+ANSWERS_PARTITION_SIZE_BYTES = 100 * 1024 * 1024
 
 
 def _iso_has_rr_path(*, iso_path: Path, rr_path: str) -> bool:
@@ -74,6 +76,7 @@ def _write_usb_image_from_bundle(
     build_name: str,
     source_iso_path: Path | None = None,
     build_boot_mode: str | None = None,
+    enable_answers_file_support: bool = False,
 ) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -103,6 +106,7 @@ def _write_usb_image_from_bundle(
             output_path=output_path,
             build_name=build_name,
             source_iso_path=source_iso_path,
+            enable_answers_file_support=enable_answers_file_support,
         )
 
     if shutil.which("grub-mkrescue") is None:
@@ -123,6 +127,9 @@ def _write_usb_image_from_bundle(
         ],
         env=env,
     )
+
+    if enable_answers_file_support:
+        _append_answers_partition_if_supported(output_path=output_path)
 
     return output_path
 
@@ -160,6 +167,73 @@ def _parse_parted_partition_map(*, disk_image: Path) -> dict[int, dict[str, int]
     if 1 not in partitions or 2 not in partitions:
         raise ArtifactExportError("Failed to discover expected GPT partitions for USB image")
     return partitions
+
+
+def _parse_any_parted_partition_map(*, disk_image: Path) -> dict[int, dict[str, int]]:
+    proc = _run_checked(["parted", "-s", "-m", str(disk_image), "unit", "B", "print"])
+    partitions: dict[int, dict[str, int]] = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip().rstrip(";")
+        if not line or not line[0].isdigit():
+            continue
+        parts = line.split(":")
+        if len(parts) < 4:
+            continue
+        number = int(parts[0])
+        start_byte = int(parts[1].rstrip("B") or "0")
+        size_bytes = int(parts[3].rstrip("B") or "0")
+        partitions[number] = {
+            "start_byte": start_byte,
+            "size_bytes": size_bytes,
+        }
+    return partitions
+
+
+def _append_answers_partition_if_supported(*, output_path: Path) -> None:
+    required_tools = ["parted", "mkfs.vfat"]
+    missing_tools = [tool for tool in required_tools if shutil.which(tool) is None]
+    if missing_tools:
+        raise ArtifactExportError(
+            "Answers-file USB partition requires additional host tools: " + ", ".join(missing_tools)
+        )
+
+    current_size = output_path.stat().st_size
+    extra_padding = 2 * 1024 * 1024
+    with output_path.open("r+b") as f:
+        f.truncate(current_size + ANSWERS_PARTITION_SIZE_BYTES + extra_padding)
+
+    start_mib = max(1, int(math.ceil(current_size / (1024 * 1024))))
+    end_mib = start_mib + int(math.ceil(ANSWERS_PARTITION_SIZE_BYTES / (1024 * 1024)))
+
+    _run_checked(
+        [
+            "parted",
+            "-s",
+            str(output_path),
+            "mkpart",
+            "ANSWERS",
+            "fat32",
+            f"{start_mib}MiB",
+            f"{end_mib}MiB",
+        ]
+    )
+
+    partition_map = _parse_any_parted_partition_map(disk_image=output_path)
+    if not partition_map:
+        raise ArtifactExportError("Could not parse partition table after adding answers partition")
+    answers_partition_number = max(partition_map.keys())
+
+    with tempfile.TemporaryDirectory(prefix="tuxwsmaker-answers-part-", dir=str(output_path.parent)) as tmp:
+        tmp_dir = Path(tmp)
+        answers_image = tmp_dir / "answers.img"
+        with answers_image.open("wb") as f:
+            f.truncate(partition_map[answers_partition_number]["size_bytes"])
+        _run_checked(["mkfs.vfat", "-F", "32", "-n", ANSWERS_PARTITION_LABEL, str(answers_image)])
+        _copy_partition_image_into_disk(
+            disk_path=output_path,
+            partition_image_path=answers_image,
+            offset_bytes=partition_map[answers_partition_number]["start_byte"],
+        )
 
 
 def _copy_tree_to_fat_image(*, source_dir: Path, fat_image: Path) -> None:
@@ -254,6 +328,7 @@ def _write_uefi_gpt_usb_image_from_bundle(
     output_path: Path,
     build_name: str,
     source_iso_path: Path | None,
+    enable_answers_file_support: bool = False,
 ) -> Path:
     if not source_iso_path or not source_iso_path.exists():
         raise ArtifactExportError(
@@ -270,7 +345,12 @@ def _write_uefi_gpt_usb_image_from_bundle(
     esp_size_bytes = 512 * 1024 * 1024
     bundle_size_bytes = _directory_size_bytes(bundle_dir)
     data_size_bytes = max(int(math.ceil(bundle_size_bytes * 1.15)), 1024 * 1024 * 1024)
-    total_size_bytes = 1024 * 1024 + esp_size_bytes + 1024 * 1024 + data_size_bytes + 1024 * 1024
+    answers_size_bytes = ANSWERS_PARTITION_SIZE_BYTES if enable_answers_file_support else 0
+    total_size_bytes = 1024 * 1024 + esp_size_bytes + 1024 * 1024 + data_size_bytes + answers_size_bytes + 1024 * 1024
+
+    data_end_mib = int((513 * 1024 * 1024 + data_size_bytes) / (1024 * 1024))
+    answers_start_mib = data_end_mib
+    answers_end_mib = answers_start_mib + int(math.ceil(answers_size_bytes / (1024 * 1024)))
 
     if output_path.exists():
         output_path.unlink()
@@ -278,29 +358,37 @@ def _write_uefi_gpt_usb_image_from_bundle(
     with output_path.open("wb") as f:
         f.truncate(total_size_bytes)
 
-    _run_checked(
-        [
-            "parted",
-            "-s",
-            str(output_path),
-            "mklabel",
-            "gpt",
+    parted_command = [
+        "parted",
+        "-s",
+        str(output_path),
+        "mklabel",
+        "gpt",
+        "mkpart",
+        "EFI",
+        "fat32",
+        "1MiB",
+        "513MiB",
+        "set",
+        "1",
+        "esp",
+        "on",
+        "mkpart",
+        "DATA",
+        "ext4",
+        "513MiB",
+        f"{data_end_mib}MiB",
+    ]
+    if enable_answers_file_support:
+        parted_command.extend([
             "mkpart",
-            "EFI",
+            "ANSWERS",
             "fat32",
-            "1MiB",
-            "513MiB",
-            "set",
-            "1",
-            "esp",
-            "on",
-            "mkpart",
-            "DATA",
-            "ext4",
-            "513MiB",
-            "100%",
-        ]
-    )
+            f"{answers_start_mib}MiB",
+            f"{answers_end_mib}MiB",
+        ])
+
+    _run_checked(parted_command)
 
     partition_map = _parse_parted_partition_map(disk_image=output_path)
 
@@ -308,6 +396,7 @@ def _write_uefi_gpt_usb_image_from_bundle(
         tmp_dir = Path(tmp)
         esp_image = tmp_dir / "esp.img"
         data_image = tmp_dir / "data.img"
+        answers_image = tmp_dir / "answers.img"
 
         with esp_image.open("wb") as f:
             f.truncate(partition_map[1]["size_bytes"])
@@ -334,6 +423,16 @@ def _write_uefi_gpt_usb_image_from_bundle(
             partition_image_path=data_image,
             offset_bytes=partition_map[2]["start_byte"],
         )
+
+        if enable_answers_file_support and 3 in partition_map:
+            with answers_image.open("wb") as f:
+                f.truncate(partition_map[3]["size_bytes"])
+            _run_checked(["mkfs.vfat", "-F", "32", "-n", ANSWERS_PARTITION_LABEL, str(answers_image)])
+            _copy_partition_image_into_disk(
+                disk_path=output_path,
+                partition_image_path=answers_image,
+                offset_bytes=partition_map[3]["start_byte"],
+            )
 
     return output_path
 
@@ -415,6 +514,20 @@ def _extract_iso_stage2_payload(*, iso_path: Path, output_dir: Path) -> None:
 
 
 def _write_usb_instructions(*, build: BuildDefinition, out_dir: Path) -> None:
+    answers_section = ""
+    if build.enable_answers_file_support:
+        answers_section = (
+            "Answers file support\n"
+            "--------------------\n"
+            "This USB image includes a 100MB VFAT partition labeled TUXWSANSWERS.\n"
+            "Place your answers file in the root using one of these names (checked in order):\n"
+            "- answers.yaml\n"
+            "- answers.yml\n"
+            "- answers\n"
+            "Deploy logs are mirrored to this partition when it is available.\n"
+            "Warning: values in answers files may include secrets and are stored as plaintext.\n\n"
+        )
+
     content = (
         "TuxWSMaker USB Deploy Bundle\n"
         "=========================\n\n"
@@ -439,6 +552,7 @@ def _write_usb_instructions(*, build: BuildDefinition, out_dir: Path) -> None:
         "2. Flash image to the target USB device (example):\n"
         "   sudo dd if=usb.img of=/dev/sdX bs=16M status=progress conv=fsync\n"
         "3. Safely eject and boot target machine from this USB.\n\n"
+    ) + answers_section + (
         "Build reference\n"
         "---------------\n"
         f"Build: {build.name} (id {build.id})\n"
@@ -523,6 +637,7 @@ def _deploy_payload_metadata(*, build: BuildDefinition) -> dict[str, object]:
             "pxe_http": True,
             "offline_usb": True,
             "luks_prompt": True,
+            "answers_file": bool(build.enable_answers_file_support),
         },
         "operating_system": {
             "name": build.operating_system.name,
@@ -1216,6 +1331,7 @@ def generate_artifacts(
             build_name=build.name,
             source_iso_path=Path(build.iso_image.iso_file.path),
             build_boot_mode=build.machine_config.boot_mode,
+            **({"enable_answers_file_support": True} if bool(build.enable_answers_file_support) else {}),
         )
         created.append((BuildArtifact.TYPE_USB, usb_image_path))
 

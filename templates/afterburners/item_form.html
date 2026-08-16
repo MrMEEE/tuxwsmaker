@@ -40,10 +40,19 @@
       <div class="row g-3">
         <div class="col-md-6">{{ form.item_type.label_tag }} {{ form.item_type }}</div>
 
+        <div id="item-fields-hostname" class="row g-3 d-none">
+          <div class="col-md-6">{{ form.hostname_value_answer_key.label_tag }} {{ form.hostname_value_answer_key }}</div>
+          <div class="col-md-6">{{ form.hostname_domain_answer_key.label_tag }} {{ form.hostname_domain_answer_key }}</div>
+        </div>
+
         <div id="item-fields-ad_join" class="row g-3 d-none">
           <div class="col-md-6">{{ form.ad_domain.label_tag }} {{ form.ad_domain }}</div>
           <div class="col-md-6">{{ form.ad_join_user.label_tag }} {{ form.ad_join_user }}</div>
           <div class="col-12">{{ form.ad_computer_ou.label_tag }} {{ form.ad_computer_ou }}</div>
+          <div class="col-md-6">{{ form.ad_domain_answer_key.label_tag }} {{ form.ad_domain_answer_key }}</div>
+          <div class="col-md-6">{{ form.ad_join_user_answer_key.label_tag }} {{ form.ad_join_user_answer_key }}</div>
+          <div class="col-md-6">{{ form.ad_join_password_answer_key.label_tag }} {{ form.ad_join_password_answer_key }}</div>
+          <div class="col-md-6">{{ form.ad_computer_ou_answer_key.label_tag }} {{ form.ad_computer_ou_answer_key }}</div>
         </div>
 
         <div id="item-fields-static_ip" class="row g-3 d-none">
@@ -52,6 +61,11 @@
           <div class="col-md-4">{{ form.static_prefix.label_tag }} {{ form.static_prefix }}</div>
           <div class="col-md-6">{{ form.static_gateway.label_tag }} {{ form.static_gateway }}</div>
           <div class="col-md-6">{{ form.static_dns.label_tag }} {{ form.static_dns }}</div>
+          <div class="col-md-6">{{ form.static_interface_answer_key.label_tag }} {{ form.static_interface_answer_key }}</div>
+          <div class="col-md-6">{{ form.static_ip_address_answer_key.label_tag }} {{ form.static_ip_address_answer_key }}</div>
+          <div class="col-md-6">{{ form.static_prefix_answer_key.label_tag }} {{ form.static_prefix_answer_key }}</div>
+          <div class="col-md-6">{{ form.static_gateway_answer_key.label_tag }} {{ form.static_gateway_answer_key }}</div>
+          <div class="col-12">{{ form.static_dns_answer_key.label_tag }} {{ form.static_dns_answer_key }}</div>
         </div>
 
         <div id="item-fields-luks_rotate" class="row g-3 d-none">
@@ -63,10 +77,15 @@
             </div>
             <div class="form-text">{{ form.luks_autodetect.help_text }}</div>
           </div>
+          <div class="col-md-6">{{ form.luks_device_answer_key.label_tag }} {{ form.luks_device_answer_key }}</div>
+          <div class="col-md-6">{{ form.luks_current_password_answer_key.label_tag }} {{ form.luks_current_password_answer_key }}</div>
+          <div class="col-md-6">{{ form.luks_new_password_answer_key.label_tag }} {{ form.luks_new_password_answer_key }}</div>
         </div>
 
         <div id="item-fields-bootloader_password" class="row g-3 d-none">
           <div class="col-md-6">{{ form.bootloader_user.label_tag }} {{ form.bootloader_user }}</div>
+          <div class="col-md-6">{{ form.bootloader_user_answer_key.label_tag }} {{ form.bootloader_user_answer_key }}</div>
+          <div class="col-md-6">{{ form.bootloader_password_answer_key.label_tag }} {{ form.bootloader_password_answer_key }}</div>
         </div>
 
         <div id="item-fields-local_user" class="row g-3 d-none">
@@ -77,6 +96,12 @@
               {{ form.local_user_prompt_groups.label_tag }}
             </div>
           </div>
+          <div class="col-md-6">{{ form.local_user_username_answer_key.label_tag }} {{ form.local_user_username_answer_key }}</div>
+          <div class="col-md-6">{{ form.local_user_firstname_answer_key.label_tag }} {{ form.local_user_firstname_answer_key }}</div>
+          <div class="col-md-6">{{ form.local_user_lastname_answer_key.label_tag }} {{ form.local_user_lastname_answer_key }}</div>
+          <div class="col-md-6">{{ form.local_user_password_answer_key.label_tag }} {{ form.local_user_password_answer_key }}</div>
+          <div class="col-md-6">{{ form.local_user_admin_answer_key.label_tag }} {{ form.local_user_admin_answer_key }}</div>
+          <div class="col-md-6">{{ form.local_user_groups_answer_key.label_tag }} {{ form.local_user_groups_answer_key }}</div>
         </div>
 
         <div id="item-fields-redhat_registration" class="row g-3 d-none">
@@ -98,6 +123,12 @@
               {{ form.rhsm_prompt_repositories.label_tag }}
             </div>
           </div>
+          <div class="col-md-6">{{ form.rhsm_use_activation_key_answer_key.label_tag }} {{ form.rhsm_use_activation_key_answer_key }}</div>
+          <div class="col-md-6">{{ form.rhsm_username_answer_key.label_tag }} {{ form.rhsm_username_answer_key }}</div>
+          <div class="col-md-6">{{ form.rhsm_password_answer_key.label_tag }} {{ form.rhsm_password_answer_key }}</div>
+          <div class="col-md-6">{{ form.rhsm_org_id_answer_key.label_tag }} {{ form.rhsm_org_id_answer_key }}</div>
+          <div class="col-md-6">{{ form.rhsm_activation_key_answer_key.label_tag }} {{ form.rhsm_activation_key_answer_key }}</div>
+          <div class="col-12">{{ form.rhsm_repo_ids_answer_key.label_tag }} {{ form.rhsm_repo_ids_answer_key }}</div>
         </div>
 
         <div id="item-fields-tpm_integration" class="row g-3 d-none">
@@ -118,6 +149,8 @@
             </div>
             <div class="form-text">{{ form.tpm_autodetect.help_text }}</div>
           </div>
+          <div class="col-md-6">{{ form.tpm_device_answer_key.label_tag }} {{ form.tpm_device_answer_key }}</div>
+          <div class="col-md-6">{{ form.tpm_password_answer_key.label_tag }} {{ form.tpm_password_answer_key }}</div>
         </div>
 
         <div id="item-fields-wait_for_enter" class="row g-3 d-none">
@@ -134,7 +167,7 @@
         </div>
       </div>
       <div class="alert alert-info mt-3 mb-0 small">
-        Hostname items use built-in prompts and do not require extra configuration here.
+        Hostname and other prompt-driven items can optionally use answer keys for non-interactive restores.
       </div>
       <div class="d-flex gap-2 mt-3">
         <button class="btn btn-primary" type="submit">Save</button>
@@ -151,7 +184,7 @@
       return;
     }
 
-    const sectionIds = ['ad_join', 'static_ip', 'luks_rotate', 'bootloader_password', 'local_user', 'redhat_registration', 'tpm_integration', 'wait_for_enter', 'custom_script'];
+    const sectionIds = ['hostname', 'ad_join', 'static_ip', 'luks_rotate', 'bootloader_password', 'local_user', 'redhat_registration', 'tpm_integration', 'wait_for_enter', 'custom_script'];
     const autodetectCheckbox = document.querySelector('input[name="luks_autodetect"]');
     const luksDeviceField = document.querySelector('[data-luks-device-field]');
 

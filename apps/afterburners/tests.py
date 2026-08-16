@@ -337,6 +337,7 @@ class AfterburnerItemFormTests(TestCase):
                         "name": "Repo channel",
                         "question": "Which channel should be used?",
                         "env_var": "REPO_CHANNEL",
+                        "answer_key": "REPO_CHANNEL_ANSWER",
                     }
                 ]),
             }
@@ -348,6 +349,7 @@ class AfterburnerItemFormTests(TestCase):
         self.assertEqual(payload[0]["description"], "Repo channel")
         self.assertEqual(payload[0]["label"], "Which channel should be used?")
         self.assertEqual(payload[0]["key"], "REPO_CHANNEL")
+        self.assertEqual(payload[0]["answer_key"], "REPO_CHANNEL_ANSWER")
 
     def test_custom_script_questions_json_requires_required_fields(self):
         form = AfterburnerItemForm(
@@ -385,13 +387,13 @@ class AfterburnerRedHatRegistrationSnippetTests(TestCase):
         )
 
         snippet = _build_item_snippet(item)
-        self.assertIn("prompt_bool RHSM_USE_ACTIVATION_KEY", snippet)
+        self.assertIn("prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY", snippet)
         self.assertIn("while true; do", snippet)
         self.assertIn("Red Hat registration failed. Try again.", snippet)
         self.assertIn("if run_chroot subscription-manager register --force --org", snippet)
         self.assertIn("if run_chroot subscription-manager register --force --username", snippet)
-        self.assertIn("prompt_password RHSM_PASSWORD", snippet)
-        self.assertIn("prompt_text RHSM_REPO_IDS_USER", snippet)
+        self.assertIn("prompt_password_with_answer RHSM_PASSWORD", snippet)
+        self.assertIn("prompt_text_with_answer RHSM_REPO_IDS_USER", snippet)
         self.assertIn("subscription-manager repos --enable=", snippet)
         self.assertIn(f"RHSM_REPO_FILE=/run/install/repo/deploy/{RHSM_REPO_IDS_FILENAME}", snippet)
 
@@ -432,7 +434,7 @@ class AfterburnerLocalUserSnippetTests(TestCase):
         )
 
         snippet = _build_item_snippet(item)
-        self.assertIn("prompt_text LOCAL_USER_GROUPS", snippet)
+        self.assertIn("prompt_text_with_answer LOCAL_USER_GROUPS", snippet)
         self.assertIn("run_chroot groupadd -f", snippet)
         self.assertIn("run_chroot usermod -aG \"$LOCAL_USER_GROUP\"", snippet)
 
@@ -503,6 +505,29 @@ class AfterburnerCustomScriptRunModeSnippetTests(TestCase):
 
         self.assertIn("run_chroot bash /tmp/tuxws-afterburner-custom.sh", snippet)
         self.assertIn("$TARGET_ROOT/tmp/tuxws-afterburner-custom.sh", snippet)
+
+    def test_custom_script_snippet_uses_answer_key_prompt_helpers(self):
+        profile = AfterburnerProfile.objects.create(name="snippet-answer-key", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="custom",
+            item_type=AfterburnerItem.TYPE_CUSTOM_SCRIPT,
+            config={"script_body": "echo ok", "run_mode": "non_chroot"},
+        )
+        AfterburnerScriptInput.objects.create(
+            item=item,
+            order=1,
+            key="TEAM_NAME",
+            label="Team",
+            input_type=AfterburnerScriptInput.TYPE_STRING,
+            answer_key="TEAM_ANSWER",
+        )
+
+        snippet = _build_item_snippet(item)
+
+        self.assertIn("prompt_text_with_answer TEAM_NAME", snippet)
+        self.assertIn("TEAM_ANSWER", snippet)
 
 
 class AfterburnerOrderingViewsTests(TestCase):
