@@ -462,13 +462,13 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
                 + _shell_quote(org_id_answer_key)
                 + " RHSM_ANSWERS_ORG_ID && lookup_answer "
                 + _shell_quote(activation_key_answer_key)
-                + " RHSM_ANSWERS_ACTIVATION_KEY && [[ -n \"${RHSM_ANSWERS_ORG_ID:-}\" && -n \"${RHSM_ANSWERS_ACTIVATION_KEY:-}\" ]]; then\n"
+                + " RHSM_ANSWERS_ACTIVATION_KEY && [[ -n \"${RHSM_ANSWERS_ORG_ID//[[:space:]]/}\" && -n \"${RHSM_ANSWERS_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
                 "    RHSM_MODE_FROM_ANSWERS=\"activation\"\n"
                 "  elif lookup_answer "
                 + _shell_quote(username_answer_key)
                 + " RHSM_ANSWERS_USERNAME && lookup_answer "
                 + _shell_quote(password_answer_key)
-                + " RHSM_ANSWERS_PASSWORD && [[ -n \"${RHSM_ANSWERS_USERNAME:-}\" && -n \"${RHSM_ANSWERS_PASSWORD:-}\" ]]; then\n"
+                + " RHSM_ANSWERS_PASSWORD && [[ -n \"${RHSM_ANSWERS_USERNAME//[[:space:]]/}\" && -n \"${RHSM_ANSWERS_PASSWORD//[[:space:]]/}\" ]]; then\n"
                 "    RHSM_MODE_FROM_ANSWERS=\"userpass\"\n"
                 "  fi\n"
                 "  if [[ \"$RHSM_MODE_FROM_ANSWERS\" == \"activation\" ]]; then\n"
@@ -494,7 +494,13 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
                 "    prompt_text_with_answer RHSM_ACTIVATION_KEY \"Activation key\" \"\" "
                 + _shell_quote(activation_key_answer_key)
                 + "\n"
-                "    if [[ -z \"${RHSM_ORG_ID:-}\" || -z \"${RHSM_ACTIVATION_KEY:-}\" ]]; then\n"
+                "    if [[ -z \"${RHSM_ORG_ID//[[:space:]]/}\" ]]; then\n"
+                "      prompt_text RHSM_ORG_ID \"Organization ID\" \"\"\n"
+                "    fi\n"
+                "    if [[ -z \"${RHSM_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
+                "      prompt_text RHSM_ACTIVATION_KEY \"Activation key\" \"\"\n"
+                "    fi\n"
+                "    if [[ -z \"${RHSM_ORG_ID//[[:space:]]/}\" || -z \"${RHSM_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
                 "      echo \"Org ID and activation key are required\" >&2\n"
                 "      continue\n"
                 "    fi\n"
@@ -508,7 +514,13 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
                 "    prompt_password_with_answer RHSM_PASSWORD \"Red Hat password\" "
                 + _shell_quote(password_answer_key)
                 + "\n"
-                "    if [[ -z \"${RHSM_USERNAME:-}\" || -z \"${RHSM_PASSWORD:-}\" ]]; then\n"
+                "    if [[ -z \"${RHSM_USERNAME//[[:space:]]/}\" ]]; then\n"
+                "      prompt_text RHSM_USERNAME \"Red Hat username\" \"\"\n"
+                "    fi\n"
+                "    if [[ -z \"${RHSM_PASSWORD//[[:space:]]/}\" ]]; then\n"
+                "      prompt_password RHSM_PASSWORD \"Red Hat password\"\n"
+                "    fi\n"
+                "    if [[ -z \"${RHSM_USERNAME//[[:space:]]/}\" || -z \"${RHSM_PASSWORD//[[:space:]]/}\" ]]; then\n"
                 "      echo \"Username and password are required\" >&2\n"
                 "      continue\n"
                 "    fi\n"
