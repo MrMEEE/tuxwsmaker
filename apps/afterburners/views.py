@@ -38,6 +38,35 @@ def _sync_custom_script_inputs(*, item: AfterburnerItem, payload: list[dict[str,
         )
 
 
+def _sync_shared_luks_tpm_answer_keys(*, item: AfterburnerItem) -> None:
+    if item.item_type not in {AfterburnerItem.TYPE_LUKS_ROTATE, AfterburnerItem.TYPE_TPM_INTEGRATION}:
+        return
+
+    cfg = dict(item.config or {})
+    shared_autodetect_key = str(cfg.get("luks_autodetect_answer_key") or cfg.get("tpm_autodetect_answer_key") or "").strip()
+    shared_password_key = str(cfg.get("luks_new_password_answer_key") or cfg.get("tpm_password_answer_key") or "").strip()
+
+    target_items = list(
+        AfterburnerItem.objects.filter(
+            profile_id=item.profile_id,
+            item_type__in=[AfterburnerItem.TYPE_LUKS_ROTATE, AfterburnerItem.TYPE_TPM_INTEGRATION],
+        )
+    )
+    to_update: list[AfterburnerItem] = []
+    for target in target_items:
+        target_cfg = dict(target.config or {})
+        target_cfg["luks_autodetect_answer_key"] = shared_autodetect_key
+        target_cfg["luks_new_password_answer_key"] = shared_password_key
+        target_cfg.pop("tpm_autodetect_answer_key", None)
+        target_cfg.pop("tpm_password_answer_key", None)
+        if target_cfg != (target.config or {}):
+            target.config = target_cfg
+            to_update.append(target)
+
+    if to_update:
+        AfterburnerItem.objects.bulk_update(to_update, ["config"])
+
+
 def _custom_script_example_lines(item: AfterburnerItem | None) -> list[str]:
     lines = [
         "#!/usr/bin/env bash",
@@ -150,6 +179,7 @@ class AfterburnerItemCreateView(LoginRequiredMixin, CreateView):
         max_order = self.profile.items.order_by("-order").values_list("order", flat=True).first() or 0
         form.instance.order = max_order + 1
         response = super().form_valid(form)
+        _sync_shared_luks_tpm_answer_keys(item=self.object)
         _sync_custom_script_inputs(
             item=self.object,
             payload=form.cleaned_data.get("item_script_inputs_payload") or [],
@@ -177,6 +207,7 @@ class AfterburnerItemUpdateView(LoginRequiredMixin, UpdateView):
 
     def form_valid(self, form):
         response = super().form_valid(form)
+        _sync_shared_luks_tpm_answer_keys(item=self.object)
         _sync_custom_script_inputs(
             item=self.object,
             payload=form.cleaned_data.get("item_script_inputs_payload") or [],
@@ -200,6 +231,7 @@ class AfterburnerItemInlineCreateView(LoginRequiredMixin, View):
             max_order = profile.items.order_by("-order").values_list("order", flat=True).first() or 0
             item.order = max_order + 1
             item.save()
+            _sync_shared_luks_tpm_answer_keys(item=item)
             _sync_custom_script_inputs(
                 item=item,
                 payload=form.cleaned_data.get("item_script_inputs_payload") or [],
@@ -223,6 +255,7 @@ class AfterburnerItemInlineUpdateView(LoginRequiredMixin, View):
         form = AfterburnerItemForm(request.POST, instance=item, prefix=f"item-{item.id}")
         if form.is_valid():
             item = form.save()
+            _sync_shared_luks_tpm_answer_keys(item=item)
             _sync_custom_script_inputs(
                 item=item,
                 payload=form.cleaned_data.get("item_script_inputs_payload") or [],

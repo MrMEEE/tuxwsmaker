@@ -64,6 +64,25 @@ Kickstart-based VM creation in the worker additionally requires:
 - PXE output: generated as a bundle directory containing extracted kernel/initrd, BIOS and UEFI boot config, and manifest metadata
 - Compression: controlled by Server Configuration (enable_artifact_compression)
 
+## Answers file (afterburner)
+
+When a build enables answers-file generation, an answers partition includes answers.yaml.
+
+For LUKS rotate and TPM integration, these answer keys are shared so values only need to be set once:
+
+- LUKS autodetect toggle: use the same key in both items, for example LUKS_AUTODETECT
+- LUKS password: use the same key in both items, for example LUKS_PASSWORD_SHARED
+
+Expected values:
+
+- Autodetect toggle accepts yes/no style values (yes, true, 1 => enabled; anything else => disabled)
+- LUKS password is plain text
+
+Example answers.yaml snippet:
+
+LUKS_AUTODETECT: "yes"
+LUKS_PASSWORD_SHARED: "your-passphrase"
+
 ## Artifact cleanup
 
 Run retention cleanup manually:

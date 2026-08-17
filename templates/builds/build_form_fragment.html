@@ -10,6 +10,11 @@
     <div class="col-md-6">{{ form.iso_image.label_tag }} {{ form.iso_image }}</div>
     <div class="col-md-6">{{ form.partition_layout.label_tag }} {{ form.partition_layout }}</div>
     <div class="col-md-6">{{ form.machine_config.label_tag }} {{ form.machine_config }}</div>
+    <div class="col-md-6">
+      <div class="form-check">{{ form.output_pxe }} {{ form.output_pxe.label_tag }}</div>
+      <div class="form-check">{{ form.output_usb_img }} {{ form.output_usb_img.label_tag }}</div>
+      <div class="form-check">{{ form.enable_answers_file_support }} {{ form.enable_answers_file_support.label_tag }}</div>
+    </div>
     <div class="col-12">
       <div id="boot-layout-compatibility" class="alert d-none mb-0" role="status"></div>
     </div>
@@ -62,10 +67,6 @@
         </div>
       </div>
       <div id="rhsm-sync-status" class="alert d-none mt-2 mb-0" role="status"></div>
-    </div>
-    <div class="col-md-6">
-      <div class="form-check">{{ form.output_pxe }} {{ form.output_pxe.label_tag }}</div>
-      <div class="form-check">{{ form.output_usb_img }} {{ form.output_usb_img.label_tag }}</div>
     </div>
   </div>
 

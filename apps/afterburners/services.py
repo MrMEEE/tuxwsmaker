@@ -20,8 +20,8 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
     label = item.name or item.get_item_type_display()
 
     if item.item_type == AfterburnerItem.TYPE_HOSTNAME:
-        hostname_value_answer_key = str(cfg.get("hostname_value_answer_key") or "")
-        hostname_domain_answer_key = str(cfg.get("hostname_domain_answer_key") or "")
+        hostname_value_answer_key = str(cfg.get("hostname_value_answer_key") or "HOSTNAME")
+        hostname_domain_answer_key = str(cfg.get("hostname_domain_answer_key") or "HOSTNAME_DOMAIN")
         return (
             f'echo "[afterburner] {label}: hostname"\n'
             "prompt_text_with_answer HOSTNAME_VALUE \"Hostname (short name)\" \"\" "
@@ -241,9 +241,10 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
     if item.item_type == AfterburnerItem.TYPE_LUKS_ROTATE:
         default_device = str(cfg.get("device") or "")
         autodetect = bool(cfg.get("autodetect") or False)
+        autodetect_answer_key = str(cfg.get("luks_autodetect_answer_key") or "")
         device_answer_key = str(cfg.get("luks_device_answer_key") or "")
-        current_password_answer_key = str(cfg.get("luks_current_password_answer_key") or "")
         new_password_answer_key = str(cfg.get("luks_new_password_answer_key") or "")
+        autodetect_default = "yes" if autodetect else "no"
         return (
             f'echo "[afterburner] {label}: rotate LUKS password"\n'
             "rotate_luks_container() {\n"
@@ -254,9 +255,7 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             "  if ! printf '%s' \"$luks_current\" | cryptsetup open --test-passphrase \"$luks_dev\" 2>/dev/null; then\n"
             "    echo \"[afterburner] Build-time passphrase did not match $luks_dev — please enter the current LUKS password.\"\n"
             "    while true; do\n"
-            "      prompt_password_with_answer luks_current \"Current LUKS password for $luks_dev\" "
-            + _shell_quote(current_password_answer_key)
-            + "\n"
+            "      prompt_password luks_current \"Current LUKS password for $luks_dev\"\n"
             "      if [[ -z \"${luks_current:-}\" ]]; then\n"
             "        echo \"Password cannot be empty\" >&2; continue\n"
             "      fi\n"
@@ -354,24 +353,28 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             + "LUKS_DEVICE_VALUE="
             + _shell_quote(default_device)
             + "\n"
-            + "if [[ -n \"$LUKS_DEVICE_VALUE\" ]]; then\n"
-            + "  prompt_text_with_answer LUKS_DEVICE_VALUE \"LUKS device path (optional when autodetect is enabled)\" \"$LUKS_DEVICE_VALUE\" "
+            + "prompt_bool_with_answer LUKS_USE_AUTODETECT \"Autodetect LUKS containers\" "
+            + _shell_quote(autodetect_default)
+            + " "
+            + _shell_quote(autodetect_answer_key)
+            + "\n"
+            + "if [[ \"$LUKS_USE_AUTODETECT\" == \"yes\" ]]; then\n"
+            + "  LUKS_AUTODETECT_OUTPUT=\"$(discover_luks_devices)\"; LUKS_AUTODETECT_RC=$?\n"
+            + "  if [[ $LUKS_AUTODETECT_RC -ne 0 ]]; then\n"
+            + "    exit $LUKS_AUTODETECT_RC\n"
+            + "  fi\n"
+            + "  while IFS= read -r luks_dev; do\n"
+            + "    [[ -n \"${luks_dev:-}\" ]] || continue\n"
+            + "    add_luks_target \"$luks_dev\"\n"
+            + "  done <<< \"$LUKS_AUTODETECT_OUTPUT\"\n"
+            + "else\n"
+            + "  if [[ -n \"$LUKS_DEVICE_VALUE\" ]]; then\n"
+            + "    prompt_text_with_answer LUKS_DEVICE_VALUE \"LUKS device path\" \"$LUKS_DEVICE_VALUE\" "
             + _shell_quote(device_answer_key)
             + "\n"
+            + "  fi\n"
+            + "  add_luks_target \"$LUKS_DEVICE_VALUE\"\n"
             + "fi\n"
-            + "add_luks_target \"$LUKS_DEVICE_VALUE\"\n"
-            + (
-                "LUKS_AUTODETECT_OUTPUT=\"$(discover_luks_devices)\"; LUKS_AUTODETECT_RC=$?\n"
-                "if [[ $LUKS_AUTODETECT_RC -ne 0 ]]; then\n"
-                "  exit $LUKS_AUTODETECT_RC\n"
-                "fi\n"
-                "while IFS= read -r luks_dev; do\n"
-                "  [[ -n \"${luks_dev:-}\" ]] || continue\n"
-                "  add_luks_target \"$luks_dev\"\n"
-                "done <<< \"$LUKS_AUTODETECT_OUTPUT\"\n"
-                if autodetect
-                else ""
-            )
             + "if [[ ${#LUKS_TARGETS[@]} -eq 0 ]]; then\n"
             + "  echo \"No LUKS containers found; skipping.\"\n"
             + "else\n"
@@ -450,102 +453,125 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         org_id_answer_key = str(cfg.get("rhsm_org_id_answer_key") or "")
         activation_key_answer_key = str(cfg.get("rhsm_activation_key_answer_key") or "")
         repo_ids_answer_key = str(cfg.get("rhsm_repo_ids_answer_key") or "")
+        answers_credentials_block = (
+            "rhsm_register_from_answers() {\n"
+            "  local rhsm_mode=\"\"\n"
+            "  local rhsm_answers_org_id=\"\"\n"
+            "  local rhsm_answers_activation_key=\"\"\n"
+            "  local rhsm_answers_username=\"\"\n"
+            "  local rhsm_answers_password=\"\"\n"
+            "  if lookup_answer "
+            + _shell_quote(org_id_answer_key)
+            + " rhsm_answers_org_id && lookup_answer "
+            + _shell_quote(activation_key_answer_key)
+            + " rhsm_answers_activation_key && [[ -n \"${rhsm_answers_org_id//[[:space:]]/}\" && -n \"${rhsm_answers_activation_key//[[:space:]]/}\" ]]; then\n"
+            "    rhsm_mode=\"activation\"\n"
+            "  elif lookup_answer "
+            + _shell_quote(username_answer_key)
+            + " rhsm_answers_username && lookup_answer "
+            + _shell_quote(password_answer_key)
+            + " rhsm_answers_password && [[ -n \"${rhsm_answers_username//[[:space:]]/}\" && -n \"${rhsm_answers_password//[[:space:]]/}\" ]]; then\n"
+            "    rhsm_mode=\"userpass\"\n"
+            "  fi\n"
+            "  if [[ \"$rhsm_mode\" == \"activation\" ]]; then\n"
+            "    if run_chroot subscription-manager register --force --org \"$rhsm_answers_org_id\" --activationkey \"$rhsm_answers_activation_key\"; then\n"
+            "      return 0\n"
+            "    fi\n"
+            "    echo \"Red Hat registration failed using org/activation key from answers file.\" >&2\n"
+            "    return 2\n"
+            "  elif [[ \"$rhsm_mode\" == \"userpass\" ]]; then\n"
+            "    if run_chroot subscription-manager register --force --username \"$rhsm_answers_username\" --password \"$rhsm_answers_password\"; then\n"
+            "      return 0\n"
+            "    fi\n"
+            "    echo \"Red Hat registration failed using username/password from answers file.\" >&2\n"
+            "    return 2\n"
+            "  fi\n"
+            "  return 1\n"
+            "}\n"
+        )
         if prompt_credentials:
             credentials_block = (
                 "while true; do\n"
-                "  RHSM_MODE_FROM_ANSWERS=\"\"\n"
-                "  RHSM_ANSWERS_ORG_ID=\"\"\n"
-                "  RHSM_ANSWERS_ACTIVATION_KEY=\"\"\n"
-                "  RHSM_ANSWERS_USERNAME=\"\"\n"
-                "  RHSM_ANSWERS_PASSWORD=\"\"\n"
-                "  if lookup_answer "
-                + _shell_quote(org_id_answer_key)
-                + " RHSM_ANSWERS_ORG_ID && lookup_answer "
-                + _shell_quote(activation_key_answer_key)
-                + " RHSM_ANSWERS_ACTIVATION_KEY && [[ -n \"${RHSM_ANSWERS_ORG_ID//[[:space:]]/}\" && -n \"${RHSM_ANSWERS_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
-                "    RHSM_MODE_FROM_ANSWERS=\"activation\"\n"
-                "  elif lookup_answer "
-                + _shell_quote(username_answer_key)
-                + " RHSM_ANSWERS_USERNAME && lookup_answer "
-                + _shell_quote(password_answer_key)
-                + " RHSM_ANSWERS_PASSWORD && [[ -n \"${RHSM_ANSWERS_USERNAME//[[:space:]]/}\" && -n \"${RHSM_ANSWERS_PASSWORD//[[:space:]]/}\" ]]; then\n"
-                "    RHSM_MODE_FROM_ANSWERS=\"userpass\"\n"
-                "  fi\n"
-                "  if [[ \"$RHSM_MODE_FROM_ANSWERS\" == \"activation\" ]]; then\n"
-                "    if run_chroot subscription-manager register --force --org \"$RHSM_ANSWERS_ORG_ID\" --activationkey \"$RHSM_ANSWERS_ACTIVATION_KEY\"; then\n"
-                "      break\n"
-                "    fi\n"
-                "    echo \"Red Hat registration failed using org/activation key from answers file.\" >&2\n"
-                "    exit 1\n"
-                "  elif [[ \"$RHSM_MODE_FROM_ANSWERS\" == \"userpass\" ]]; then\n"
-                "    if run_chroot subscription-manager register --force --username \"$RHSM_ANSWERS_USERNAME\" --password \"$RHSM_ANSWERS_PASSWORD\"; then\n"
-                "      break\n"
-                "    fi\n"
-                "    echo \"Red Hat registration failed using username/password from answers file.\" >&2\n"
-                "    exit 1\n"
-                "  fi\n"
-                "  prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\" "
+                + answers_credentials_block
+                + "  if rhsm_register_from_answers; then\n"
+                + "    break\n"
+                + "  else\n"
+                + "    rhsm_answers_status=$?\n"
+                + "    if [[ $rhsm_answers_status -eq 2 ]]; then\n"
+                + "      exit 1\n"
+                + "    fi\n"
+                + "  fi\n"
+                + "  prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY \"Use activation key registration\" \"no\" "
                 + _shell_quote(use_activation_key_answer_key)
                 + "\n"
-                "  if [[ \"$RHSM_USE_ACTIVATION_KEY\" == \"yes\" ]]; then\n"
-                "    prompt_text_with_answer RHSM_ORG_ID \"Organization ID\" \"\" "
+                + "  if [[ \"$RHSM_USE_ACTIVATION_KEY\" == \"yes\" ]]; then\n"
+                + "    prompt_text_with_answer RHSM_ORG_ID \"Organization ID\" \"\" "
                 + _shell_quote(org_id_answer_key)
                 + "\n"
-                "    prompt_text_with_answer RHSM_ACTIVATION_KEY \"Activation key\" \"\" "
+                + "    prompt_text_with_answer RHSM_ACTIVATION_KEY \"Activation key\" \"\" "
                 + _shell_quote(activation_key_answer_key)
                 + "\n"
-                "    if [[ -z \"${RHSM_ORG_ID//[[:space:]]/}\" ]]; then\n"
-                "      prompt_text RHSM_ORG_ID \"Organization ID\" \"\"\n"
-                "    fi\n"
-                "    if [[ -z \"${RHSM_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
-                "      prompt_text RHSM_ACTIVATION_KEY \"Activation key\" \"\"\n"
-                "    fi\n"
-                "    if [[ -z \"${RHSM_ORG_ID//[[:space:]]/}\" || -z \"${RHSM_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
-                "      echo \"Org ID and activation key are required\" >&2\n"
-                "      continue\n"
-                "    fi\n"
-                "    if run_chroot subscription-manager register --force --org \"$RHSM_ORG_ID\" --activationkey \"$RHSM_ACTIVATION_KEY\"; then\n"
-                "      break\n"
-                "    fi\n"
-                "  else\n"
-                "    prompt_text_with_answer RHSM_USERNAME \"Red Hat username\" \"\" "
+                + "    if [[ -z \"${RHSM_ORG_ID//[[:space:]]/}\" ]]; then\n"
+                + "      prompt_text RHSM_ORG_ID \"Organization ID\" \"\"\n"
+                + "    fi\n"
+                + "    if [[ -z \"${RHSM_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
+                + "      prompt_text RHSM_ACTIVATION_KEY \"Activation key\" \"\"\n"
+                + "    fi\n"
+                + "    if [[ -z \"${RHSM_ORG_ID//[[:space:]]/}\" || -z \"${RHSM_ACTIVATION_KEY//[[:space:]]/}\" ]]; then\n"
+                + "      echo \"Org ID and activation key are required\" >&2\n"
+                + "      continue\n"
+                + "    fi\n"
+                + "    if run_chroot subscription-manager register --force --org \"$RHSM_ORG_ID\" --activationkey \"$RHSM_ACTIVATION_KEY\"; then\n"
+                + "      break\n"
+                + "    fi\n"
+                + "  else\n"
+                + "    prompt_text_with_answer RHSM_USERNAME \"Red Hat username\" \"\" "
                 + _shell_quote(username_answer_key)
                 + "\n"
-                "    prompt_password_with_answer RHSM_PASSWORD \"Red Hat password\" "
+                + "    prompt_password_with_answer RHSM_PASSWORD \"Red Hat password\" "
                 + _shell_quote(password_answer_key)
                 + "\n"
-                "    if [[ -z \"${RHSM_USERNAME//[[:space:]]/}\" ]]; then\n"
-                "      prompt_text RHSM_USERNAME \"Red Hat username\" \"\"\n"
-                "    fi\n"
-                "    if [[ -z \"${RHSM_PASSWORD//[[:space:]]/}\" ]]; then\n"
-                "      prompt_password RHSM_PASSWORD \"Red Hat password\"\n"
-                "    fi\n"
-                "    if [[ -z \"${RHSM_USERNAME//[[:space:]]/}\" || -z \"${RHSM_PASSWORD//[[:space:]]/}\" ]]; then\n"
-                "      echo \"Username and password are required\" >&2\n"
-                "      continue\n"
-                "    fi\n"
-                "    if run_chroot subscription-manager register --force --username \"$RHSM_USERNAME\" --password \"$RHSM_PASSWORD\"; then\n"
-                "      break\n"
-                "    fi\n"
-                "  fi\n"
-                "  echo \"Red Hat registration failed. Try again.\" >&2\n"
-                "done\n"
-            )
-        elif default_org_id and default_activation_key:
-            credentials_block = (
-                "run_chroot subscription-manager register --force --org "
-                + _shell_quote(default_org_id)
-                + " --activationkey "
-                + _shell_quote(default_activation_key)
-                + "\n"
+                + "    if [[ -z \"${RHSM_USERNAME//[[:space:]]/}\" ]]; then\n"
+                + "      prompt_text RHSM_USERNAME \"Red Hat username\" \"\"\n"
+                + "    fi\n"
+                + "    if [[ -z \"${RHSM_PASSWORD//[[:space:]]/}\" ]]; then\n"
+                + "      prompt_password RHSM_PASSWORD \"Red Hat password\"\n"
+                + "    fi\n"
+                + "    if [[ -z \"${RHSM_USERNAME//[[:space:]]/}\" || -z \"${RHSM_PASSWORD//[[:space:]]/}\" ]]; then\n"
+                + "      echo \"Username and password are required\" >&2\n"
+                + "      continue\n"
+                + "    fi\n"
+                + "    if run_chroot subscription-manager register --force --username \"$RHSM_USERNAME\" --password \"$RHSM_PASSWORD\"; then\n"
+                + "      break\n"
+                + "    fi\n"
+                + "  fi\n"
+                + "  echo \"Red Hat registration failed. Try again.\" >&2\n"
+                + "done\n"
             )
         else:
             credentials_block = (
-                "run_chroot subscription-manager register --force --username "
-                + _shell_quote(default_username)
-                + " --password "
-                + _shell_quote(default_password)
-                + "\n"
+                answers_credentials_block
+                + "if rhsm_register_from_answers; then\n"
+                + "  :\n"
+                + "else\n"
+                + "  rhsm_answers_status=$?\n"
+                + "  if [[ $rhsm_answers_status -eq 2 ]]; then\n"
+                + "    exit 1\n"
+                + "  fi\n"
+                + (
+                    "  run_chroot subscription-manager register --force --org "
+                    + _shell_quote(default_org_id)
+                    + " --activationkey "
+                    + _shell_quote(default_activation_key)
+                    + "\n"
+                    if default_org_id and default_activation_key
+                    else "  run_chroot subscription-manager register --force --username "
+                    + _shell_quote(default_username)
+                    + " --password "
+                    + _shell_quote(default_password)
+                    + "\n"
+                )
+                + "fi\n"
             )
 
         repo_assignment_block = (
@@ -592,8 +618,10 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
         tpm_hash = str(cfg.get("hash") or "sha256").strip() or "sha256"
         tpm_key = str(cfg.get("key") or "ecc").strip() or "ecc"
         tpm_pcr_bank = str(cfg.get("pcr_bank") or "sha256").strip() or "sha256"
+        autodetect_answer_key = str(cfg.get("luks_autodetect_answer_key") or cfg.get("tpm_autodetect_answer_key") or "")
         device_answer_key = str(cfg.get("tpm_device_answer_key") or "")
-        password_answer_key = str(cfg.get("tpm_password_answer_key") or "")
+        password_answer_key = str(cfg.get("luks_new_password_answer_key") or cfg.get("tpm_password_answer_key") or "")
+        autodetect_default = "yes" if autodetect else "no"
 
         raw_pcr_ids = cfg.get("pcr_ids")
         if isinstance(raw_pcr_ids, str):
@@ -706,24 +734,28 @@ def _build_item_snippet(item: AfterburnerItem) -> str:
             + "TPM_DEVICE_VALUE="
             + _shell_quote(default_device)
             + "\n"
-            + "if [[ -n \"$TPM_DEVICE_VALUE\" ]]; then\n"
-            + "  prompt_text_with_answer TPM_DEVICE_VALUE \"LUKS device path (optional when autodetect is enabled)\" \"$TPM_DEVICE_VALUE\" "
+            + "prompt_bool_with_answer TPM_USE_AUTODETECT \"Autodetect LUKS containers\" "
+            + _shell_quote(autodetect_default)
+            + " "
+            + _shell_quote(autodetect_answer_key)
+            + "\n"
+            + "if [[ \"$TPM_USE_AUTODETECT\" == \"yes\" ]]; then\n"
+            + "  TPM_AUTODETECT_OUTPUT=\"$(discover_tpm_luks_devices)\"; TPM_AUTODETECT_RC=$?\n"
+            + "  if [[ $TPM_AUTODETECT_RC -ne 0 ]]; then\n"
+            + "    exit $TPM_AUTODETECT_RC\n"
+            + "  fi\n"
+            + "  while IFS= read -r luks_dev; do\n"
+            + "    [[ -n \"$luks_dev\" ]] || continue\n"
+            + "    add_tpm_target \"$luks_dev\"\n"
+            + "  done <<< \"$TPM_AUTODETECT_OUTPUT\"\n"
+            + "else\n"
+            + "  if [[ -n \"$TPM_DEVICE_VALUE\" ]]; then\n"
+            + "    prompt_text_with_answer TPM_DEVICE_VALUE \"LUKS device path (optional when autodetect is enabled)\" \"$TPM_DEVICE_VALUE\" "
             + _shell_quote(device_answer_key)
             + "\n"
+            + "  fi\n"
+            + "  add_tpm_target \"$TPM_DEVICE_VALUE\"\n"
             + "fi\n"
-            + "add_tpm_target \"$TPM_DEVICE_VALUE\"\n"
-            + (
-                "TPM_AUTODETECT_OUTPUT=\"$(discover_tpm_luks_devices)\"; TPM_AUTODETECT_RC=$?\n"
-                "if [[ $TPM_AUTODETECT_RC -ne 0 ]]; then\n"
-                "  exit $TPM_AUTODETECT_RC\n"
-                "fi\n"
-                "while IFS= read -r luks_dev; do\n"
-                "  [[ -n \"$luks_dev\" ]] || continue\n"
-                "  add_tpm_target \"$luks_dev\"\n"
-                "done <<< \"$TPM_AUTODETECT_OUTPUT\"\n"
-                if autodetect
-                else ""
-            )
             + "if [[ ${#TPM_TARGETS[@]} -eq 0 ]]; then\n"
             + "  echo \"No LUKS containers selected for TPM integration; skipping.\"\n"
             + "else\n"
@@ -924,6 +956,7 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "declare -A ANSWERS_VALUES=()",
         "ANSWERS_LOADED=0",
         "ANSWERS_PATH=\"${ANSWERS_FILE:-}\"",
+        "ANSWERS_DEBUG=\"${ANSWERS_DEBUG:-0}\"",
         "",
         "load_answers_file() {",
         "  [[ \"$ANSWERS_LOADED\" == \"1\" ]] && return 0",
@@ -935,6 +968,10 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "    while IFS=$'\\t' read -r answer_key answer_value; do",
         "      [[ -n \"${answer_key:-}\" ]] || continue",
         "      ANSWERS_VALUES[$answer_key]=\"$answer_value\"",
+        "      answer_key_lc=\"${answer_key,,}\"",
+        "      if [[ \"$answer_key_lc\" != \"$answer_key\" && -z \"${ANSWERS_VALUES[$answer_key_lc]:-}\" ]]; then",
+        "        ANSWERS_VALUES[$answer_key_lc]=\"$answer_value\"",
+        "      fi",
         "    done < <(python3 - \"$ANSWERS_PATH\" <<'PY'",
         "import sys",
         "from pathlib import Path",
@@ -969,18 +1006,31 @@ def render_afterburner_script(*, build, output_dir: Path) -> Path:
         "    answer_value=\"$(echo \"$answer_value\" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')\"",
         "    [[ -n \"$answer_key\" ]] || continue",
         "    ANSWERS_VALUES[$answer_key]=\"$answer_value\"",
+        "    answer_key_lc=\"${answer_key,,}\"",
+        "    if [[ \"$answer_key_lc\" != \"$answer_key\" && -z \"${ANSWERS_VALUES[$answer_key_lc]:-}\" ]]; then",
+        "      ANSWERS_VALUES[$answer_key_lc]=\"$answer_value\"",
+        "    fi",
         "  done < \"$ANSWERS_PATH\"",
         "}",
         "",
         "lookup_answer() {",
         "  local answer_key=\"$1\"",
+        "  local answer_key_lc=\"\"",
         "  local out_var=\"$2\"",
         "  [[ -n \"$answer_key\" ]] || return 1",
         "  load_answers_file",
         "  if [[ -v ANSWERS_VALUES[$answer_key] ]]; then",
         "    printf -v \"$out_var\" '%s' \"${ANSWERS_VALUES[$answer_key]}\"",
+        "    if [[ \"$ANSWERS_DEBUG\" == \"1\" ]]; then echo \"[afterburner] answer hit: $answer_key\" >&2; fi",
         "    return 0",
         "  fi",
+        "  answer_key_lc=\"${answer_key,,}\"",
+        "  if [[ -v ANSWERS_VALUES[$answer_key_lc] ]]; then",
+        "    printf -v \"$out_var\" '%s' \"${ANSWERS_VALUES[$answer_key_lc]}\"",
+        "    if [[ \"$ANSWERS_DEBUG\" == \"1\" ]]; then echo \"[afterburner] answer hit (normalized): $answer_key -> $answer_key_lc\" >&2; fi",
+        "    return 0",
+        "  fi",
+        "  if [[ \"$ANSWERS_DEBUG\" == \"1\" ]]; then echo \"[afterburner] answer miss: $answer_key\" >&2; fi",
         "  return 1",
         "}",
         "",

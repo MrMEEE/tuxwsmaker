@@ -29,8 +29,9 @@ class ArtifactExportError(RuntimeError):
 
 
 DEPLOY_MANIFEST_VERSION = 1
-ANSWERS_PARTITION_LABEL = "TUXWSANSWERS"
+ANSWERS_PARTITION_LABEL = "TUXWSANSWR"
 ANSWERS_PARTITION_SIZE_BYTES = 100 * 1024 * 1024
+IGNORED_ANSWER_KEY_CONFIG_FIELDS = {"luks_current_password_answer_key"}
 
 
 def _collect_build_answer_keys(*, build: BuildDefinition) -> list[str]:
@@ -48,6 +49,8 @@ def _collect_build_answer_keys(*, build: BuildDefinition) -> list[str]:
         cfg = item.config if isinstance(item.config, dict) else {}
         for field_name, raw_value in cfg.items():
             if not str(field_name).endswith("_answer_key"):
+                continue
+            if str(field_name) in IGNORED_ANSWER_KEY_CONFIG_FIELDS:
                 continue
             value = str(raw_value or "").strip()
             if value:
@@ -283,9 +286,19 @@ def _append_answers_partition_if_supported(*, output_path: Path, answers_file_co
     with tempfile.TemporaryDirectory(prefix="tuxwsmaker-answers-part-", dir=str(output_path.parent)) as tmp:
         tmp_dir = Path(tmp)
         answers_image = tmp_dir / "answers.img"
+        answers_start_lba = partition_map[answers_partition_number]["start_byte"] // 512
         with answers_image.open("wb") as f:
             f.truncate(partition_map[answers_partition_number]["size_bytes"])
-        _run_checked(["mkfs.vfat", "-F", "32", "-n", ANSWERS_PARTITION_LABEL, str(answers_image)])
+        _run_checked([
+            "mkfs.vfat",
+            "-F",
+            "32",
+            "-h",
+            str(answers_start_lba),
+            "-n",
+            ANSWERS_PARTITION_LABEL,
+            str(answers_image),
+        ])
         if answers_file_content:
             _write_answers_yaml_to_fat_image(fat_image=answers_image, answers_yaml=answers_file_content)
         _copy_partition_image_into_disk(
@@ -424,11 +437,18 @@ def _write_uefi_gpt_usb_image_from_bundle(
         str(output_path),
         "mklabel",
         "gpt",
+        "disk_set",
+        "pmbr_boot",
+        "on",
         "mkpart",
         "EFI",
         "fat32",
         "1MiB",
         "513MiB",
+        "set",
+        "1",
+        "boot",
+        "on",
         "set",
         "1",
         "esp",
@@ -457,10 +477,20 @@ def _write_uefi_gpt_usb_image_from_bundle(
         esp_image = tmp_dir / "esp.img"
         data_image = tmp_dir / "data.img"
         answers_image = tmp_dir / "answers.img"
+        esp_start_lba = partition_map[1]["start_byte"] // 512
 
         with esp_image.open("wb") as f:
             f.truncate(partition_map[1]["size_bytes"])
-        _run_checked(["mkfs.vfat", "-F", "32", "-n", "TUXWSEFI", str(esp_image)])
+        _run_checked([
+            "mkfs.vfat",
+            "-F",
+            "32",
+            "-h",
+            str(esp_start_lba),
+            "-n",
+            "TUXWSEFI",
+            str(esp_image),
+        ])
 
         efi_tree = _prepare_efi_boot_tree(
             source_iso_path=source_iso_path,
@@ -485,9 +515,19 @@ def _write_uefi_gpt_usb_image_from_bundle(
         )
 
         if enable_answers_file_support and 3 in partition_map:
+            answers_start_lba = partition_map[3]["start_byte"] // 512
             with answers_image.open("wb") as f:
                 f.truncate(partition_map[3]["size_bytes"])
-            _run_checked(["mkfs.vfat", "-F", "32", "-n", ANSWERS_PARTITION_LABEL, str(answers_image)])
+            _run_checked([
+                "mkfs.vfat",
+                "-F",
+                "32",
+                "-h",
+                str(answers_start_lba),
+                "-n",
+                ANSWERS_PARTITION_LABEL,
+                str(answers_image),
+            ])
             if answers_file_content:
                 _write_answers_yaml_to_fat_image(fat_image=answers_image, answers_yaml=answers_file_content)
             _copy_partition_image_into_disk(
@@ -581,7 +621,7 @@ def _write_usb_instructions(*, build: BuildDefinition, out_dir: Path) -> None:
         answers_section = (
             "Answers file support\n"
             "--------------------\n"
-            "This USB image includes a 100MB VFAT partition labeled TUXWSANSWERS.\n"
+            "This USB image includes a 100MB VFAT partition labeled TUXWSANSWR.\n"
             "Place your answers file in the root using one of these names (checked in order):\n"
             "- answers.yaml\n"
             "- answers.yml\n"

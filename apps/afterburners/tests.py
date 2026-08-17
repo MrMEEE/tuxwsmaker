@@ -124,6 +124,24 @@ class AfterburnerItemFormTests(TestCase):
         self.assertFalse(form.is_valid())
         self.assertIn("Provide a device or enable autodetect", form.errors.as_text())
 
+    def test_luks_rotate_saves_shared_autodetect_and_password_keys(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_LUKS_ROTATE,
+                "luks_device": "/dev/sda3",
+                "luks_autodetect_answer_key": "LUKS_AUTODETECT_SHARED",
+                "luks_new_password_answer_key": "LUKS_PASSWORD_SHARED",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        item = form.save(commit=False)
+        item.profile = self.profile
+        item.order = 1
+        item.save()
+        self.assertEqual(item.config["luks_autodetect_answer_key"], "LUKS_AUTODETECT_SHARED")
+        self.assertEqual(item.config["luks_new_password_answer_key"], "LUKS_PASSWORD_SHARED")
+
     def test_wait_for_enter_requires_message(self):
         form = AfterburnerItemForm(
             data={
@@ -252,6 +270,28 @@ class AfterburnerItemFormTests(TestCase):
         item.order = 1
         item.save()
         self.assertEqual(item.config["pcr_ids"], [])
+
+    def test_tpm_integration_saves_shared_luks_keys(self):
+        form = AfterburnerItemForm(
+            data={
+                "item_type": AfterburnerItem.TYPE_TPM_INTEGRATION,
+                "tpm_device": "/dev/sda3",
+                "tpm_hash": "sha256",
+                "tpm_pcr_bank": "sha256",
+                "tpm_key": "ecc",
+                "tpm_pcr_ids": ["7"],
+                "tpm_autodetect_answer_key": "LUKS_AUTODETECT_SHARED",
+                "tpm_password_answer_key": "LUKS_PASSWORD_SHARED",
+            }
+        )
+
+        self.assertTrue(form.is_valid(), form.errors.as_text())
+        item = form.save(commit=False)
+        item.profile = self.profile
+        item.order = 1
+        item.save()
+        self.assertEqual(item.config["luks_autodetect_answer_key"], "LUKS_AUTODETECT_SHARED")
+        self.assertEqual(item.config["luks_new_password_answer_key"], "LUKS_PASSWORD_SHARED")
 
     def test_redhat_registration_requires_prompt_or_preset_credentials(self):
         form = AfterburnerItemForm(
@@ -435,20 +475,195 @@ class AfterburnerRedHatRegistrationSnippetTests(TestCase):
         )
 
         snippet = _build_item_snippet(item)
-        self.assertIn("RHSM_MODE_FROM_ANSWERS=\"\"", snippet)
-        self.assertIn("lookup_answer RHSM_ORG RHSM_ANSWERS_ORG_ID", snippet)
-        self.assertIn("lookup_answer RHSM_ACT_KEY RHSM_ANSWERS_ACTIVATION_KEY", snippet)
-        self.assertIn("lookup_answer RHSM_USER RHSM_ANSWERS_USERNAME", snippet)
-        self.assertIn("lookup_answer RHSM_PASS RHSM_ANSWERS_PASSWORD", snippet)
-        self.assertIn('${RHSM_ANSWERS_ORG_ID//[[:space:]]/}', snippet)
-        self.assertIn('${RHSM_ANSWERS_ACTIVATION_KEY//[[:space:]]/}', snippet)
-        self.assertIn('${RHSM_ANSWERS_USERNAME//[[:space:]]/}', snippet)
-        self.assertIn('${RHSM_ANSWERS_PASSWORD//[[:space:]]/}', snippet)
+        self.assertIn("lookup_answer RHSM_ORG rhsm_answers_org_id", snippet)
+        self.assertIn("lookup_answer RHSM_ACT_KEY rhsm_answers_activation_key", snippet)
+        self.assertIn("lookup_answer RHSM_USER rhsm_answers_username", snippet)
+        self.assertIn("lookup_answer RHSM_PASS rhsm_answers_password", snippet)
+        self.assertIn('${rhsm_answers_org_id//[[:space:]]/}', snippet)
+        self.assertIn('${rhsm_answers_activation_key//[[:space:]]/}', snippet)
+        self.assertIn('${rhsm_answers_username//[[:space:]]/}', snippet)
+        self.assertIn('${rhsm_answers_password//[[:space:]]/}', snippet)
         self.assertIn('prompt_text RHSM_USERNAME "Red Hat username" ""', snippet)
         self.assertIn('prompt_password RHSM_PASSWORD "Red Hat password"', snippet)
         self.assertIn("Red Hat registration failed using org/activation key from answers file.", snippet)
         self.assertIn("Red Hat registration failed using username/password from answers file.", snippet)
         self.assertIn("prompt_bool_with_answer RHSM_USE_ACTIVATION_KEY", snippet)
+
+    def test_snippet_uses_answers_file_even_without_prompt_mode(self):
+        profile = AfterburnerProfile.objects.create(name="rhsm-answers-noprompt", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="rhsm answers no prompt",
+            item_type=AfterburnerItem.TYPE_REDHAT_REGISTRATION,
+            config={
+                "prompt_credentials": False,
+                "rhsm_username_answer_key": "RHSM_USER",
+                "rhsm_password_answer_key": "RHSM_PASS",
+                "rhsm_org_id_answer_key": "RHSM_ORG",
+                "rhsm_activation_key_answer_key": "RHSM_ACT_KEY",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn("rhsm_register_from_answers()", snippet)
+        self.assertIn("if rhsm_register_from_answers; then", snippet)
+        self.assertIn("lookup_answer RHSM_ORG rhsm_answers_org_id", snippet)
+        self.assertIn("lookup_answer RHSM_USER rhsm_answers_username", snippet)
+
+    def test_snippet_prefers_org_activation_over_userpass_when_both_answers_present(self):
+        profile = AfterburnerProfile.objects.create(name="rhsm-answers-both", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="rhsm answers both",
+            item_type=AfterburnerItem.TYPE_REDHAT_REGISTRATION,
+            config={
+                "prompt_credentials": True,
+                "rhsm_username_answer_key": "RHSM_USER",
+                "rhsm_password_answer_key": "RHSM_PASS",
+                "rhsm_org_id_answer_key": "RHSM_ORG",
+                "rhsm_activation_key_answer_key": "RHSM_ACT_KEY",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        org_line = snippet.index('lookup_answer RHSM_ORG rhsm_answers_org_id')
+        user_line = snippet.index('lookup_answer RHSM_USER rhsm_answers_username')
+        self.assertLess(org_line, user_line)
+        self.assertIn('rhsm_mode="activation"', snippet)
+
+
+class AfterburnerAnswerKeySnippetCoverageTests(TestCase):
+    def test_hostname_uses_builtin_fallback_keys_when_custom_keys_missing(self):
+        profile = AfterburnerProfile.objects.create(name="hostname-default-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="hostname",
+            item_type=AfterburnerItem.TYPE_HOSTNAME,
+            config={},
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn('prompt_text_with_answer HOSTNAME_VALUE "Hostname (short name)" "" HOSTNAME', snippet)
+        self.assertIn('prompt_text_with_answer HOSTNAME_DOMAIN "Domain name (optional)" "" HOSTNAME_DOMAIN', snippet)
+
+    def test_hostname_answer_keys_are_used(self):
+        profile = AfterburnerProfile.objects.create(name="hostname-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="hostname",
+            item_type=AfterburnerItem.TYPE_HOSTNAME,
+            config={
+                "hostname_value_answer_key": "HOSTNAME",
+                "hostname_domain_answer_key": "DOMAIN",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn('prompt_text_with_answer HOSTNAME_VALUE "Hostname (short name)" "" HOSTNAME', snippet)
+        self.assertIn('prompt_text_with_answer HOSTNAME_DOMAIN "Domain name (optional)" "" DOMAIN', snippet)
+
+    def test_ad_join_answer_keys_are_used(self):
+        profile = AfterburnerProfile.objects.create(name="ad-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="ad",
+            item_type=AfterburnerItem.TYPE_AD_JOIN,
+            config={
+                "domain": "outerrim.lan",
+                "computer_ou": "OU=Workstations,DC=outerrim,DC=lan",
+                "join_user": "joiner",
+                "ad_domain_answer_key": "AD_DOMAIN",
+                "ad_computer_ou_answer_key": "AD_OU",
+                "ad_join_user_answer_key": "AD_JOIN_USER",
+                "ad_join_password_answer_key": "AD_JOIN_PASS",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn('prompt_text_with_answer AD_DOMAIN "Active Directory domain (blank to skip)"', snippet)
+        self.assertIn('prompt_text_with_answer AD_JOIN_USER "AD join username"', snippet)
+        self.assertIn('prompt_password_with_answer AD_JOIN_PASS "AD join password"', snippet)
+        self.assertIn('prompt_text_with_answer AD_COMPUTER_OU "Computer OU (optional)"', snippet)
+        self.assertIn('AD_OU', snippet)
+
+    def test_static_ip_answer_keys_are_used(self):
+        profile = AfterburnerProfile.objects.create(name="static-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="static",
+            item_type=AfterburnerItem.TYPE_STATIC_IP,
+            config={
+                "interface": "eth0",
+                "ip_address": "192.0.2.10",
+                "prefix": "24",
+                "gateway": "192.0.2.1",
+                "dns": "1.1.1.1,8.8.8.8",
+                "static_interface_answer_key": "STATIC_IFACE",
+                "static_ip_address_answer_key": "STATIC_IP",
+                "static_prefix_answer_key": "STATIC_PREFIX",
+                "static_gateway_answer_key": "STATIC_GW",
+                "static_dns_answer_key": "STATIC_DNS",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn('prompt_text_with_answer STATIC_IFACE "Interface (blank to skip)"', snippet)
+        self.assertIn('prompt_text_with_answer STATIC_IP "IPv4 address"', snippet)
+        self.assertIn('prompt_text_with_answer STATIC_PREFIX "Prefix"', snippet)
+        self.assertIn('prompt_text_with_answer STATIC_GW "Gateway"', snippet)
+        self.assertIn('prompt_text_with_answer STATIC_DNS "DNS (comma separated)"', snippet)
+
+    def test_bootloader_answer_keys_are_used(self):
+        profile = AfterburnerProfile.objects.create(name="grub-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="bootloader",
+            item_type=AfterburnerItem.TYPE_BOOTLOADER_PASSWORD,
+            config={
+                "grub_user": "grub",
+                "bootloader_user_answer_key": "GRUB_USER",
+                "bootloader_password_answer_key": "GRUB_PASS",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn('prompt_text_with_answer GRUB_USER "GRUB superuser"', snippet)
+        self.assertIn('prompt_password_with_answer GRUB_PW_1 "GRUB password" GRUB_PASS', snippet)
+        self.assertIn('prompt_password_with_answer GRUB_PW_2 "Confirm GRUB password" GRUB_PASS', snippet)
+
+    def test_local_user_answer_keys_are_used(self):
+        profile = AfterburnerProfile.objects.create(name="local-answers", description="")
+        item = AfterburnerItem.objects.create(
+            profile=profile,
+            order=1,
+            name="local user",
+            item_type=AfterburnerItem.TYPE_LOCAL_USER,
+            config={
+                "groups": "wheel,video",
+                "prompt_groups": True,
+                "local_user_username_answer_key": "LOCAL_USER",
+                "local_user_firstname_answer_key": "LOCAL_FIRST",
+                "local_user_lastname_answer_key": "LOCAL_LAST",
+                "local_user_password_answer_key": "LOCAL_PASS",
+                "local_user_admin_answer_key": "LOCAL_ADMIN",
+                "local_user_groups_answer_key": "LOCAL_GROUPS",
+            },
+        )
+
+        snippet = _build_item_snippet(item)
+        self.assertIn('prompt_text_with_answer LOCAL_USER_USERNAME "Username (blank to skip)"', snippet)
+        self.assertIn('prompt_text_with_answer LOCAL_USER_FIRSTNAME "First name"', snippet)
+        self.assertIn('prompt_text_with_answer LOCAL_USER_LASTNAME "Last name"', snippet)
+        self.assertIn('prompt_password_with_answer LOCAL_USER_PASS_1 "Password" LOCAL_PASS', snippet)
+        self.assertIn('prompt_bool_with_answer LOCAL_USER_ADMIN "Grant sudo (wheel) access" "no" LOCAL_ADMIN', snippet)
+        self.assertIn('prompt_text_with_answer LOCAL_USER_GROUPS "Additional groups (comma-separated; blank to skip)"', snippet)
 
 
 class AfterburnerLocalUserSnippetTests(TestCase):
@@ -646,3 +861,77 @@ class AfterburnerOrderingViewsTests(TestCase):
             .values_list("id", flat=True)
         )
         self.assertEqual(ordered_ids, [self.input_b.id, self.input_a.id])
+
+
+class AfterburnerSharedLuksTpmKeysSyncTests(TestCase):
+    def setUp(self):
+        user_model = get_user_model()
+        self.user = user_model.objects.create_user(username="sync-user", password="secret")
+        self.client.force_login(self.user)
+
+        self.profile = AfterburnerProfile.objects.create(name="sync-profile", description="")
+        self.luks_item = AfterburnerItem.objects.create(
+            profile=self.profile,
+            order=1,
+            name="LUKS",
+            item_type=AfterburnerItem.TYPE_LUKS_ROTATE,
+            config={
+                "device": "/dev/sda3",
+                "autodetect": False,
+                "luks_autodetect_answer_key": "OLD_AUTO",
+                "luks_new_password_answer_key": "OLD_PASS",
+            },
+        )
+        self.tpm_item = AfterburnerItem.objects.create(
+            profile=self.profile,
+            order=2,
+            name="TPM",
+            item_type=AfterburnerItem.TYPE_TPM_INTEGRATION,
+            config={
+                "device": "/dev/sda3",
+                "autodetect": False,
+                "hash": "sha256",
+                "pcr_bank": "sha256",
+                "key": "ecc",
+                "pcr_ids": ["7"],
+                "luks_autodetect_answer_key": "OLD_AUTO",
+                "luks_new_password_answer_key": "OLD_PASS",
+            },
+        )
+
+    def test_inline_update_luks_syncs_shared_keys_to_tpm(self):
+        response = self.client.post(
+            reverse("afterburners:item-inline-update", args=[self.luks_item.id]),
+            {
+                f"item-{self.luks_item.id}-item_type": AfterburnerItem.TYPE_LUKS_ROTATE,
+                f"item-{self.luks_item.id}-luks_device": "/dev/sda3",
+                f"item-{self.luks_item.id}-luks_autodetect": "on",
+                f"item-{self.luks_item.id}-luks_autodetect_answer_key": "SHARED_AUTO",
+                f"item-{self.luks_item.id}-luks_new_password_answer_key": "SHARED_PASS",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.tpm_item.refresh_from_db()
+        self.assertEqual(self.tpm_item.config.get("luks_autodetect_answer_key"), "SHARED_AUTO")
+        self.assertEqual(self.tpm_item.config.get("luks_new_password_answer_key"), "SHARED_PASS")
+
+    def test_inline_update_tpm_syncs_shared_keys_to_luks(self):
+        response = self.client.post(
+            reverse("afterburners:item-inline-update", args=[self.tpm_item.id]),
+            {
+                f"item-{self.tpm_item.id}-item_type": AfterburnerItem.TYPE_TPM_INTEGRATION,
+                f"item-{self.tpm_item.id}-tpm_device": "/dev/sda3",
+                f"item-{self.tpm_item.id}-tpm_hash": "sha256",
+                f"item-{self.tpm_item.id}-tpm_pcr_bank": "sha256",
+                f"item-{self.tpm_item.id}-tpm_key": "ecc",
+                f"item-{self.tpm_item.id}-tpm_pcr_ids": ["7"],
+                f"item-{self.tpm_item.id}-tpm_autodetect_answer_key": "SYNCED_AUTO",
+                f"item-{self.tpm_item.id}-tpm_password_answer_key": "SYNCED_PASS",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.luks_item.refresh_from_db()
+        self.assertEqual(self.luks_item.config.get("luks_autodetect_answer_key"), "SYNCED_AUTO")
+        self.assertEqual(self.luks_item.config.get("luks_new_password_answer_key"), "SYNCED_PASS")

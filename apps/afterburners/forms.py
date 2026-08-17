@@ -64,9 +64,12 @@ class AfterburnerItemForm(forms.ModelForm):
         label="Autodetect LUKS containers",
         help_text="Scan the target system for LUKS containers and prompt for each one.",
     )
+    luks_autodetect_answer_key = forms.CharField(
+        required=False,
+        label="Answer key: autodetect LUKS containers (shared with TPM)",
+    )
     luks_device_answer_key = forms.CharField(required=False, label="Answer key: LUKS device")
-    luks_current_password_answer_key = forms.CharField(required=False, label="Answer key: current LUKS password")
-    luks_new_password_answer_key = forms.CharField(required=False, label="Answer key: new LUKS password")
+    luks_new_password_answer_key = forms.CharField(required=False, label="Answer key: new LUKS password (shared with TPM)")
 
     tpm_device = forms.CharField(required=False, label="Default LUKS block device")
     tpm_autodetect = forms.BooleanField(
@@ -101,7 +104,11 @@ class AfterburnerItemForm(forms.ModelForm):
         help_text="Add zero or more PCR IDs to bind in the TPM2 policy.",
     )
     tpm_device_answer_key = forms.CharField(required=False, label="Answer key: LUKS device")
-    tpm_password_answer_key = forms.CharField(required=False, label="Answer key: LUKS password")
+    tpm_autodetect_answer_key = forms.CharField(
+        required=False,
+        label="Answer key: autodetect LUKS containers (shared with LUKS rotate)",
+    )
+    tpm_password_answer_key = forms.CharField(required=False, label="Answer key: LUKS password (shared with LUKS rotate)")
 
     bootloader_user = forms.CharField(required=False, label="Default GRUB username")
     bootloader_user_answer_key = forms.CharField(required=False, label="Answer key: GRUB username")
@@ -206,14 +213,19 @@ class AfterburnerItemForm(forms.ModelForm):
 
             self.initial["luks_device"] = str(cfg.get("device") or "")
             self.initial["luks_autodetect"] = bool(cfg.get("autodetect") or False)
+            self.initial["luks_autodetect_answer_key"] = str(cfg.get("luks_autodetect_answer_key") or "")
             self.initial["luks_device_answer_key"] = str(cfg.get("luks_device_answer_key") or "")
-            self.initial["luks_current_password_answer_key"] = str(cfg.get("luks_current_password_answer_key") or "")
             self.initial["luks_new_password_answer_key"] = str(cfg.get("luks_new_password_answer_key") or "")
 
             self.initial["tpm_device"] = str(cfg.get("device") or "")
             self.initial["tpm_autodetect"] = bool(cfg.get("autodetect") or False)
             self.initial["tpm_device_answer_key"] = str(cfg.get("tpm_device_answer_key") or "")
-            self.initial["tpm_password_answer_key"] = str(cfg.get("tpm_password_answer_key") or "")
+            self.initial["tpm_autodetect_answer_key"] = str(
+                cfg.get("luks_autodetect_answer_key") or cfg.get("tpm_autodetect_answer_key") or ""
+            )
+            self.initial["tpm_password_answer_key"] = str(
+                cfg.get("luks_new_password_answer_key") or cfg.get("tpm_password_answer_key") or ""
+            )
 
             legacy_profile = str(cfg.get("policy_profile") or "").strip()
             if legacy_profile == "pcr7_11_sha256_ecc":
@@ -430,8 +442,8 @@ class AfterburnerItemForm(forms.ModelForm):
             config = {
                 "device": device,
                 "autodetect": autodetect,
+                "luks_autodetect_answer_key": key("luks_autodetect_answer_key"),
                 "luks_device_answer_key": key("luks_device_answer_key"),
-                "luks_current_password_answer_key": key("luks_current_password_answer_key"),
                 "luks_new_password_answer_key": key("luks_new_password_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_BOOTLOADER_PASSWORD:
@@ -530,8 +542,9 @@ class AfterburnerItemForm(forms.ModelForm):
                 "pcr_bank": tpm_pcr_bank,
                 "key": tpm_key,
                 "pcr_ids": pcr_ids,
+                "luks_autodetect_answer_key": key("tpm_autodetect_answer_key"),
                 "tpm_device_answer_key": key("tpm_device_answer_key"),
-                "tpm_password_answer_key": key("tpm_password_answer_key"),
+                "luks_new_password_answer_key": key("tpm_password_answer_key"),
             }
         elif item_type == AfterburnerItem.TYPE_WAIT_FOR_ENTER:
             message = str(cleaned.get("wait_message") or "").strip()

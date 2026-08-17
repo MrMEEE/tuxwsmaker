@@ -77,8 +77,8 @@
             </div>
             <div class="form-text">{{ form.luks_autodetect.help_text }}</div>
           </div>
+          <div class="col-md-6">{{ form.luks_autodetect_answer_key.label_tag }} {{ form.luks_autodetect_answer_key }}</div>
           <div class="col-md-6">{{ form.luks_device_answer_key.label_tag }} {{ form.luks_device_answer_key }}</div>
-          <div class="col-md-6">{{ form.luks_current_password_answer_key.label_tag }} {{ form.luks_current_password_answer_key }}</div>
           <div class="col-md-6">{{ form.luks_new_password_answer_key.label_tag }} {{ form.luks_new_password_answer_key }}</div>
         </div>
 
@@ -149,6 +149,7 @@
             </div>
             <div class="form-text">{{ form.tpm_autodetect.help_text }}</div>
           </div>
+          <div class="col-md-6">{{ form.tpm_autodetect_answer_key.label_tag }} {{ form.tpm_autodetect_answer_key }}</div>
           <div class="col-md-6">{{ form.tpm_device_answer_key.label_tag }} {{ form.tpm_device_answer_key }}</div>
           <div class="col-md-6">{{ form.tpm_password_answer_key.label_tag }} {{ form.tpm_password_answer_key }}</div>
         </div>

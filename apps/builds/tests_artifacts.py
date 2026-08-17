@@ -37,11 +37,29 @@ class ArtifactGenerationTests(TestCase):
                 "hostname_value_answer_key": "HOSTNAME",
                 "hostname_domain_answer_key": "DOMAIN",
                 "ignored_field": "x",
+                "luks_current_password_answer_key": "LUKS_CURRENT_IGNORED",
+                "luks_autodetect_answer_key": "LUKS_AUTODETECT_SHARED",
+            },
+        )
+        AfterburnerItem.objects.create(
+            profile=profile,
+            order=2,
+            name="tpm",
+            item_type=AfterburnerItem.TYPE_TPM_INTEGRATION,
+            config={
+                "device": "/dev/sda3",
+                "autodetect": True,
+                "hash": "sha256",
+                "pcr_bank": "sha256",
+                "key": "ecc",
+                "pcr_ids": ["7"],
+                "luks_autodetect_answer_key": "LUKS_AUTODETECT_SHARED",
+                "luks_new_password_answer_key": "LUKS_PASSWORD_SHARED",
             },
         )
         custom_item = AfterburnerItem.objects.create(
             profile=profile,
-            order=2,
+            order=3,
             name="custom",
             item_type=AfterburnerItem.TYPE_CUSTOM_SCRIPT,
             config={"script_body": "echo ok"},
@@ -66,10 +84,12 @@ class ArtifactGenerationTests(TestCase):
 
         keys = _collect_build_answer_keys(build=self.build)
 
-        self.assertEqual(keys, ["DOMAIN", "HOSTNAME", "TEAM_NAME"])
+        self.assertEqual(keys, ["DOMAIN", "HOSTNAME", "LUKS_AUTODETECT_SHARED", "LUKS_PASSWORD_SHARED", "TEAM_NAME"])
         yaml_content = _render_answers_yaml_template(keys=keys)
         self.assertIn('HOSTNAME: ""', yaml_content)
         self.assertIn('DOMAIN: ""', yaml_content)
+        self.assertIn('LUKS_AUTODETECT_SHARED: ""', yaml_content)
+        self.assertIn('LUKS_PASSWORD_SHARED: ""', yaml_content)
         self.assertIn('TEAM_NAME: ""', yaml_content)
 
     @patch("apps.builds.services.artifacts._copy_partition_image_into_disk")
@@ -203,7 +223,12 @@ class ArtifactGenerationTests(TestCase):
             order=1,
             name="rotate luks",
             item_type=AfterburnerItem.TYPE_LUKS_ROTATE,
-            config={"autodetect": True, "device": "/dev/sda3"},
+            config={
+                "autodetect": True,
+                "device": "/dev/sda3",
+                "luks_autodetect_answer_key": "LUKS_AUTODETECT_SHARED",
+                "luks_new_password_answer_key": "LUKS_PASSWORD_SHARED",
+            },
         )
         self.build.afterburner_selections.create(afterburner=profile, order=1)
 
@@ -235,6 +260,12 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("DEFAULT_LUKS_PASSWORD", script)
         self.assertIn("test-passphrase", script)
         self.assertIn("Confirm new LUKS password for", script)
+        self.assertIn('prompt_bool_with_answer LUKS_USE_AUTODETECT "Autodetect LUKS containers" yes', script)
+        self.assertIn("LUKS_AUTODETECT_SHARED", script)
+        self.assertIn("LUKS_PASSWORD_SHARED", script)
+        self.assertIn('prompt_text_with_answer LUKS_DEVICE_VALUE "LUKS device path"', script)
+        self.assertNotIn('prompt_password_with_answer luks_current "Current LUKS password for $luks_dev"', script)
+        self.assertIn('prompt_password luks_current "Current LUKS password for $luks_dev"', script)
 
     @patch("apps.builds.services.artifacts._extract_uefi_boot_assets_from_iso")
     @patch("apps.builds.services.artifacts._extract_iso_stage2_payload")
@@ -576,6 +607,8 @@ class ArtifactGenerationTests(TestCase):
                 "pcr_bank": "sha256",
                 "key": "ecc",
                 "pcr_ids": ["7"],
+                "luks_autodetect_answer_key": "LUKS_AUTODETECT_SHARED",
+                "luks_new_password_answer_key": "LUKS_PASSWORD_SHARED",
             },
         )
         self.build.afterburner_selections.create(afterburner=profile, order=1)
@@ -608,6 +641,10 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn('run_chroot clevis luks bind -y -k "$_clevis_tmpkey_chroot" -d "$container_dev" tpm2 "$TPM2_POLICY"', script)
         self.assertIn('run_chroot clevis luks list -d "$container_dev"', script)
         self.assertIn('cryptsetup luksRemoveKey "$container_dev" -', script)
+        self.assertIn('prompt_bool_with_answer TPM_USE_AUTODETECT "Autodetect LUKS containers" yes', script)
+        self.assertIn("LUKS_AUTODETECT_SHARED", script)
+        self.assertIn('prompt_password_with_answer luks_tpm_pass "Current LUKS password for $container_dev"', script)
+        self.assertIn("LUKS_PASSWORD_SHARED", script)
         self.assertIn('No TPM device found (/dev/tpmrm0 or /dev/tpm0); skipping TPM integration', script)
         self.assertIn('run_chroot dracut -q -f --regenerate-all', script)
 
@@ -703,7 +740,9 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn("sfdisk --force --wipe always --wipe-partitions always", restore_script)
         self.assertIn("Restoring partition", restore_script)
         self.assertIn("status()", restore_script)
-        self.assertIn("[$PART_INDEX/$TOTAL_PARTS]", restore_script)
+        self.assertIn("Partition {number} ({file_name}) {pct}% restored", restore_script)
+        self.assertIn("write_sparse_blocks()", restore_script)
+        self.assertIn("sparse_restore_stream()", restore_script)
         self.assertIn("Partition $number is empty; skipping write", restore_script)
         self.assertIn("grub2-install", restore_script)
         self.assertIn("Verifying BIOS bootloader", restore_script)
@@ -997,8 +1036,9 @@ class ArtifactGenerationTests(TestCase):
         self.assertIn('DEFAULT_LUKS_PASSWORD="${DEFAULT_LUKS_PASSWORD:-tuxwsmaker}"', script)
         self.assertIn('cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -', script)
         self.assertIn('restore_partition_payload_to "/dev/mapper/$map_name"', script)
-        self.assertIn('restore_target="$part_dev"', script)
-        self.assertIn('No LUKS header detected on $part_dev; bootstrapping LUKS and replaying payload', script)
+        self.assertIn('Reinitializing LUKS container on $part_dev and restoring payload', script)
+        self.assertIn('cryptsetup close "$map_name" >/dev/null 2>&1 || true', script)
+        self.assertIn('restore_partition_payload_to "$part_dev"', script)
         self.assertIn('restore_partition_payload_to() {', script)
         self.assertIn('sgdisk -e "$TARGET_DEV" >/dev/null 2>&1 || true', script)
         self.assertIn('TARGET_SECTORS="$(blockdev --getsz "$TARGET_DEV"', script)

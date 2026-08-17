@@ -256,7 +256,7 @@ setup_answers_support() {
   [[ "$ANSWERS_SUPPORT" == "yes" ]] || return 0
 
   local mount_root="/run/tuxwsmaker-answers"
-  local by_label="/dev/disk/by-label/TUXWSANSWERS"
+  local by_label="/dev/disk/by-label/TUXWSANSWR"
   local part_dev=""
 
   if [[ -e "$by_label" ]]; then
@@ -264,7 +264,7 @@ setup_answers_support() {
   else
     while IFS= read -r dev_path; do
       [[ -n "$dev_path" ]] || continue
-      if [[ "$(blkid -s LABEL -o value "$dev_path" 2>/dev/null || true)" == "TUXWSANSWERS" ]]; then
+      if [[ "$(blkid -s LABEL -o value "$dev_path" 2>/dev/null || true)" == "TUXWSANSWR" ]]; then
         part_dev="$dev_path"
         break
       fi
@@ -272,7 +272,7 @@ setup_answers_support() {
   fi
 
   if [[ -z "$part_dev" ]]; then
-    status "Answers partition label TUXWSANSWERS not found; continuing without answers file"
+    status "Answers partition label TUXWSANSWR not found; continuing without answers file"
     return 0
   fi
 
@@ -404,17 +404,37 @@ write_sparse_blocks() {
   local source_path="$1"
   local target_path="$2"
   local block_size="${3:-65536}"
+  local total_bytes="${4:-0}"
+  local part_index="${5:-0}"
+  local total_parts="${6:-0}"
+  local number="${7:-0}"
+  local file_name="${8:-}"
 
   if command -v blkdiscard >/dev/null 2>&1; then
     blkdiscard -f "$target_path" >/dev/null 2>&1 || true
   fi
 
-  python3 - "$source_path" "$target_path" "$block_size" <<'PY'
+  python3 - "$source_path" "$target_path" "$block_size" "$total_bytes" "$part_index" "$total_parts" "$number" "$file_name" <<'PY'
 import sys
 
 source_path, target_path, block_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+total_bytes = max(1, int(sys.argv[4] or 0))
+part_index, total_parts, number, file_name = sys.argv[5:9]
+
+last_pct = -1
+
+def emit_progress(processed):
+    global last_pct
+    pct = min(100, int(processed * 100 / total_bytes))
+    if pct == last_pct:
+        return
+    last_pct = pct
+    sys.stderr.write(f"[deploy] [{part_index}/{total_parts}] Partition {number} ({file_name}) {pct}% restored\n")
+    sys.stderr.flush()
+
 with open(source_path, 'rb') as source_handle, open(target_path, 'r+b', buffering=0) as target_handle:
     offset = 0
+    processed = 0
     while True:
         chunk = source_handle.read(block_size)
         if not chunk:
@@ -423,6 +443,9 @@ with open(source_path, 'rb') as source_handle, open(target_path, 'r+b', bufferin
             target_handle.seek(offset)
             target_handle.write(chunk)
         offset += len(chunk)
+        processed += len(chunk)
+        emit_progress(processed)
+emit_progress(total_bytes)
 PY
 }
 
@@ -431,22 +454,41 @@ apply_sparse_extents_file() {
   local extents_path="$2"
   local target_path="$3"
   local compressed_flag="$4"
+  local total_bytes="${5:-0}"
+  local part_index="${6:-0}"
+  local total_parts="${7:-0}"
+  local number="${8:-0}"
+  local file_name="${9:-}"
 
   if command -v blkdiscard >/dev/null 2>&1; then
     blkdiscard -f "$target_path" >/dev/null 2>&1 || true
   fi
 
-  python3 - "$payload_path" "$extents_path" "$target_path" "$compressed_flag" <<'PY'
+  python3 - "$payload_path" "$extents_path" "$target_path" "$compressed_flag" "$total_bytes" "$part_index" "$total_parts" "$number" "$file_name" <<'PY'
 import gzip
 import json
 import sys
 
 payload_path, extents_path, target_path, compressed_flag = sys.argv[1:5]
+total_bytes = max(1, int(sys.argv[5] or 0))
+part_index, total_parts, number, file_name = sys.argv[6:10]
 with open(extents_path, encoding="utf-8") as extents_file:
     extents = json.load(extents_file)
 
 opener = gzip.open if compressed_flag == "1" else open
 with opener(payload_path, "rb") as payload_handle, open(target_path, "r+b", buffering=0) as target_handle:
+    last_pct = -1
+    processed = 0
+
+    def emit_progress(amount):
+      global last_pct
+        pct = min(100, int(amount * 100 / total_bytes))
+        if pct == last_pct:
+            return
+        last_pct = pct
+        sys.stderr.write(f"[deploy] [{part_index}/{total_parts}] Partition {number} ({file_name}) {pct}% restored\n")
+        sys.stderr.flush()
+
     for extent in extents:
         length = int(extent.get("length") or 0)
         if length <= 0:
@@ -457,12 +499,20 @@ with opener(payload_path, "rb") as payload_handle, open(target_path, "r+b", buff
             raise RuntimeError(f"Sparse payload truncated for {payload_path}: expected {length} bytes, got {len(chunk)}")
         target_handle.seek(part_offset)
         target_handle.write(chunk)
+            processed += len(chunk)
+            emit_progress(processed)
+              emit_progress(total_bytes)
 PY
 }
 
 sparse_restore_stream() {
   local target_path="$1"
   local block_size="${2:-65536}"
+  local total_bytes="${3:-0}"
+  local part_index="${4:-0}"
+  local total_parts="${5:-0}"
+  local number="${6:-0}"
+  local file_name="${7:-}"
 
   if command -v blkdiscard >/dev/null 2>&1; then
     blkdiscard -f "$target_path" >/dev/null 2>&1 || true
@@ -471,17 +521,35 @@ sparse_restore_stream() {
   python3 -c 'import sys
 target_path = sys.argv[1]
 block_size = int(sys.argv[2])
+total_bytes = max(1, int(sys.argv[3] or 0))
+part_index, total_parts, number, file_name = sys.argv[4:8]
+
+last_pct = -1
+
+def emit_progress(processed):
+  global last_pct
+  pct = min(100, int(processed * 100 / total_bytes))
+  if pct == last_pct:
+    return
+  last_pct = pct
+  sys.stderr.write(f"[deploy] [{part_index}/{total_parts}] Partition {number} ({file_name}) {pct}% restored\n")
+  sys.stderr.flush()
+
 with open(target_path, "r+b", buffering=0) as target_handle:
-    offset = 0
-    stdin = sys.stdin.buffer
-    while True:
-        chunk = stdin.read(block_size)
-        if not chunk:
-            break
-        if any(chunk):
-            target_handle.seek(offset)
-            target_handle.write(chunk)
-        offset += len(chunk)' "$target_path" "$block_size"
+  offset = 0
+  processed = 0
+  stdin = sys.stdin.buffer
+  while True:
+    chunk = stdin.read(block_size)
+    if not chunk:
+      break
+    if any(chunk):
+      target_handle.seek(offset)
+      target_handle.write(chunk)
+    offset += len(chunk)
+    processed += len(chunk)
+    emit_progress(processed)
+  emit_progress(total_bytes)' "$target_path" "$block_size" "$total_bytes" "$part_index" "$total_parts" "$number" "$file_name"
 }
 
 cleanup_mounts() {
@@ -822,6 +890,7 @@ for idx, part in enumerate(partitions):
       str(part.get("extents_file") or ""),
       str(part.get("payload_format") or "raw"),
       str(part.get("compressed") or False),
+        str(part.get("size_bytes") or 0),
         str(entry.get("mount_point") or ""),
         str(entry.get("filesystem") or ""),
         str(entry.get("luks_enabled") or False),
@@ -872,10 +941,24 @@ fi
 TOTAL_PARTS=$(grep -c '^[0-9]' "$WORK_DIR/parts.map" || true)
 PART_INDEX=0
 
+partition_progress_percent() {
+  local current="$1"
+  local total="$2"
+  if [[ "$total" -le 0 ]]; then
+    printf '0%%'
+    return 0
+  fi
+  printf '%d%%' $(( current * 100 / total ))
+}
+
 restore_partition_payload_to() {
   local restore_target="$1"
+  local progress_percent
+  local logical_bytes="${size_bytes:-0}"
 
-  status "[$PART_INDEX/$TOTAL_PARTS] Restoring partition $number ($file_name) to $restore_target"
+  progress_percent="$(partition_progress_percent "$PART_INDEX" "$TOTAL_PARTS")"
+
+  status "[$PART_INDEX/$TOTAL_PARTS ${progress_percent}] Restoring partition $number ($file_name) to $restore_target"
   if [[ "$image_url" == file://* ]]; then
     image_path="${image_url#file://}"
     extents_path=""
@@ -885,23 +968,23 @@ restore_partition_payload_to() {
     fi
     image_size=$(stat -c%s "$image_path" 2>/dev/null || echo 0)
     if [[ "$image_size" -eq 0 ]]; then
-      status "[$PART_INDEX/$TOTAL_PARTS] Partition $number is empty; skipping write"
+      status "[$PART_INDEX/$TOTAL_PARTS ${progress_percent}] Partition $number is empty; skipping write"
       return 0
     fi
     if [[ "${payload_format:-raw}" == "sparse-extents-v1" && -n "${extents_path:-}" ]]; then
-      status "[$PART_INDEX/$TOTAL_PARTS] Applying sparse extents for partition $number"
+      status "[$PART_INDEX/$TOTAL_PARTS ${progress_percent}] Applying sparse extents for partition $number"
       compressed_flag=0
       [[ "${compressed:-False}" == "True" || "${compressed:-false}" == "true" ]] && compressed_flag=1
-      apply_sparse_extents_file "$image_path" "$extents_path" "$restore_target" "$compressed_flag"
+      apply_sparse_extents_file "$image_path" "$extents_path" "$restore_target" "$compressed_flag" "$logical_bytes" "$PART_INDEX" "$TOTAL_PARTS" "$number" "$file_name"
     elif [[ "$image_path" == *.gz ]]; then
-      status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
-      gzip -dc "$image_path" | sparse_restore_stream "$restore_target" 65536
+      status "[$PART_INDEX/$TOTAL_PARTS ${progress_percent}] Writing sparse blocks for partition $number"
+      gzip -dc "$image_path" | sparse_restore_stream "$restore_target" 65536 "$logical_bytes" "$PART_INDEX" "$TOTAL_PARTS" "$number" "$file_name"
     else
-      status "[$PART_INDEX/$TOTAL_PARTS] Writing sparse blocks for partition $number"
-      write_sparse_blocks "$image_path" "$restore_target" 65536
+      status "[$PART_INDEX/$TOTAL_PARTS ${progress_percent}] Writing sparse blocks for partition $number"
+      write_sparse_blocks "$image_path" "$restore_target" 65536 "$logical_bytes" "$PART_INDEX" "$TOTAL_PARTS" "$number" "$file_name"
     fi
   else
-    status "[$PART_INDEX/$TOTAL_PARTS] Streaming remote partition image for $number"
+    status "[$PART_INDEX/$TOTAL_PARTS ${progress_percent}] Streaming remote partition image for $number"
     if [[ "${payload_format:-raw}" == "sparse-extents-v1" && -n "${extents_file:-}" ]]; then
       tmp_payload="$WORK_DIR/partition-${number}.payload"
       tmp_extents="$WORK_DIR/partition-${number}.extents.json"
@@ -909,18 +992,18 @@ restore_partition_payload_to() {
       curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$CLONE_BASE/$extents_file" -o "$tmp_extents"
       compressed_flag=0
       [[ "${compressed:-False}" == "True" || "${compressed:-false}" == "true" ]] && compressed_flag=1
-      apply_sparse_extents_file "$tmp_payload" "$tmp_extents" "$restore_target" "$compressed_flag"
+      apply_sparse_extents_file "$tmp_payload" "$tmp_extents" "$restore_target" "$compressed_flag" "$logical_bytes" "$PART_INDEX" "$TOTAL_PARTS" "$number" "$file_name"
       rm -f "$tmp_payload" "$tmp_extents"
     elif [[ "$image_url" == *.gz ]]; then
-      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | sparse_restore_stream "$restore_target" 65536
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | gzip -dc | sparse_restore_stream "$restore_target" 65536 "$logical_bytes" "$PART_INDEX" "$TOTAL_PARTS" "$number" "$file_name"
     else
-      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$restore_target" 65536
+      curl --fail --show-error --location --connect-timeout 10 --max-time 120 "$image_url" | sparse_restore_stream "$restore_target" 65536 "$logical_bytes" "$PART_INDEX" "$TOTAL_PARTS" "$number" "$file_name"
     fi
   fi
 }
 
 CURRENT_PHASE="partition-restore"
-while IFS='|' read -r number file_name extents_file payload_format compressed mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
+while IFS='|' read -r number file_name extents_file payload_format compressed size_bytes mount_point fs_type luks_enabled luks_name entry_role volume_group logical_volume size_mode; do
   [[ -z "${number:-}" ]] && continue
   PART_INDEX=$((PART_INDEX + 1))
   if [[ -z "${file_name:-}" ]]; then
@@ -934,30 +1017,25 @@ while IFS='|' read -r number file_name extents_file payload_format compressed mo
     luks_enabled="False"
     luks_name=""
   fi
-  status "[$PART_INDEX/$TOTAL_PARTS] Partition metadata: mount=${mount_point:-none} fs=${fs_type:-none} role=${entry_role:-none} luks=${luks_enabled:-False} name=${luks_name:-none}"
+  status "[$PART_INDEX/$TOTAL_PARTS $(partition_progress_percent "$PART_INDEX" "$TOTAL_PARTS")] Partition metadata: mount=${mount_point:-none} fs=${fs_type:-none} role=${entry_role:-none} luks=${luks_enabled:-False} name=${luks_name:-none}"
   echo "$number|$part_dev|$mount_point|$fs_type|$luks_enabled|$luks_name|$entry_role|$volume_group|$logical_volume|$size_mode" >> "$WORK_DIR/part-dev.map"
-
-  # Partition payloads are captured from raw block devices. Even for encrypted
-  # volumes, restore must write back to the raw partition device.
-  restore_target="$part_dev"
-
-  restore_partition_payload_to "$restore_target"
 
   if [[ "$luks_enabled" == "True" ]]; then
     map_name="${luks_name:-luks-${number}}"
-    if ! cryptsetup isLuks "$part_dev" >/dev/null 2>&1; then
-      status "[$PART_INDEX/$TOTAL_PARTS] No LUKS header detected on $part_dev; bootstrapping LUKS and replaying payload"
-      if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
-        echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot bootstrap LUKS for $part_dev" >&2
-        exit 1
-      fi
-      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
-      printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
-      restore_partition_payload_to "/dev/mapper/$map_name"
+    status "[$PART_INDEX/$TOTAL_PARTS $(partition_progress_percent "$PART_INDEX" "$TOTAL_PARTS")] Reinitializing LUKS container on $part_dev and restoring payload"
+    if [[ -z "${DEFAULT_LUKS_PASSWORD:-}" ]]; then
+      echo "[deploy] DEFAULT_LUKS_PASSWORD is empty; cannot initialize LUKS for $part_dev" >&2
+      exit 1
     fi
+    cryptsetup close "$map_name" >/dev/null 2>&1 || true
+    printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup luksFormat --type luks2 --batch-mode "$part_dev" -
+    printf '%s' "$DEFAULT_LUKS_PASSWORD" | cryptsetup open "$part_dev" "$map_name" -
+    restore_partition_payload_to "/dev/mapper/$map_name"
+  else
+    restore_partition_payload_to "$part_dev"
   fi
 
-  status "[$PART_INDEX/$TOTAL_PARTS] Partition $number restore completed"
+  status "[$PART_INDEX/$TOTAL_PARTS $(partition_progress_percent "$PART_INDEX" "$TOTAL_PARTS")] Partition $number restore completed"
 done < "$WORK_DIR/parts.map"
 
 CURRENT_PHASE="filesystem-and-boot-repair"
